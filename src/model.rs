@@ -77,7 +77,15 @@ struct SseEvent {
     data: String,
 }
 
-async fn read_sse_events(response: reqwest::Response) -> Result<Vec<SseEvent>> {
+async fn read_sse_events_streaming<S, F>(
+    response: reqwest::Response,
+    sink: &mut S,
+    mut on_event: F,
+) -> Result<Vec<SseEvent>>
+where
+    S: UiSink,
+    F: FnMut(&SseEvent, &mut S) -> Result<()>,
+{
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut events = Vec::new();
@@ -89,12 +97,14 @@ async fn read_sse_events(response: reqwest::Response) -> Result<Vec<SseEvent>> {
             let frame = buffer[..index].to_string();
             buffer = buffer[index + boundary_len..].to_string();
             if let Some(event) = parse_sse_frame(&frame) {
+                on_event(&event, sink)?;
                 events.push(event);
             }
         }
     }
 
     if let Some(event) = parse_sse_frame(&buffer) {
+        on_event(&event, sink)?;
         events.push(event);
     }
     Ok(events)
@@ -155,6 +165,27 @@ struct ResponsesFunctionAcc {
     call_id: String,
     name: String,
     arguments: String,
+}
+
+fn emit_responses_sse_delta<S: UiSink>(event: &SseEvent, sink: &mut S) -> Result<()> {
+    if event.data == "[DONE]" {
+        return Ok(());
+    }
+    let value: Value = serde_json::from_str(&event.data).context("parse Responses SSE event")?;
+    let event_type = event
+        .event
+        .as_deref()
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or_default();
+
+    if event_type == "response.output_text.delta" {
+        if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+            sink.on_event(AgentEvent::AssistantDelta {
+                text: delta.to_string(),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_responses_sse_events<S: UiSink>(
@@ -280,6 +311,42 @@ struct ChatToolCallAcc {
     r#type: String,
     name: String,
     arguments: String,
+}
+
+fn emit_chat_completions_sse_delta<S: UiSink>(event: &SseEvent, sink: &mut S) -> Result<()> {
+    if event.data == "[DONE]" {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(&event.data).context("parse Chat Completions SSE event")?;
+    let Some(delta) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+    else {
+        return Ok(());
+    };
+
+    if let Some(piece) = delta.get("content").and_then(Value::as_str) {
+        sink.on_event(AgentEvent::AssistantDelta {
+            text: piece.to_string(),
+        })?;
+    }
+    if let Some(piece) = delta.get("reasoning_content").and_then(Value::as_str) {
+        sink.on_event(AgentEvent::ReasoningDelta {
+            text: piece.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+struct NoopUi;
+
+impl UiSink for NoopUi {
+    fn on_event(&mut self, _event: AgentEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn parse_chat_completions_sse_events<S: UiSink>(
@@ -469,8 +536,9 @@ impl OpenAiModelClient {
             return Err(anyhow!("Responses API error {status}: {text}"));
         }
 
-        let events = read_sse_events(response).await?;
-        parse_responses_sse_events(&events, sink)
+        let events = read_sse_events_streaming(response, sink, emit_responses_sse_delta).await?;
+        let mut noop = NoopUi;
+        parse_responses_sse_events(&events, &mut noop)
     }
 
     async fn respond_chat_completions(&self, request: ModelRequest) -> Result<ModelResponse> {
@@ -559,8 +627,10 @@ impl OpenAiModelClient {
             return Err(anyhow!("Chat Completions API error {status}: {text}"));
         }
 
-        let events = read_sse_events(response).await?;
-        parse_chat_completions_sse_events(&events, sink)
+        let events =
+            read_sse_events_streaming(response, sink, emit_chat_completions_sse_delta).await?;
+        let mut noop = NoopUi;
+        parse_chat_completions_sse_events(&events, &mut noop)
     }
 }
 
@@ -1039,5 +1109,18 @@ data: [DONE]
             "{\"path\":\"README.md\"}"
         );
         assert_eq!(response.output[0]["reasoning_content"], "Need file.");
+    }
+
+    #[test]
+    fn emits_chat_completions_delta_as_events_arrive() {
+        let mut events = parse_sse_text(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"think","content":"hi"}}]}
+
+"#,
+        );
+        let mut ui = CaptureUi::default();
+        emit_chat_completions_sse_delta(&events.remove(0), &mut ui).unwrap();
+        assert_eq!(ui.assistant, "hi");
+        assert_eq!(ui.reasoning, "think");
     }
 }

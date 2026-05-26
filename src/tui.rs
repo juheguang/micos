@@ -13,7 +13,10 @@ use crate::ui::{
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -26,10 +29,13 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::{self, Stdout};
+use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const POPUP_LIMIT: usize = 6;
+const SCROLL_STEP: isize = 5;
+const TICK_RATE: Duration = Duration::from_millis(120);
 
 pub async fn run_tui_chat(agent: &mut Agent<OpenAiModelClient>) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
@@ -45,7 +51,8 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        execute!(io::stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+            .context("enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -53,7 +60,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
     }
 }
 
@@ -63,6 +75,13 @@ pub struct TuiUi {
     composer: ComposerState,
     model_panel: Option<ModelPanelState>,
     permission_message: Option<usize>,
+    show_reasoning: bool,
+    run_status: RunStatus,
+    animation_tick: usize,
+    footer_model: String,
+    footer_thinking: String,
+    footer_reasoning_effort: String,
+    footer_cwd: String,
     scroll_top: usize,
     stick_to_bottom: bool,
     last_message_lines: usize,
@@ -77,6 +96,13 @@ impl TuiUi {
             composer: ComposerState::new(),
             model_panel: None,
             permission_message: None,
+            show_reasoning: false,
+            run_status: RunStatus::Idle,
+            animation_tick: 0,
+            footer_model: String::new(),
+            footer_thinking: String::new(),
+            footer_reasoning_effort: String::new(),
+            footer_cwd: String::new(),
             scroll_top: 0,
             stick_to_bottom: true,
             last_message_lines: 0,
@@ -85,6 +111,7 @@ impl TuiUi {
     }
 
     fn banner(&mut self, agent: &Agent<OpenAiModelClient>) {
+        self.sync_footer_config(agent);
         self.push_message(
             MessageKind::System,
             "micos",
@@ -101,43 +128,171 @@ impl TuiUi {
 
     async fn run(&mut self, agent: &mut Agent<OpenAiModelClient>) -> Result<()> {
         loop {
-            self.render()?;
-            let Event::Key(key) = event::read().context("read terminal event")? else {
+            self.render_with_agent(agent)?;
+            if !event::poll(TICK_RATE).context("poll terminal event")? {
+                self.tick_animation();
                 continue;
             };
-            if !is_key_press(key) {
-                continue;
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                agent.stop(StopReason::UserInterrupt).await?;
-                self.push_message(MessageKind::Warning, "stopped", "interrupted");
-                self.render()?;
-                break;
-            }
+            match event::read().context("read terminal event")? {
+                Event::Key(key) => {
+                    if !is_key_press(key) {
+                        continue;
+                    }
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        agent.stop(StopReason::UserInterrupt).await?;
+                        self.push_message(MessageKind::Warning, "stopped", "interrupted");
+                        self.run_status = RunStatus::Idle;
+                        self.render_with_agent(agent)?;
+                        break;
+                    }
 
-            if self.handle_model_panel_key(key, agent)? {
-                continue;
-            }
-            if self.handle_scroll_key(key) {
-                continue;
-            }
+                    if self.handle_model_panel_key(key, agent)? {
+                        continue;
+                    }
+                    if self.handle_scroll_key(key) {
+                        continue;
+                    }
 
-            match self.composer.handle_key(key) {
-                ComposerAction::None => {}
-                ComposerAction::Submit(input) => {
-                    let reason = agent.run_turn_with_ui(input, self).await?;
-                    if matches!(reason, StopReason::UserExit | StopReason::UserInterrupt) {
+                    let action = self.composer.handle_key(key);
+                    if !self.process_composer_action(action, agent).await? {
                         break;
                     }
                 }
-                ComposerAction::Command(command) => {
-                    if !self.handle_slash(command, agent).await? {
-                        break;
-                    }
-                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => self.scroll_by(-SCROLL_STEP),
+                    MouseEventKind::ScrollDown => self.scroll_by(SCROLL_STEP),
+                    _ => {}
+                },
+                _ => {}
             }
         }
         Ok(())
+    }
+
+    fn footer_state(&self, agent: &Agent<OpenAiModelClient>) -> FooterState {
+        let mut footer = self.footer_state_from_self();
+        footer.model = agent.config().model.clone();
+        footer.thinking = agent
+            .config()
+            .thinking
+            .map_or("unset".into(), |value| value.to_string());
+        footer.reasoning_effort = agent
+            .config()
+            .reasoning_effort
+            .map_or("unset".into(), |value| value.to_string());
+        footer.cwd = agent.config().cwd.display().to_string();
+        footer
+    }
+
+    fn footer_state_from_self(&self) -> FooterState {
+        FooterState {
+            model: self.footer_model.clone(),
+            thinking: self.footer_thinking.clone(),
+            reasoning_effort: self.footer_reasoning_effort.clone(),
+            cwd: self.footer_cwd.clone(),
+            show_reasoning: self.show_reasoning,
+            run_status: self.run_status.clone(),
+            animation_tick: self.animation_tick,
+        }
+    }
+
+    fn sync_footer_config(&mut self, agent: &Agent<OpenAiModelClient>) {
+        self.footer_model = agent.config().model.clone();
+        self.footer_thinking = agent
+            .config()
+            .thinking
+            .map_or("unset".into(), |value| value.to_string());
+        self.footer_reasoning_effort = agent
+            .config()
+            .reasoning_effort
+            .map_or("unset".into(), |value| value.to_string());
+        self.footer_cwd = agent.config().cwd.display().to_string();
+    }
+
+    fn render_with_agent(&mut self, agent: &Agent<OpenAiModelClient>) -> Result<()> {
+        self.sync_footer_config(agent);
+        let footer = self.footer_state(agent);
+        self.render_with_footer(&footer)
+    }
+
+    fn render(&mut self) -> Result<()> {
+        let footer = self.footer_state_from_self();
+        self.render_with_footer(&footer)
+    }
+
+    fn render_with_footer(&mut self, footer: &FooterState) -> Result<()> {
+        let size = self.terminal.size().context("read terminal size")?;
+        let bottom_height = bottom_panel_height(&self.composer, self.model_panel.as_ref());
+        let message_height = size.height.saturating_sub(3 + bottom_height) as usize;
+        let message_width = size.width as usize;
+        let lines = build_message_lines(&self.messages, message_width);
+        self.last_message_lines = lines.len();
+        self.last_message_height = message_height;
+        let max_top = self.max_scroll_top();
+        if self.stick_to_bottom {
+            self.scroll_top = max_top;
+        } else {
+            self.scroll_top = self.scroll_top.min(max_top);
+        }
+
+        let composer = self.composer.clone();
+        let model_panel = self.model_panel.clone();
+        let scroll_top = self.scroll_top;
+        let footer = footer.clone();
+        self.terminal
+            .draw(|frame| {
+                draw_frame(
+                    frame,
+                    &lines,
+                    scroll_top,
+                    &composer,
+                    model_panel.as_ref(),
+                    &footer,
+                )
+            })
+            .context("draw terminal")?;
+        Ok(())
+    }
+
+    fn tick_animation(&mut self) {
+        if !matches!(self.run_status, RunStatus::Idle) {
+            self.animation_tick = self.animation_tick.wrapping_add(1);
+        }
+    }
+
+    async fn run_agent_turn(
+        &mut self,
+        input: String,
+        agent: &mut Agent<OpenAiModelClient>,
+    ) -> Result<StopReason> {
+        self.run_status = RunStatus::Working;
+        let reason = agent.run_turn_with_ui(input, self).await?;
+        self.run_status = RunStatus::Idle;
+        Ok(reason)
+    }
+
+    async fn process_composer_action(
+        &mut self,
+        action: ComposerAction,
+        agent: &mut Agent<OpenAiModelClient>,
+    ) -> Result<bool> {
+        match action {
+            ComposerAction::None => {}
+            ComposerAction::Submit(input) => {
+                let reason = self.run_agent_turn(input, agent).await?;
+                if matches!(reason, StopReason::UserExit | StopReason::UserInterrupt) {
+                    return Ok(false);
+                }
+            }
+            ComposerAction::Command(command) => {
+                if !self.handle_slash(command, agent).await? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     async fn handle_slash(
@@ -163,7 +318,10 @@ impl TuiUi {
                 format_transcript(agent.session_path())?,
             ),
             SlashCommand::Model => {
-                self.model_panel = Some(ModelPanelState::from_settings(agent.config()));
+                self.model_panel = Some(ModelPanelState::from_settings(
+                    agent.config(),
+                    self.show_reasoning,
+                ));
             }
             SlashCommand::Clear => {
                 self.messages.clear();
@@ -192,9 +350,13 @@ impl TuiUi {
             ModelPanelAction::Cancel => {
                 self.model_panel = None;
             }
-            ModelPanelAction::Apply(settings) => {
+            ModelPanelAction::Apply {
+                settings,
+                show_reasoning,
+            } => {
                 save_model_settings(&agent.config().cwd, &settings)?;
                 agent.apply_model_settings(settings)?;
+                self.show_reasoning = show_reasoning;
                 self.model_panel = None;
                 self.push_message(
                     MessageKind::System,
@@ -211,8 +373,8 @@ impl TuiUi {
             return false;
         }
         match key.code {
-            KeyCode::Up => self.scroll_by(-1),
-            KeyCode::Down => self.scroll_by(1),
+            KeyCode::Up => self.scroll_by(-SCROLL_STEP),
+            KeyCode::Down => self.scroll_by(SCROLL_STEP),
             KeyCode::PageUp => self.scroll_by(-((self.last_message_height as isize).max(1))),
             KeyCode::PageDown => self.scroll_by((self.last_message_height as isize).max(1)),
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_to_top(),
@@ -226,12 +388,7 @@ impl TuiUi {
 
     fn scroll_by(&mut self, delta: isize) {
         let max_top = self.max_scroll_top();
-        let next = if delta.is_negative() {
-            self.scroll_top.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.scroll_top.saturating_add(delta as usize).min(max_top)
-        };
-        self.scroll_top = next;
+        self.scroll_top = next_scroll_top(self.scroll_top, max_top, delta);
         self.stick_to_bottom = self.scroll_top >= max_top;
     }
 
@@ -248,29 +405,6 @@ impl TuiUi {
     fn max_scroll_top(&self) -> usize {
         self.last_message_lines
             .saturating_sub(self.last_message_height)
-    }
-
-    fn render(&mut self) -> Result<()> {
-        let size = self.terminal.size().context("read terminal size")?;
-        let message_height = size.height.saturating_sub(3) as usize;
-        let message_width = size.width as usize;
-        let lines = build_message_lines(&self.messages, message_width);
-        self.last_message_lines = lines.len();
-        self.last_message_height = message_height;
-        let max_top = self.max_scroll_top();
-        if self.stick_to_bottom {
-            self.scroll_top = max_top;
-        } else {
-            self.scroll_top = self.scroll_top.min(max_top);
-        }
-
-        let composer = self.composer.clone();
-        let model_panel = self.model_panel.clone();
-        let scroll_top = self.scroll_top;
-        self.terminal
-            .draw(|frame| draw_frame(frame, &lines, scroll_top, &composer, model_panel.as_ref()))
-            .context("draw terminal")?;
-        Ok(())
     }
 
     fn push_message(
@@ -324,13 +458,18 @@ impl UiSink for TuiUi {
     fn on_event(&mut self, event: AgentEvent) -> Result<()> {
         match event {
             AgentEvent::TurnStarted { input } => {
+                self.run_status = RunStatus::Working;
                 self.push_message(MessageKind::User, "you", input);
             }
             AgentEvent::AssistantDelta { text } => {
+                self.tick_animation();
                 self.append_stream(MessageKind::Assistant, "assistant", &text);
             }
             AgentEvent::ReasoningDelta { text } => {
-                self.append_stream(MessageKind::Reasoning, "reasoning", &text);
+                self.tick_animation();
+                if self.show_reasoning {
+                    self.append_stream(MessageKind::Reasoning, "reasoning", &text);
+                }
             }
             AgentEvent::ToolCallStarted {
                 call_id,
@@ -338,6 +477,7 @@ impl UiSink for TuiUi {
                 arguments,
                 permission,
             } => {
+                self.run_status = RunStatus::Tool(name.clone());
                 let summary = ToolSummary::from_arguments(&name, &arguments).summary;
                 self.push_message(
                     MessageKind::Tool,
@@ -351,6 +491,7 @@ impl UiSink for TuiUi {
                 result,
                 elapsed,
             } => {
+                self.run_status = RunStatus::Working;
                 self.push_message(
                     tool_result_kind(&result),
                     format!("tool {name}"),
@@ -364,14 +505,17 @@ impl UiSink for TuiUi {
                 );
             }
             AgentEvent::PermissionPrompt { name, summary } => {
+                self.run_status = RunStatus::WaitingApproval;
                 self.push_permission_message(&name, &summary);
             }
             AgentEvent::Stop { reason } => {
+                self.run_status = RunStatus::Idle;
                 if reason != StopReason::FinalAnswer {
                     self.push_message(MessageKind::Warning, "stopped", reason.to_string());
                 }
             }
             AgentEvent::Error { message } => {
+                self.run_status = RunStatus::Idle;
                 self.push_message(MessageKind::Error, "error", message);
             }
         }
@@ -395,6 +539,7 @@ impl UiSink for TuiUi {
             };
             if let Some(approved) = decision {
                 self.remove_permission_message();
+                self.run_status = RunStatus::Working;
                 self.render()?;
                 return Ok(approved);
             }
@@ -695,10 +840,11 @@ struct ModelPanelState {
     model_index: usize,
     thinking_index: usize,
     effort_index: usize,
+    show_reasoning: bool,
 }
 
 impl ModelPanelState {
-    fn from_settings(config: &crate::config::SessionConfig) -> Self {
+    fn from_settings(config: &crate::config::SessionConfig, show_reasoning: bool) -> Self {
         let model_index = MODEL_PRESETS
             .iter()
             .position(|preset| preset.name == config.model)
@@ -718,23 +864,27 @@ impl ModelPanelState {
             model_index,
             thinking_index,
             effort_index,
+            show_reasoning,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ModelPanelAction {
         match key.code {
             KeyCode::Esc => ModelPanelAction::Cancel,
-            KeyCode::Enter => ModelPanelAction::Apply(self.settings()),
+            KeyCode::Enter => ModelPanelAction::Apply {
+                settings: self.settings(),
+                show_reasoning: self.show_reasoning,
+            },
             KeyCode::Up => {
                 self.selected_field = if self.selected_field == 0 {
-                    2
+                    3
                 } else {
                     self.selected_field - 1
                 };
                 ModelPanelAction::None
             }
             KeyCode::Down | KeyCode::Tab => {
-                self.selected_field = (self.selected_field + 1) % 3;
+                self.selected_field = (self.selected_field + 1) % 4;
                 ModelPanelAction::None
             }
             KeyCode::Left => {
@@ -754,6 +904,7 @@ impl ModelPanelState {
             0 => self.model_index = cycle_index(self.model_index, MODEL_PRESETS.len(), delta),
             1 => self.thinking_index = cycle_index(self.thinking_index, 2, delta),
             2 => self.effort_index = cycle_index(self.effort_index, 2, delta),
+            3 => self.show_reasoning = !self.show_reasoning,
             _ => {}
         }
     }
@@ -776,7 +927,7 @@ impl ModelPanelState {
         }
     }
 
-    fn field_values(&self) -> [(&'static str, String); 3] {
+    fn field_values(&self) -> [(&'static str, String); 4] {
         [
             ("model", MODEL_PRESETS[self.model_index].name.to_string()),
             (
@@ -797,6 +948,15 @@ impl ModelPanelState {
                 }
                 .to_string(),
             ),
+            (
+                "show",
+                if self.show_reasoning {
+                    "reasoning"
+                } else {
+                    "answer only"
+                }
+                .to_string(),
+            ),
         ]
     }
 }
@@ -805,7 +965,10 @@ impl ModelPanelState {
 enum ModelPanelAction {
     None,
     Cancel,
-    Apply(ModelSettings),
+    Apply {
+        settings: ModelSettings,
+        show_reasoning: bool,
+    },
 }
 
 fn cycle_index(index: usize, len: usize, delta: isize) -> usize {
@@ -816,6 +979,53 @@ fn cycle_index(index: usize, len: usize, delta: isize) -> usize {
         index.checked_sub(1).unwrap_or(len - 1)
     } else {
         (index + 1) % len
+    }
+}
+
+fn next_scroll_top(current: usize, max_top: usize, delta: isize) -> usize {
+    if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(max_top)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FooterState {
+    model: String,
+    thinking: String,
+    reasoning_effort: String,
+    cwd: String,
+    show_reasoning: bool,
+    run_status: RunStatus,
+    animation_tick: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RunStatus {
+    Idle,
+    Working,
+    Tool(String),
+    WaitingApproval,
+}
+
+impl RunStatus {
+    fn label(&self, tick: usize) -> String {
+        match self {
+            RunStatus::Idle => "idle".into(),
+            RunStatus::Working => format!("{} Working...", sweep(tick)),
+            RunStatus::Tool(name) => format!("{} Running {name}", sweep(tick)),
+            RunStatus::WaitingApproval => "Waiting for approval".into(),
+        }
+    }
+}
+
+fn sweep(tick: usize) -> &'static str {
+    match tick % 4 {
+        0 => ".",
+        1 => "·",
+        2 => "•",
+        _ => "·",
     }
 }
 
@@ -844,18 +1054,37 @@ fn draw_frame(
     scroll_top: usize,
     composer: &ComposerState,
     model_panel: Option<&ModelPanelState>,
+    footer: &FooterState,
 ) {
+    let bottom_height = bottom_panel_height(composer, model_panel);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(bottom_height),
+        ])
         .split(frame.size());
     draw_messages(frame, chunks[0], message_lines, scroll_top);
     draw_composer(frame, chunks[1], composer);
-    if composer.popup_open() {
-        draw_popup(frame, chunks[1], composer);
-    }
+    frame.render_widget(Clear, chunks[2]);
     if let Some(panel) = model_panel {
-        draw_model_panel(frame, chunks[1], panel);
+        draw_model_panel(frame, chunks[2], panel);
+    } else if composer.popup_open() {
+        draw_popup(frame, chunks[2], composer);
+    } else {
+        draw_footer(frame, chunks[2], footer);
+    }
+}
+
+fn bottom_panel_height(composer: &ComposerState, model_panel: Option<&ModelPanelState>) -> u16 {
+    if model_panel.is_some() {
+        9
+    } else if composer.popup_open() {
+        let rows = composer.matches().len().min(POPUP_LIMIT).max(1);
+        rows as u16 + 2
+    } else {
+        1
     }
 }
 
@@ -888,17 +1117,10 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, composer: &ComposerState) {
     frame.set_cursor(inner.x + cursor_x as u16, inner.y);
 }
 
-fn draw_popup(frame: &mut Frame<'_>, composer_area: Rect, composer: &ComposerState) {
+fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState) {
     let matches = composer.matches();
-    let rows = if matches.is_empty() {
-        1
-    } else {
-        matches.len().min(POPUP_LIMIT)
-    };
-    let height = rows as u16 + 2;
-    let width = 68u16.min(composer_area.width);
-    let y = composer_area.y.saturating_sub(height);
-    let area = Rect::new(composer_area.x, y, width, height);
+    let width = 68u16.min(footer_area.width);
+    let area = Rect::new(footer_area.x, footer_area.y, width, footer_area.height);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -937,11 +1159,9 @@ fn draw_popup(frame: &mut Frame<'_>, composer_area: Rect, composer: &ComposerSta
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_model_panel(frame: &mut Frame<'_>, composer_area: Rect, panel: &ModelPanelState) {
-    let width = 72u16.min(composer_area.width);
-    let height = 8u16.min(composer_area.y);
-    let y = composer_area.y.saturating_sub(height);
-    let area = Rect::new(composer_area.x, y, width, height);
+fn draw_model_panel(frame: &mut Frame<'_>, footer_area: Rect, panel: &ModelPanelState) {
+    let width = 72u16.min(footer_area.width);
+    let area = Rect::new(footer_area.x, footer_area.y, width, footer_area.height);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue))
@@ -969,6 +1189,31 @@ fn draw_model_panel(frame: &mut Frame<'_>, composer_area: Rect, panel: &ModelPan
     }
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, footer: &FooterState) {
+    let text = footer_text(footer);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
+
+fn footer_text(footer: &FooterState) -> String {
+    let reasoning = if footer.show_reasoning {
+        "reasoning shown"
+    } else {
+        "reasoning hidden"
+    };
+    format!(
+        "{} · thinking:{} · effort:{} · {} · {} · {}",
+        footer.model,
+        footer.thinking,
+        footer.reasoning_effort,
+        footer.cwd,
+        reasoning,
+        footer.run_status.label(footer.animation_tick)
+    )
 }
 
 fn build_message_lines(messages: &[TuiMessage], width: usize) -> Vec<Line<'static>> {
@@ -1187,7 +1432,7 @@ mod tests {
             max_steps: 20,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
-        let mut panel = ModelPanelState::from_settings(&config);
+        let mut panel = ModelPanelState::from_settings(&config, false);
         assert_eq!(panel.settings().model, "deepseek-v4-flash");
         panel.handle_key(key(KeyCode::Right));
         panel.handle_key(key(KeyCode::Down));
@@ -1196,13 +1441,36 @@ mod tests {
         panel.handle_key(key(KeyCode::Right));
         assert_eq!(
             panel.handle_key(key(KeyCode::Enter)),
-            ModelPanelAction::Apply(ModelSettings {
-                model: "deepseek-v4-pro".into(),
-                base_url: DEEPSEEK_CHAT_COMPLETIONS_BASE_URL.into(),
-                thinking: Some(ThinkingMode::Disabled),
-                reasoning_effort: Some(ReasoningEffort::Max),
-            })
+            ModelPanelAction::Apply {
+                settings: ModelSettings {
+                    model: "deepseek-v4-pro".into(),
+                    base_url: DEEPSEEK_CHAT_COMPLETIONS_BASE_URL.into(),
+                    thinking: Some(ThinkingMode::Disabled),
+                    reasoning_effort: Some(ReasoningEffort::Max),
+                },
+                show_reasoning: false,
+            }
         );
+    }
+
+    #[test]
+    fn model_panel_toggles_reasoning_visibility() {
+        let config = SessionConfig {
+            api_kind: crate::config::ApiKind::ChatCompletions,
+            model: "deepseek-v4-flash".into(),
+            base_url: DEEPSEEK_CHAT_COMPLETIONS_BASE_URL.into(),
+            thinking: Some(ThinkingMode::Enabled),
+            reasoning_effort: Some(ReasoningEffort::High),
+            permission: crate::config::PermissionMode::Ask,
+            max_steps: 20,
+            cwd: std::path::PathBuf::from("/tmp/micos"),
+        };
+        let mut panel = ModelPanelState::from_settings(&config, false);
+        panel.handle_key(key(KeyCode::Down));
+        panel.handle_key(key(KeyCode::Down));
+        panel.handle_key(key(KeyCode::Down));
+        panel.handle_key(key(KeyCode::Right));
+        assert!(panel.show_reasoning);
     }
 
     #[test]
@@ -1215,5 +1483,37 @@ mod tests {
         }];
         let lines = build_message_lines(&messages, 4);
         assert!(lines.len() >= 3);
+    }
+
+    #[test]
+    fn scroll_step_moves_five_lines() {
+        assert_eq!(next_scroll_top(20, 100, -SCROLL_STEP), 15);
+        assert_eq!(next_scroll_top(20, 100, SCROLL_STEP), 25);
+        assert_eq!(next_scroll_top(98, 100, SCROLL_STEP), 100);
+    }
+
+    #[test]
+    fn footer_text_contains_status_and_reasoning_visibility() {
+        let footer = FooterState {
+            model: "deepseek-v4-flash".into(),
+            thinking: "enabled".into(),
+            reasoning_effort: "high".into(),
+            cwd: "/tmp/micos".into(),
+            show_reasoning: false,
+            run_status: RunStatus::Working,
+            animation_tick: 2,
+        };
+        let text = footer_text(&footer);
+        assert!(text.contains("deepseek-v4-flash"));
+        assert!(text.contains("reasoning hidden"));
+        assert!(text.contains("Working"));
+    }
+
+    #[test]
+    fn bottom_panel_expands_for_popup_below_composer() {
+        let mut composer = ComposerState::new();
+        composer.handle_key(key(KeyCode::Char('/')));
+        assert!(bottom_panel_height(&composer, None) > 1);
+        assert_eq!(bottom_panel_height(&ComposerState::new(), None), 1);
     }
 }
