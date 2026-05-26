@@ -29,7 +29,10 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -37,13 +40,13 @@ const POPUP_LIMIT: usize = 6;
 const SCROLL_STEP: isize = 5;
 const TICK_RATE: Duration = Duration::from_millis(120);
 
-pub async fn run_tui_chat(agent: &mut Agent<OpenAiModelClient>) -> Result<()> {
+pub async fn run_tui_chat(agent: Agent<OpenAiModelClient>) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend).context("create terminal")?;
-    let mut ui = TuiUi::new(terminal);
-    ui.banner(agent);
-    ui.run(agent).await
+    let mut ui = TuiUi::new(terminal, agent);
+    ui.banner();
+    ui.run().await
 }
 
 struct TerminalGuard;
@@ -69,12 +72,53 @@ impl Drop for TerminalGuard {
     }
 }
 
+enum TuiAgentMessage {
+    Event(AgentEvent),
+    ApprovalRequest {
+        name: String,
+        summary: String,
+        response: std_mpsc::Sender<bool>,
+    },
+    TurnFinished {
+        agent: Agent<OpenAiModelClient>,
+        result: std::result::Result<StopReason, String>,
+        elapsed: Duration,
+    },
+}
+
+struct TuiAgentSink {
+    tx: mpsc::UnboundedSender<TuiAgentMessage>,
+}
+
+impl UiSink for TuiAgentSink {
+    fn on_event(&mut self, event: AgentEvent) -> Result<()> {
+        let _ = self.tx.send(TuiAgentMessage::Event(event));
+        Ok(())
+    }
+
+    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<bool> {
+        let (response, decision) = std_mpsc::channel();
+        let _ = self.tx.send(TuiAgentMessage::ApprovalRequest {
+            name: name.to_string(),
+            summary: summary.to_string(),
+            response,
+        });
+        Ok(decision.recv().unwrap_or(false))
+    }
+}
+
 pub struct TuiUi {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    agent: Option<Agent<OpenAiModelClient>>,
+    agent_tx: mpsc::UnboundedSender<TuiAgentMessage>,
+    agent_rx: mpsc::UnboundedReceiver<TuiAgentMessage>,
+    agent_task: Option<JoinHandle<()>>,
     messages: Vec<TuiMessage>,
     composer: ComposerState,
     model_panel: Option<ModelPanelState>,
+    approval_picker: Option<ApprovalPickerState>,
     permission_message: Option<usize>,
+    active_tool_message: Option<usize>,
     show_reasoning: bool,
     run_status: RunStatus,
     animation_tick: usize,
@@ -89,13 +133,20 @@ pub struct TuiUi {
 }
 
 impl TuiUi {
-    fn new(terminal: Terminal<CrosstermBackend<Stdout>>) -> Self {
+    fn new(terminal: Terminal<CrosstermBackend<Stdout>>, agent: Agent<OpenAiModelClient>) -> Self {
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         Self {
             terminal,
+            agent: Some(agent),
+            agent_tx,
+            agent_rx,
+            agent_task: None,
             messages: Vec::new(),
             composer: ComposerState::new(),
             model_panel: None,
+            approval_picker: None,
             permission_message: None,
+            active_tool_message: None,
             show_reasoning: false,
             run_status: RunStatus::Idle,
             animation_tick: 0,
@@ -110,25 +161,40 @@ impl TuiUi {
         }
     }
 
-    fn banner(&mut self, agent: &Agent<OpenAiModelClient>) {
-        self.sync_footer_config(agent);
+    fn banner(&mut self) {
+        let Some((model, permission, cwd, session_id, session_path, thinking, effort)) =
+            self.agent.as_ref().map(|agent| {
+                (
+                    agent.config().model.clone(),
+                    agent.config().permission.to_string(),
+                    agent.config().cwd.display().to_string(),
+                    agent.session_id(),
+                    agent.session_path().display().to_string(),
+                    short_thinking(agent.config().thinking).to_string(),
+                    short_reasoning_effort(agent.config().reasoning_effort).to_string(),
+                )
+            })
+        else {
+            return;
+        };
+        self.footer_model = model.clone();
+        self.footer_thinking = thinking;
+        self.footer_reasoning_effort = effort;
+        self.footer_cwd = cwd.clone();
         self.push_message(
             MessageKind::System,
             "micos",
             format!(
                 "model: {}\npermission: {}\ncwd: {}\nsession: {}\nlog: {}\nType /help for commands.",
-                agent.config().model,
-                agent.config().permission,
-                agent.config().cwd.display(),
-                agent.session_id(),
-                agent.session_path().display()
+                model, permission, cwd, session_id, session_path
             ),
         );
     }
 
-    async fn run(&mut self, agent: &mut Agent<OpenAiModelClient>) -> Result<()> {
+    async fn run(&mut self) -> Result<()> {
         loop {
-            self.render_with_agent(agent)?;
+            self.handle_agent_messages()?;
+            self.render()?;
             if !event::poll(TICK_RATE).context("poll terminal event")? {
                 self.tick_animation();
                 continue;
@@ -141,22 +207,42 @@ impl TuiUi {
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
-                        agent.stop(StopReason::UserInterrupt).await?;
-                        self.push_message(MessageKind::Warning, "stopped", "interrupted");
-                        self.run_status = RunStatus::Idle;
-                        self.render_with_agent(agent)?;
-                        break;
+                        if let Some(agent) = self.agent.as_ref() {
+                            agent.stop(StopReason::UserInterrupt).await?;
+                            self.push_message(MessageKind::Warning, "stopped", "interrupted");
+                            self.run_status = RunStatus::Idle;
+                            self.render()?;
+                            break;
+                        } else {
+                            self.push_message(
+                                MessageKind::Warning,
+                                "busy",
+                                "wait for the current turn to finish before exiting",
+                            );
+                            continue;
+                        }
                     }
 
-                    if self.handle_model_panel_key(key, agent)? {
+                    if self.handle_approval_key(key)? {
+                        continue;
+                    }
+                    if self.handle_model_panel_key(key)? {
                         continue;
                     }
                     if self.handle_scroll_key(key) {
                         continue;
                     }
+                    if self.agent_task.is_some() && key.code == KeyCode::Enter {
+                        self.push_message(
+                            MessageKind::Warning,
+                            "busy",
+                            "agent is still working on the current turn",
+                        );
+                        continue;
+                    }
 
                     let action = self.composer.handle_key(key);
-                    if !self.process_composer_action(action, agent).await? {
+                    if !self.process_composer_action(action).await? {
                         break;
                     }
                 }
@@ -171,21 +257,6 @@ impl TuiUi {
         Ok(())
     }
 
-    fn footer_state(&self, agent: &Agent<OpenAiModelClient>) -> FooterState {
-        let mut footer = self.footer_state_from_self();
-        footer.model = agent.config().model.clone();
-        footer.thinking = agent
-            .config()
-            .thinking
-            .map_or("unset".into(), |value| value.to_string());
-        footer.reasoning_effort = agent
-            .config()
-            .reasoning_effort
-            .map_or("unset".into(), |value| value.to_string());
-        footer.cwd = agent.config().cwd.display().to_string();
-        footer
-    }
-
     fn footer_state_from_self(&self) -> FooterState {
         FooterState {
             model: self.footer_model.clone(),
@@ -198,36 +269,32 @@ impl TuiUi {
         }
     }
 
-    fn sync_footer_config(&mut self, agent: &Agent<OpenAiModelClient>) {
-        self.footer_model = agent.config().model.clone();
-        self.footer_thinking = agent
-            .config()
-            .thinking
-            .map_or("unset".into(), |value| value.to_string());
-        self.footer_reasoning_effort = agent
-            .config()
-            .reasoning_effort
-            .map_or("unset".into(), |value| value.to_string());
-        self.footer_cwd = agent.config().cwd.display().to_string();
-    }
-
-    fn render_with_agent(&mut self, agent: &Agent<OpenAiModelClient>) -> Result<()> {
-        self.sync_footer_config(agent);
-        let footer = self.footer_state(agent);
-        self.render_with_footer(&footer)
-    }
-
     fn render(&mut self) -> Result<()> {
+        if let Some(agent) = self.agent.as_ref() {
+            self.footer_model = agent.config().model.clone();
+            self.footer_thinking = short_thinking(agent.config().thinking).to_string();
+            self.footer_reasoning_effort =
+                short_reasoning_effort(agent.config().reasoning_effort).to_string();
+            self.footer_cwd = agent.config().cwd.display().to_string();
+        }
         let footer = self.footer_state_from_self();
         self.render_with_footer(&footer)
     }
 
     fn render_with_footer(&mut self, footer: &FooterState) -> Result<()> {
         let size = self.terminal.size().context("read terminal size")?;
-        let bottom_height = bottom_panel_height(&self.composer, self.model_panel.as_ref());
-        let message_height = size.height.saturating_sub(3 + bottom_height) as usize;
+        let approval_selected = self
+            .approval_picker
+            .as_ref()
+            .map(ApprovalPickerState::selected);
+        let bottom_height =
+            bottom_panel_height(&self.composer, self.model_panel.as_ref(), approval_selected);
+        let working_height = working_panel_height(footer);
+        let message_height =
+            size.height
+                .saturating_sub(3 + bottom_height + working_height) as usize;
         let message_width = size.width as usize;
-        let lines = build_message_lines(&self.messages, message_width);
+        let lines = build_message_lines(&self.messages, message_width, footer.animation_tick);
         self.last_message_lines = lines.len();
         self.last_message_height = message_height;
         let max_top = self.max_scroll_top();
@@ -249,6 +316,7 @@ impl TuiUi {
                     scroll_top,
                     &composer,
                     model_panel.as_ref(),
+                    approval_selected,
                     &footer,
                 )
             })
@@ -262,32 +330,86 @@ impl TuiUi {
         }
     }
 
-    async fn run_agent_turn(
-        &mut self,
-        input: String,
-        agent: &mut Agent<OpenAiModelClient>,
-    ) -> Result<StopReason> {
-        self.run_status = RunStatus::Working;
-        let reason = agent.run_turn_with_ui(input, self).await?;
-        self.run_status = RunStatus::Idle;
-        Ok(reason)
+    fn handle_agent_messages(&mut self) -> Result<()> {
+        while let Ok(message) = self.agent_rx.try_recv() {
+            match message {
+                TuiAgentMessage::Event(event) => self.apply_agent_event(event),
+                TuiAgentMessage::ApprovalRequest {
+                    name,
+                    summary,
+                    response,
+                } => {
+                    self.run_status = RunStatus::WaitingApproval;
+                    self.model_panel = None;
+                    self.composer.popup_open = false;
+                    self.push_permission_message(&name, &summary);
+                    self.approval_picker = Some(ApprovalPickerState::new(response));
+                }
+                TuiAgentMessage::TurnFinished {
+                    agent,
+                    result,
+                    elapsed,
+                } => {
+                    self.agent = Some(agent);
+                    self.agent_task = None;
+                    self.run_status = RunStatus::Idle;
+                    self.active_tool_message = None;
+                    match result {
+                        Ok(reason) => self.push_turn_elapsed(reason, elapsed),
+                        Err(message) => {
+                            self.push_message(MessageKind::Error, "error", message);
+                            self.push_message_with_status(
+                                MessageKind::System,
+                                "stopped",
+                                format!("turn finished in {}", format_duration(elapsed)),
+                                Some(MessageStatus::Neutral),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
-    async fn process_composer_action(
-        &mut self,
-        action: ComposerAction,
-        agent: &mut Agent<OpenAiModelClient>,
-    ) -> Result<bool> {
+    fn start_agent_turn(&mut self, input: String) {
+        if self.agent_task.is_some() {
+            self.push_message(
+                MessageKind::Warning,
+                "busy",
+                "agent is still working on the current turn",
+            );
+            return;
+        }
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+        self.run_status = RunStatus::Working;
+        let tx = self.agent_tx.clone();
+        self.agent_task = Some(tokio::spawn(async move {
+            let start = Instant::now();
+            let mut sink = TuiAgentSink { tx: tx.clone() };
+            let result = agent
+                .run_turn_with_ui(input, &mut sink)
+                .await
+                .map_err(|error| error.to_string());
+            let elapsed = start.elapsed();
+            let _ = tx.send(TuiAgentMessage::TurnFinished {
+                agent,
+                result,
+                elapsed,
+            });
+        }));
+    }
+
+    async fn process_composer_action(&mut self, action: ComposerAction) -> Result<bool> {
         match action {
             ComposerAction::None => {}
             ComposerAction::Submit(input) => {
-                let reason = self.run_agent_turn(input, agent).await?;
-                if matches!(reason, StopReason::UserExit | StopReason::UserInterrupt) {
-                    return Ok(false);
-                }
+                self.start_agent_turn(input);
             }
             ComposerAction::Command(command) => {
-                if !self.handle_slash(command, agent).await? {
+                if !self.handle_slash(command).await? {
                     return Ok(false);
                 }
             }
@@ -295,29 +417,43 @@ impl TuiUi {
         Ok(true)
     }
 
-    async fn handle_slash(
-        &mut self,
-        command: SlashCommand,
-        agent: &mut Agent<OpenAiModelClient>,
-    ) -> Result<bool> {
+    async fn handle_slash(&mut self, command: SlashCommand) -> Result<bool> {
+        if self.agent.is_none() && !matches!(command, SlashCommand::Help | SlashCommand::Clear) {
+            self.push_message(
+                MessageKind::Warning,
+                "busy",
+                "command is unavailable while the agent is working",
+            );
+            return Ok(true);
+        }
         match command {
             SlashCommand::Help => self.push_message(MessageKind::System, "/help", format_help()),
-            SlashCommand::Status => self.push_message(
-                MessageKind::System,
-                "/status",
-                format_status(agent.config(), agent.session_id(), agent.session_path()),
-            ),
-            SlashCommand::Sessions => self.push_message(
-                MessageKind::System,
-                "/sessions",
-                format_sessions(&agent.config().cwd)?,
-            ),
-            SlashCommand::Transcript => self.push_message(
-                MessageKind::System,
-                "/transcript",
-                format_transcript(agent.session_path())?,
-            ),
+            SlashCommand::Status => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/status",
+                    format_status(agent.config(), agent.session_id(), agent.session_path()),
+                );
+            }
+            SlashCommand::Sessions => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/sessions",
+                    format_sessions(&agent.config().cwd)?,
+                );
+            }
+            SlashCommand::Transcript => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/transcript",
+                    format_transcript(agent.session_path())?,
+                );
+            }
             SlashCommand::Model => {
+                let agent = self.agent.as_ref().expect("agent checked above");
                 self.model_panel = Some(ModelPanelState::from_settings(
                     agent.config(),
                     self.show_reasoning,
@@ -326,22 +462,21 @@ impl TuiUi {
             SlashCommand::Clear => {
                 self.messages.clear();
                 self.permission_message = None;
+                self.active_tool_message = None;
                 self.scroll_top = 0;
                 self.stick_to_bottom = true;
             }
             SlashCommand::Exit => {
-                agent.stop(StopReason::UserExit).await?;
+                if let Some(agent) = self.agent.as_ref() {
+                    agent.stop(StopReason::UserExit).await?;
+                }
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn handle_model_panel_key(
-        &mut self,
-        key: KeyEvent,
-        agent: &mut Agent<OpenAiModelClient>,
-    ) -> Result<bool> {
+    fn handle_model_panel_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(panel) = &mut self.model_panel else {
             return Ok(false);
         };
@@ -354,18 +489,59 @@ impl TuiUi {
                 settings,
                 show_reasoning,
             } => {
-                save_model_settings(&agent.config().cwd, &settings)?;
-                agent.apply_model_settings(settings)?;
+                let Some(status) = self.agent.as_mut().map(|agent| {
+                    save_model_settings(&agent.config().cwd, &settings)?;
+                    agent.apply_model_settings(settings)?;
+                    Ok::<String, anyhow::Error>(format_status(
+                        agent.config(),
+                        agent.session_id(),
+                        agent.session_path(),
+                    ))
+                }) else {
+                    self.model_panel = None;
+                    return Ok(true);
+                };
+                let status = status?;
                 self.show_reasoning = show_reasoning;
                 self.model_panel = None;
-                self.push_message(
-                    MessageKind::System,
-                    "/model",
-                    format_status(agent.config(), agent.session_id(), agent.session_path()),
-                );
+                self.push_message(MessageKind::System, "/model", status);
             }
         }
         Ok(true)
+    }
+
+    fn handle_approval_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.approval_picker.is_none() {
+            return Ok(false);
+        };
+        if !matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Tab
+                | KeyCode::Enter
+                | KeyCode::Esc
+        ) {
+            return Ok(false);
+        }
+        let picker = self.approval_picker.as_mut().expect("picker checked above");
+        match picker.handle_key(key) {
+            ApprovalAction::None => {}
+            ApprovalAction::Decide(approved) => {
+                self.finish_approval(approved);
+            }
+        }
+        Ok(true)
+    }
+
+    fn finish_approval(&mut self, approved: bool) {
+        if let Some(mut picker) = self.approval_picker.take() {
+            picker.send(approved);
+        }
+        self.remove_permission_message();
+        self.run_status = RunStatus::Working;
     }
 
     fn handle_scroll_key(&mut self, key: KeyEvent) -> bool {
@@ -417,8 +593,39 @@ impl TuiUi {
             kind,
             title: title.into(),
             body: body.into(),
+            status: default_status_for_kind(kind),
             transient: false,
         });
+    }
+
+    fn push_message_with_status(
+        &mut self,
+        kind: MessageKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        status: Option<MessageStatus>,
+    ) {
+        self.messages.push(TuiMessage {
+            kind,
+            title: title.into(),
+            body: body.into(),
+            status,
+            transient: false,
+        });
+    }
+
+    fn push_turn_elapsed(&mut self, reason: StopReason, elapsed: Duration) {
+        let title = if reason == StopReason::FinalAnswer {
+            "completed"
+        } else {
+            "stopped"
+        };
+        self.push_message_with_status(
+            MessageKind::System,
+            title,
+            format!("turn finished in {}", format_duration(elapsed)),
+            Some(MessageStatus::Neutral),
+        );
     }
 
     fn append_stream(&mut self, kind: MessageKind, title: &'static str, text: &str) {
@@ -439,7 +646,8 @@ impl TuiUi {
         self.messages.push(TuiMessage {
             kind: MessageKind::Warning,
             title: format!("permission {name}"),
-            body: format!("{summary}\nEnter/y approve    Esc/n deny"),
+            body: summary.to_string(),
+            status: Some(MessageStatus::Running),
             transient: true,
         });
         self.scroll_to_bottom();
@@ -456,69 +664,7 @@ impl TuiUi {
 
 impl UiSink for TuiUi {
     fn on_event(&mut self, event: AgentEvent) -> Result<()> {
-        match event {
-            AgentEvent::TurnStarted { input } => {
-                self.run_status = RunStatus::Working;
-                self.push_message(MessageKind::User, "you", input);
-            }
-            AgentEvent::AssistantDelta { text } => {
-                self.tick_animation();
-                self.append_stream(MessageKind::Assistant, "assistant", &text);
-            }
-            AgentEvent::ReasoningDelta { text } => {
-                self.tick_animation();
-                if self.show_reasoning {
-                    self.append_stream(MessageKind::Reasoning, "reasoning", &text);
-                }
-            }
-            AgentEvent::ToolCallStarted {
-                call_id,
-                name,
-                arguments,
-                permission,
-            } => {
-                self.run_status = RunStatus::Tool(name.clone());
-                let summary = ToolSummary::from_arguments(&name, &arguments).summary;
-                self.push_message(
-                    MessageKind::Tool,
-                    format!("tool {name}"),
-                    format!("permission: {permission}\ncall: {call_id}\n{summary}"),
-                );
-            }
-            AgentEvent::ToolCallFinished {
-                call_id,
-                name,
-                result,
-                elapsed,
-            } => {
-                self.run_status = RunStatus::Working;
-                self.push_message(
-                    tool_result_kind(&result),
-                    format!("tool {name}"),
-                    format!(
-                        "{} in {:.2?}\ncall: {}\n{}",
-                        tool_result_label(&result),
-                        elapsed,
-                        call_id,
-                        summarize_result(&result)
-                    ),
-                );
-            }
-            AgentEvent::PermissionPrompt { name, summary } => {
-                self.run_status = RunStatus::WaitingApproval;
-                self.push_permission_message(&name, &summary);
-            }
-            AgentEvent::Stop { reason } => {
-                self.run_status = RunStatus::Idle;
-                if reason != StopReason::FinalAnswer {
-                    self.push_message(MessageKind::Warning, "stopped", reason.to_string());
-                }
-            }
-            AgentEvent::Error { message } => {
-                self.run_status = RunStatus::Idle;
-                self.push_message(MessageKind::Error, "error", message);
-            }
-        }
+        self.apply_agent_event(event);
         self.render()
     }
 
@@ -545,6 +691,120 @@ impl UiSink for TuiUi {
             }
         }
     }
+}
+
+impl TuiUi {
+    fn apply_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::TurnStarted { input } => {
+                self.run_status = RunStatus::Working;
+                self.push_message(MessageKind::User, "you", input);
+            }
+            AgentEvent::AssistantDelta { text } => {
+                self.tick_animation();
+                self.append_stream(MessageKind::Assistant, "assistant", &text);
+            }
+            AgentEvent::ReasoningDelta { text } => {
+                self.tick_animation();
+                if self.show_reasoning {
+                    self.append_stream(MessageKind::Reasoning, "reasoning", &text);
+                }
+            }
+            AgentEvent::ToolCallStarted {
+                call_id: _,
+                name,
+                arguments,
+                permission: _,
+            } => {
+                self.run_status = RunStatus::Tool(name.clone());
+                let summary = ToolSummary::from_arguments(&name, &arguments).summary;
+                self.active_tool_message = Some(self.messages.len());
+                self.push_message_with_status(
+                    MessageKind::Tool,
+                    format!("tool {name}"),
+                    summary,
+                    Some(MessageStatus::Running),
+                );
+            }
+            AgentEvent::ToolCallFinished {
+                call_id: _,
+                name,
+                result,
+                elapsed,
+            } => {
+                self.run_status = RunStatus::Working;
+                finish_tool_message(
+                    &mut self.messages,
+                    &mut self.active_tool_message,
+                    &name,
+                    result,
+                    elapsed,
+                );
+            }
+            AgentEvent::PermissionPrompt { name, summary } => {
+                self.run_status = RunStatus::WaitingApproval;
+                self.push_permission_message(&name, &summary);
+            }
+            AgentEvent::Stop { reason } => {
+                self.run_status = RunStatus::Idle;
+                if reason != StopReason::FinalAnswer {
+                    self.push_message(MessageKind::Warning, "stopped", reason.to_string());
+                }
+            }
+            AgentEvent::Error { message } => {
+                self.run_status = RunStatus::Idle;
+                self.push_message(MessageKind::Error, "error", message);
+            }
+        }
+    }
+}
+
+struct ApprovalPickerState {
+    selected: usize,
+    response: Option<std_mpsc::Sender<bool>>,
+}
+
+impl ApprovalPickerState {
+    fn new(response: std_mpsc::Sender<bool>) -> Self {
+        Self {
+            selected: 0,
+            response: Some(response),
+        }
+    }
+
+    fn selected(&self) -> usize {
+        self.selected
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ApprovalAction {
+        match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                self.selected = 1 - self.selected;
+                ApprovalAction::None
+            }
+            KeyCode::Tab | KeyCode::Enter => ApprovalAction::Decide(self.selected == 0),
+            KeyCode::Esc => ApprovalAction::Decide(false),
+            _ => ApprovalAction::None,
+        }
+    }
+
+    fn send(&mut self, approved: bool) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(approved);
+        }
+    }
+}
+
+impl Drop for ApprovalPickerState {
+    fn drop(&mut self) {
+        self.send(false);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalAction {
+    None,
+    Decide(bool),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1010,22 +1270,13 @@ enum RunStatus {
 }
 
 impl RunStatus {
-    fn label(&self, tick: usize) -> String {
+    fn label(&self, _tick: usize) -> String {
         match self {
             RunStatus::Idle => "idle".into(),
-            RunStatus::Working => format!("{} Working...", sweep(tick)),
-            RunStatus::Tool(name) => format!("{} Running {name}", sweep(tick)),
+            RunStatus::Working => "Working...".into(),
+            RunStatus::Tool(name) => format!("Running {name}"),
             RunStatus::WaitingApproval => "Waiting for approval".into(),
         }
-    }
-}
-
-fn sweep(tick: usize) -> &'static str {
-    match tick % 4 {
-        0 => ".",
-        1 => "·",
-        2 => "•",
-        _ => "·",
     }
 }
 
@@ -1034,7 +1285,16 @@ struct TuiMessage {
     kind: MessageKind,
     title: String,
     body: String,
+    status: Option<MessageStatus>,
     transient: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageStatus {
+    Running,
+    Success,
+    Failed,
+    Neutral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1054,32 +1314,52 @@ fn draw_frame(
     scroll_top: usize,
     composer: &ComposerState,
     model_panel: Option<&ModelPanelState>,
+    approval_selected: Option<usize>,
     footer: &FooterState,
 ) {
-    let bottom_height = bottom_panel_height(composer, model_panel);
+    let bottom_height = bottom_panel_height(composer, model_panel, approval_selected);
+    let working_height = working_panel_height(footer);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(working_height),
             Constraint::Length(3),
             Constraint::Length(bottom_height),
         ])
         .split(frame.size());
     draw_messages(frame, chunks[0], message_lines, scroll_top);
-    draw_composer(frame, chunks[1], composer);
-    frame.render_widget(Clear, chunks[2]);
+    draw_working_line(frame, chunks[1], footer);
+    draw_composer(frame, chunks[2], composer);
+    frame.render_widget(Clear, chunks[3]);
     if let Some(panel) = model_panel {
-        draw_model_panel(frame, chunks[2], panel);
+        draw_model_panel(frame, chunks[3], panel);
+    } else if let Some(selected) = approval_selected {
+        draw_approval_picker(frame, chunks[3], selected);
     } else if composer.popup_open() {
-        draw_popup(frame, chunks[2], composer);
+        draw_popup(frame, chunks[3], composer);
     } else {
-        draw_footer(frame, chunks[2], footer);
+        draw_footer(frame, chunks[3], footer);
     }
 }
 
-fn bottom_panel_height(composer: &ComposerState, model_panel: Option<&ModelPanelState>) -> u16 {
+fn working_panel_height(footer: &FooterState) -> u16 {
+    if matches!(footer.run_status, RunStatus::Idle) {
+        0
+    } else {
+        1
+    }
+}
+
+fn bottom_panel_height(
+    composer: &ComposerState,
+    model_panel: Option<&ModelPanelState>,
+    approval_selected: Option<usize>,
+) -> u16 {
     if model_panel.is_some() {
         9
+    } else if approval_selected.is_some() {
+        4
     } else if composer.popup_open() {
         let rows = composer.matches().len().min(POPUP_LIMIT).max(1);
         rows as u16 + 2
@@ -1104,6 +1384,14 @@ fn draw_messages(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_working_line(frame: &mut Frame<'_>, area: Rect, footer: &FooterState) {
+    if area.height == 0 || matches!(footer.run_status, RunStatus::Idle) {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(working_line(footer)), area);
+}
+
 fn draw_composer(frame: &mut Frame<'_>, area: Rect, composer: &ComposerState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1115,6 +1403,26 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, composer: &ComposerState) {
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(visible), inner);
     frame.set_cursor(inner.x + cursor_x as u16, inner.y);
+}
+
+fn working_line(footer: &FooterState) -> Line<'static> {
+    let label = footer.run_status.label(footer.animation_tick);
+    let highlight = footer.animation_tick % label.chars().count().max(1);
+    let mut spans = vec![Span::styled(
+        "● ",
+        status_style(MessageStatus::Running, footer.animation_tick).add_modifier(Modifier::BOLD),
+    )];
+    for (index, ch) in label.chars().enumerate() {
+        let style = if index == highlight {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    Line::from(spans)
 }
 
 fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState) {
@@ -1153,6 +1461,38 @@ fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState
                     style.add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(command.description, style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_approval_picker(frame: &mut Frame<'_>, footer_area: Rect, selected: usize) {
+    let width = 68u16.min(footer_area.width);
+    let area = Rect::new(footer_area.x, footer_area.y, width, footer_area.height);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" approval ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let items = [
+        ("Approve", "allow this tool call"),
+        ("Deny", "skip this tool call"),
+    ];
+    let lines = items
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, description))| {
+            let style = if index == selected {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!("{label:<12}"), style.add_modifier(Modifier::BOLD)),
+                Span::styled(description, style),
             ])
         })
         .collect::<Vec<_>>();
@@ -1206,26 +1546,43 @@ fn footer_text(footer: &FooterState) -> String {
         "reasoning hidden"
     };
     format!(
-        "{} · thinking:{} · effort:{} · {} · {} · {}",
-        footer.model,
-        footer.thinking,
-        footer.reasoning_effort,
-        footer.cwd,
-        reasoning,
-        footer.run_status.label(footer.animation_tick)
+        "{} · {}/{} · {} · {}",
+        footer.model, footer.thinking, footer.reasoning_effort, footer.cwd, reasoning
     )
 }
 
-fn build_message_lines(messages: &[TuiMessage], width: usize) -> Vec<Line<'static>> {
+fn short_thinking(thinking: Option<ThinkingMode>) -> &'static str {
+    match thinking {
+        Some(ThinkingMode::Enabled) => "think",
+        Some(ThinkingMode::Disabled) => "nothink",
+        None => "unset",
+    }
+}
+
+fn short_reasoning_effort(effort: Option<ReasoningEffort>) -> &'static str {
+    match effort {
+        Some(ReasoningEffort::Low) => "low",
+        Some(ReasoningEffort::Medium) => "med",
+        Some(ReasoningEffort::High) => "high",
+        Some(ReasoningEffort::Xhigh) => "xhigh",
+        Some(ReasoningEffort::Max) => "max",
+        None => "unset",
+    }
+}
+
+fn build_message_lines(
+    messages: &[TuiMessage],
+    width: usize,
+    animation_tick: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for message in messages {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(vec![Span::styled(
-            message.title.clone(),
-            message_style(message.kind).add_modifier(Modifier::BOLD),
-        )]));
+        if !matches!(message.kind, MessageKind::User | MessageKind::Assistant) {
+            lines.push(message_title_line(message, animation_tick));
+        }
         for raw_line in message.body.lines() {
             lines.extend(wrap_styled_line(
                 raw_line,
@@ -1235,6 +1592,29 @@ fn build_message_lines(messages: &[TuiMessage], width: usize) -> Vec<Line<'stati
         }
     }
     lines
+}
+
+fn message_title_line(message: &TuiMessage, animation_tick: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    if let Some(status) = visible_status(message) {
+        spans.push(Span::styled(
+            "● ",
+            status_style(status, animation_tick).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        message.title.clone(),
+        message_style(message.kind).add_modifier(Modifier::BOLD),
+    ));
+    Line::from(spans)
+}
+
+fn visible_status(message: &TuiMessage) -> Option<MessageStatus> {
+    if matches!(message.kind, MessageKind::User | MessageKind::Assistant) {
+        None
+    } else {
+        message.status
+    }
 }
 
 fn wrap_styled_line(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
@@ -1260,6 +1640,26 @@ fn wrap_styled_line(text: &str, style: Style, width: usize) -> Vec<Line<'static>
         lines.push(Line::from(Span::styled(current, style)));
     }
     lines
+}
+
+fn default_status_for_kind(kind: MessageKind) -> Option<MessageStatus> {
+    match kind {
+        MessageKind::User | MessageKind::Assistant => None,
+        MessageKind::Reasoning | MessageKind::System | MessageKind::Tool => {
+            Some(MessageStatus::Neutral)
+        }
+        MessageKind::Warning | MessageKind::Error => Some(MessageStatus::Failed),
+    }
+}
+
+fn status_style(status: MessageStatus, animation_tick: usize) -> Style {
+    match status {
+        MessageStatus::Running if animation_tick % 2 == 0 => Style::default().fg(Color::DarkGray),
+        MessageStatus::Running => Style::default().fg(Color::Gray),
+        MessageStatus::Success => Style::default().fg(Color::Green),
+        MessageStatus::Failed => Style::default().fg(Color::Red),
+        MessageStatus::Neutral => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn message_style(kind: MessageKind) -> Style {
@@ -1311,6 +1711,67 @@ fn tool_result_label(result: &ToolResult) -> &'static str {
         "denied"
     } else {
         "failed"
+    }
+}
+
+fn finish_tool_message(
+    messages: &mut Vec<TuiMessage>,
+    active_tool_message: &mut Option<usize>,
+    name: &str,
+    result: ToolResult,
+    elapsed: Duration,
+) {
+    let kind = tool_result_kind(&result);
+    let title = format!("tool {name}");
+    let body = tool_finished_body(&result, elapsed);
+    let status = Some(status_for_tool_result(&result));
+    if let Some(index) = active_tool_message
+        .take()
+        .filter(|index| *index < messages.len() && messages[*index].title == title)
+    {
+        messages[index] = TuiMessage {
+            kind,
+            title,
+            body,
+            status,
+            transient: false,
+        };
+    } else {
+        messages.push(TuiMessage {
+            kind,
+            title,
+            body,
+            status,
+            transient: false,
+        });
+    }
+}
+
+fn tool_finished_body(result: &ToolResult, elapsed: Duration) -> String {
+    format!(
+        "{} in {}\n{}",
+        tool_result_label(result),
+        format_duration(elapsed),
+        summarize_result(result)
+    )
+}
+
+fn status_for_tool_result(result: &ToolResult) -> MessageStatus {
+    if result.success {
+        MessageStatus::Success
+    } else {
+        MessageStatus::Failed
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds < 1.0 {
+        format!("{}ms", duration.as_millis())
+    } else if seconds < 10.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{seconds:.0}s")
     }
 }
 
@@ -1479,9 +1940,10 @@ mod tests {
             kind: MessageKind::System,
             title: "title".into(),
             body: "你好hello".into(),
+            status: Some(MessageStatus::Neutral),
             transient: false,
         }];
-        let lines = build_message_lines(&messages, 4);
+        let lines = build_message_lines(&messages, 4, 0);
         assert!(lines.len() >= 3);
     }
 
@@ -1496,7 +1958,7 @@ mod tests {
     fn footer_text_contains_status_and_reasoning_visibility() {
         let footer = FooterState {
             model: "deepseek-v4-flash".into(),
-            thinking: "enabled".into(),
+            thinking: "think".into(),
             reasoning_effort: "high".into(),
             cwd: "/tmp/micos".into(),
             show_reasoning: false,
@@ -1505,15 +1967,153 @@ mod tests {
         };
         let text = footer_text(&footer);
         assert!(text.contains("deepseek-v4-flash"));
+        assert!(text.contains("think/high"));
         assert!(text.contains("reasoning hidden"));
-        assert!(text.contains("Working"));
+        assert!(!text.contains("Working"));
+    }
+
+    #[test]
+    fn footer_short_labels_cover_thinking_and_effort() {
+        assert_eq!(short_thinking(Some(ThinkingMode::Enabled)), "think");
+        assert_eq!(short_thinking(Some(ThinkingMode::Disabled)), "nothink");
+        assert_eq!(short_thinking(None), "unset");
+        assert_eq!(short_reasoning_effort(Some(ReasoningEffort::High)), "high");
+        assert_eq!(short_reasoning_effort(Some(ReasoningEffort::Max)), "max");
+        assert_eq!(short_reasoning_effort(None), "unset");
     }
 
     #[test]
     fn bottom_panel_expands_for_popup_below_composer() {
         let mut composer = ComposerState::new();
         composer.handle_key(key(KeyCode::Char('/')));
-        assert!(bottom_panel_height(&composer, None) > 1);
-        assert_eq!(bottom_panel_height(&ComposerState::new(), None), 1);
+        assert!(bottom_panel_height(&composer, None, None) > 1);
+        assert_eq!(bottom_panel_height(&ComposerState::new(), None, None), 1);
+        assert_eq!(bottom_panel_height(&ComposerState::new(), None, Some(0)), 4);
+    }
+
+    #[test]
+    fn message_status_dot_skips_user_and_assistant() {
+        let tool = TuiMessage {
+            kind: MessageKind::Tool,
+            title: "tool read_file".into(),
+            body: "path=src/tui.rs".into(),
+            status: Some(MessageStatus::Running),
+            transient: false,
+        };
+        let user = TuiMessage {
+            kind: MessageKind::User,
+            title: "you".into(),
+            body: "hello".into(),
+            status: None,
+            transient: false,
+        };
+        assert!(visible_status(&tool).is_some());
+        assert!(visible_status(&user).is_none());
+        assert_ne!(
+            status_style(MessageStatus::Running, 0),
+            status_style(MessageStatus::Running, 1)
+        );
+    }
+
+    #[test]
+    fn user_and_assistant_messages_do_not_render_titles() {
+        let lines = build_message_lines(
+            &[
+                TuiMessage {
+                    kind: MessageKind::User,
+                    title: "you".into(),
+                    body: "hello".into(),
+                    status: None,
+                    transient: false,
+                },
+                TuiMessage {
+                    kind: MessageKind::Assistant,
+                    title: "assistant".into(),
+                    body: "hi".into(),
+                    status: None,
+                    transient: false,
+                },
+            ],
+            80,
+            0,
+        );
+        let rendered = format!("{lines:?}");
+        assert!(!rendered.contains("you"));
+        assert!(!rendered.contains("assistant"));
+        assert!(rendered.contains("hello"));
+        assert!(rendered.contains("hi"));
+    }
+
+    #[test]
+    fn tool_finish_updates_active_message_without_internal_fields() {
+        let mut messages = vec![TuiMessage {
+            kind: MessageKind::Tool,
+            title: "tool read_file".into(),
+            body: "path=src/tui.rs".into(),
+            status: Some(MessageStatus::Running),
+            transient: false,
+        }];
+        let mut active = Some(0);
+        finish_tool_message(
+            &mut messages,
+            &mut active,
+            "read_file",
+            ToolResult {
+                success: true,
+                output: "contents".into(),
+                error: None,
+                denied: false,
+            },
+            Duration::from_millis(250),
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].status, Some(MessageStatus::Success));
+        assert!(messages[0].body.contains("ok in 250ms"));
+        assert!(!messages[0].body.contains("call"));
+        assert!(!messages[0].body.contains("permission"));
+    }
+
+    #[test]
+    fn working_panel_only_appears_while_running() {
+        let mut footer = FooterState {
+            model: "deepseek-v4-flash".into(),
+            thinking: "enabled".into(),
+            reasoning_effort: "high".into(),
+            cwd: "/tmp/micos".into(),
+            show_reasoning: false,
+            run_status: RunStatus::Idle,
+            animation_tick: 0,
+        };
+        assert_eq!(working_panel_height(&footer), 0);
+        footer.run_status = RunStatus::Working;
+        assert_eq!(working_panel_height(&footer), 1);
+        assert!(footer
+            .run_status
+            .label(footer.animation_tick)
+            .contains("Working"));
+    }
+
+    #[test]
+    fn approval_picker_supports_selection_and_denies_on_escape() {
+        let (response, decision) = std_mpsc::channel();
+        let mut picker = ApprovalPickerState::new(response);
+        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.handle_key(key(KeyCode::Down)), ApprovalAction::None);
+        assert_eq!(picker.selected(), 1);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ApprovalAction::Decide(false)
+        );
+        drop(picker);
+        assert!(!decision.recv().unwrap());
+
+        let (response, decision) = std_mpsc::channel();
+        let mut picker = ApprovalPickerState::new(response);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Esc)),
+            ApprovalAction::Decide(false)
+        );
+        picker.send(false);
+        assert!(!decision.recv().unwrap());
     }
 }

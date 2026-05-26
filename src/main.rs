@@ -135,16 +135,17 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let session = Session::new(&config).context("create session")?;
     let api_key = resolve_api_key()?;
     let client = OpenAiModelClient::new(api_key, config.api_kind, config.base_url.clone());
-    let mut agent = Agent::new(config, client, session);
+    let agent = Agent::new(config, client, session);
 
     if should_use_tui(
         args.no_tui,
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
     ) {
-        return tui::run_tui_chat(&mut agent).await;
+        return tui::run_tui_chat(agent).await;
     }
 
+    let mut agent = agent;
     run_console_chat(&mut agent, io::stdin().is_terminal()).await
 }
 
