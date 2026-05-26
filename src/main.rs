@@ -3,6 +3,7 @@ mod config;
 mod model;
 mod session;
 mod tools;
+mod tui;
 mod ui;
 
 use agent::Agent;
@@ -11,10 +12,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use config::{
     resolve_api_key, ConfigOverrides, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode,
 };
-use model::OpenAiModelClient;
+use model::{ModelClient, OpenAiModelClient};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use session::{Session, StopReason};
+use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use ui::{parse_input, ConsoleUi, InputCommand, SlashCommand};
 
@@ -52,6 +54,9 @@ struct ChatArgs {
 
     #[arg(long)]
     cwd: Option<PathBuf>,
+
+    #[arg(long)]
+    no_tui: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -131,40 +136,42 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let api_key = resolve_api_key()?;
     let client = OpenAiModelClient::new(api_key, config.api_kind, config.base_url.clone());
     let mut agent = Agent::new(config, client, session);
+
+    if should_use_tui(
+        args.no_tui,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    ) {
+        return tui::run_tui_chat(&mut agent).await;
+    }
+
+    run_console_chat(&mut agent, io::stdin().is_terminal()).await
+}
+
+async fn run_console_chat<C: ModelClient>(
+    agent: &mut Agent<C>,
+    interactive: bool,
+) -> anyhow::Result<()> {
     let mut ui = ConsoleUi::new();
     ui.banner(agent.config(), agent.session_id(), agent.session_path());
+
+    if !interactive {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            if !handle_console_line(line.context("read stdin line")?, agent, &mut ui).await? {
+                break;
+            }
+        }
+        return Ok(());
+    }
 
     let mut editor = DefaultEditor::new()?;
     loop {
         match editor.readline(&format!("{} ", ui.prompt())) {
             Ok(line) => {
                 let _ = editor.add_history_entry(line.trim());
-                match parse_input(&line) {
-                    InputCommand::Empty => continue,
-                    InputCommand::UserText(input) => {
-                        let reason = agent.run_turn_with_ui(input, &mut ui).await?;
-                        if matches!(reason, StopReason::UserExit | StopReason::UserInterrupt) {
-                            break;
-                        }
-                    }
-                    InputCommand::Slash(command) => match command {
-                        SlashCommand::Help => ui.print_help(),
-                        SlashCommand::Status => ui.print_status(
-                            agent.config(),
-                            agent.session_id(),
-                            agent.session_path(),
-                        ),
-                        SlashCommand::Clear => ui.clear()?,
-                        SlashCommand::Sessions => ui.print_sessions(&agent.config().cwd)?,
-                        SlashCommand::Transcript => ui.print_transcript(agent.session_path())?,
-                        SlashCommand::Exit => {
-                            agent.stop(StopReason::UserExit).await?;
-                            break;
-                        }
-                    },
-                    InputCommand::UnknownSlash(command) => {
-                        eprintln!("Unknown command: {command}. Type /help.");
-                    }
+                if !handle_console_line(line, agent, &mut ui).await? {
+                    break;
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -181,4 +188,67 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn handle_console_line<C: ModelClient>(
+    line: String,
+    agent: &mut Agent<C>,
+    ui: &mut ConsoleUi,
+) -> anyhow::Result<bool> {
+    match parse_input(&line) {
+        InputCommand::Empty => Ok(true),
+        InputCommand::UserText(input) => {
+            let reason = agent.run_turn_with_ui(input, ui).await?;
+            Ok(!matches!(
+                reason,
+                StopReason::UserExit | StopReason::UserInterrupt
+            ))
+        }
+        InputCommand::Slash(command) => handle_console_slash(command, agent, ui).await,
+        InputCommand::UnknownSlash(command) => {
+            eprintln!("Unknown command: {command}. Type /help.");
+            Ok(true)
+        }
+    }
+}
+
+async fn handle_console_slash<C: ModelClient>(
+    command: SlashCommand,
+    agent: &mut Agent<C>,
+    ui: &mut ConsoleUi,
+) -> anyhow::Result<bool> {
+    match command {
+        SlashCommand::Help => ui.print_help(),
+        SlashCommand::Status => {
+            ui.print_status(agent.config(), agent.session_id(), agent.session_path())
+        }
+        SlashCommand::Sessions => ui.print_sessions(&agent.config().cwd)?,
+        SlashCommand::Transcript => ui.print_transcript(agent.session_path())?,
+        SlashCommand::Model => {
+            eprintln!("The /model picker is only available in TUI mode. Restart without --no-tui.")
+        }
+        SlashCommand::Clear => ui.clear()?,
+        SlashCommand::Exit => {
+            agent.stop(StopReason::UserExit).await?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn should_use_tui(no_tui: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
+    !no_tui && stdin_tty && stdout_tty
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_is_used_only_for_default_interactive_terminal() {
+        assert!(should_use_tui(false, true, true));
+        assert!(!should_use_tui(true, true, true));
+        assert!(!should_use_tui(false, false, true));
+        assert!(!should_use_tui(false, true, false));
+    }
 }

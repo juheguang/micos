@@ -141,77 +141,20 @@ impl ConsoleUi {
     }
 
     pub fn print_help(&mut self) {
-        println!("Commands:");
-        println!("  /help        show this help");
-        println!("  /status      show model, API, permission, cwd, and log path");
-        println!("  /sessions    list recent session logs");
-        println!("  /transcript  show current transcript and recent events");
-        println!("  /clear       clear the terminal");
-        println!("  /exit        exit");
+        println!("{}", format_help());
     }
 
     pub fn print_status(&mut self, config: &SessionConfig, session_id: Uuid, session_path: &Path) {
-        println!("session: {session_id}");
-        println!("model: {}", config.model);
-        println!("api kind: {}", config.api_kind);
-        println!("base url: {}", config.base_url);
-        println!(
-            "thinking: {}",
-            config.thinking.map_or("unset".into(), |v| v.to_string())
-        );
-        println!(
-            "reasoning effort: {}",
-            config
-                .reasoning_effort
-                .map_or("unset".into(), |v| v.to_string())
-        );
-        println!("permission: {}", config.permission);
-        println!("cwd: {}", config.cwd.display());
-        println!("log: {}", session_path.display());
+        println!("{}", format_status(config, session_id, session_path));
     }
 
     pub fn print_sessions(&mut self, cwd: &Path) -> Result<()> {
-        let dir = cwd.join(SESSION_DIR);
-        if !dir.exists() {
-            println!("No sessions found at {}", dir.display());
-            return Ok(());
-        }
-
-        let mut entries = fs::read_dir(&dir)
-            .with_context(|| format!("read session directory {}", dir.display()))?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                Some((entry.path(), metadata.modified().ok()?))
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-
-        if entries.is_empty() {
-            println!("No sessions found at {}", dir.display());
-            return Ok(());
-        }
-
-        for (path, modified) in entries.into_iter().take(10) {
-            let modified = humantime(modified);
-            println!("{modified}  {}", path.display());
-        }
+        println!("{}", format_sessions(cwd)?);
         Ok(())
     }
 
     pub fn print_transcript(&mut self, path: &Path) -> Result<()> {
-        println!("transcript: {}", path.display());
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read transcript {}", path.display()))?;
-        let lines = text.lines().rev().take(8).collect::<Vec<_>>();
-        if lines.is_empty() {
-            println!("No events recorded.");
-            return Ok(());
-        }
-        println!("recent events:");
-        for line in lines.into_iter().rev() {
-            println!("  {}", summarize_json_line(line));
-        }
+        println!("{}", format_transcript(path)?);
         Ok(())
     }
 
@@ -395,12 +338,58 @@ enum Paint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlashCommand {
     Help,
-    Exit,
     Status,
-    Clear,
     Sessions,
     Transcript,
+    Model,
+    Clear,
+    Exit,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlashCommandInfo {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub command: SlashCommand,
+}
+
+pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
+    SlashCommandInfo {
+        name: "help",
+        description: "show this help",
+        command: SlashCommand::Help,
+    },
+    SlashCommandInfo {
+        name: "status",
+        description: "show model, API, permission, cwd, and log path",
+        command: SlashCommand::Status,
+    },
+    SlashCommandInfo {
+        name: "sessions",
+        description: "list recent session logs",
+        command: SlashCommand::Sessions,
+    },
+    SlashCommandInfo {
+        name: "transcript",
+        description: "show current transcript and recent events",
+        command: SlashCommand::Transcript,
+    },
+    SlashCommandInfo {
+        name: "model",
+        description: "choose model and thinking settings",
+        command: SlashCommand::Model,
+    },
+    SlashCommandInfo {
+        name: "clear",
+        description: "clear the terminal",
+        command: SlashCommand::Clear,
+    },
+    SlashCommandInfo {
+        name: "exit",
+        description: "exit",
+        command: SlashCommand::Exit,
+    },
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputCommand {
@@ -418,15 +407,111 @@ pub fn parse_input(input: &str) -> InputCommand {
     if !trimmed.starts_with('/') {
         return InputCommand::UserText(trimmed.to_string());
     }
-    match trimmed {
-        "/help" => InputCommand::Slash(SlashCommand::Help),
-        "/exit" | "/quit" => InputCommand::Slash(SlashCommand::Exit),
-        "/status" => InputCommand::Slash(SlashCommand::Status),
-        "/clear" => InputCommand::Slash(SlashCommand::Clear),
-        "/sessions" => InputCommand::Slash(SlashCommand::Sessions),
-        "/transcript" => InputCommand::Slash(SlashCommand::Transcript),
-        other => InputCommand::UnknownSlash(other.to_string()),
+    match slash_command_exact(trimmed) {
+        Some(command) => InputCommand::Slash(command),
+        None => InputCommand::UnknownSlash(trimmed.to_string()),
     }
+}
+
+pub fn slash_command_exact(input: &str) -> Option<SlashCommand> {
+    let name = input.strip_prefix('/')?;
+    if name == "quit" {
+        return Some(SlashCommand::Exit);
+    }
+    SLASH_COMMANDS
+        .iter()
+        .find(|command| command.name == name)
+        .map(|command| command.command)
+}
+
+pub fn slash_command_matches(input: &str) -> Vec<SlashCommandInfo> {
+    let Some(prefix) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.name.starts_with(prefix))
+        .collect()
+}
+
+pub fn format_help() -> String {
+    let mut lines = vec!["Commands:".to_string()];
+    for command in SLASH_COMMANDS {
+        lines.push(format!("  /{:<11} {}", command.name, command.description));
+    }
+    lines.join("\n")
+}
+
+pub fn format_status(config: &SessionConfig, session_id: Uuid, session_path: &Path) -> String {
+    [
+        format!("session: {session_id}"),
+        format!("model: {}", config.model),
+        format!("api kind: {}", config.api_kind),
+        format!("base url: {}", config.base_url),
+        format!(
+            "thinking: {}",
+            config.thinking.map_or("unset".into(), |v| v.to_string())
+        ),
+        format!(
+            "reasoning effort: {}",
+            config
+                .reasoning_effort
+                .map_or("unset".into(), |v| v.to_string())
+        ),
+        format!("permission: {}", config.permission),
+        format!("cwd: {}", config.cwd.display()),
+        format!("log: {}", session_path.display()),
+    ]
+    .join("\n")
+}
+
+pub fn format_sessions(cwd: &Path) -> Result<String> {
+    let dir = cwd.join(SESSION_DIR);
+    if !dir.exists() {
+        return Ok(format!("No sessions found at {}", dir.display()));
+    }
+
+    let mut entries = fs::read_dir(&dir)
+        .with_context(|| format!("read session directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            Some((entry.path(), metadata.modified().ok()?))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if entries.is_empty() {
+        return Ok(format!("No sessions found at {}", dir.display()));
+    }
+
+    Ok(entries
+        .into_iter()
+        .take(10)
+        .map(|(path, modified)| format!("{}  {}", humantime(modified), path.display()))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub fn format_transcript(path: &Path) -> Result<String> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read transcript {}", path.display()))?;
+    let lines = text.lines().rev().take(8).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(format!(
+            "transcript: {}\nNo events recorded.",
+            path.display()
+        ));
+    }
+    let mut output = vec![
+        format!("transcript: {}", path.display()),
+        "recent events:".into(),
+    ];
+    for line in lines.into_iter().rev() {
+        output.push(format!("  {}", summarize_json_line(line)));
+    }
+    Ok(output.join("\n"))
 }
 
 fn summarize_result(result: &ToolResult) -> String {
@@ -512,5 +597,35 @@ mod tests {
             parse_input("/missing"),
             InputCommand::UnknownSlash("/missing".into())
         );
+    }
+
+    #[test]
+    fn slash_catalog_order_and_matching_are_shared() {
+        let names = SLASH_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "help",
+                "status",
+                "sessions",
+                "transcript",
+                "model",
+                "clear",
+                "exit"
+            ]
+        );
+        assert_eq!(slash_command_exact("/status"), Some(SlashCommand::Status));
+        assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
+        assert_eq!(
+            slash_command_matches("/sta")
+                .into_iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            vec!["status"]
+        );
+        assert!(slash_command_matches("/missing").is_empty());
     }
 }

@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 pub const DEFAULT_MODEL: &str = "gpt-5.3-codex";
 pub const DEFAULT_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1/responses";
+pub const DEEPSEEK_CHAT_COMPLETIONS_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
 pub const DEFAULT_MAX_STEPS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -138,6 +139,14 @@ pub struct SessionConfig {
     pub cwd: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelSettings {
+    pub model: String,
+    pub base_url: String,
+    pub thinking: Option<ThinkingMode>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ConfigOverrides {
     pub model: Option<String>,
@@ -225,6 +234,54 @@ impl SessionConfig {
             cwd,
         })
     }
+
+    pub fn apply_model_settings(&mut self, settings: &ModelSettings) {
+        self.model = settings.model.clone();
+        self.base_url = settings.base_url.clone();
+        self.api_kind = infer_api_kind(&self.base_url);
+        self.thinking = settings.thinking;
+        self.reasoning_effort = settings.reasoning_effort;
+    }
+}
+
+pub fn save_model_settings(cwd: &Path, settings: &ModelSettings) -> Result<()> {
+    let dir = cwd.join(".micos");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create config directory {}", dir.display()))?;
+    let path = dir.join("config.toml");
+    let mut table = if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read config file {}", path.display()))?;
+        text.parse::<toml::Value>()
+            .with_context(|| format!("parse config file {}", path.display()))?
+            .as_table()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        toml::map::Map::new()
+    };
+
+    table.insert("model".into(), toml::Value::String(settings.model.clone()));
+    table.insert(
+        "base_url".into(),
+        toml::Value::String(settings.base_url.clone()),
+    );
+    if let Some(thinking) = settings.thinking {
+        table.insert("thinking".into(), toml::Value::String(thinking.to_string()));
+    } else {
+        table.remove("thinking");
+    }
+    if let Some(reasoning_effort) = settings.reasoning_effort {
+        table.insert(
+            "reasoning_effort".into(),
+            toml::Value::String(reasoning_effort.to_string()),
+        );
+    } else {
+        table.remove("reasoning_effort");
+    }
+
+    let text = toml::to_string_pretty(&toml::Value::Table(table)).context("serialize config")?;
+    std::fs::write(&path, text).with_context(|| format!("write config file {}", path.display()))
 }
 
 impl EnvConfig {
@@ -403,5 +460,35 @@ reasoning_effort = "max"
         );
         assert_eq!(cfg.thinking, Some(ThinkingMode::Enabled));
         assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn saves_model_settings_without_dropping_other_config() {
+        let cwd = std::env::temp_dir().join(format!("micos-config-{}", uuid::Uuid::new_v4()));
+        let config_dir = cwd.join(".micos");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "permission = \"ask\"\nmax_steps = 5\n",
+        )
+        .unwrap();
+
+        save_model_settings(
+            &cwd,
+            &ModelSettings {
+                model: "deepseek-v4-pro".into(),
+                base_url: DEEPSEEK_CHAT_COMPLETIONS_BASE_URL.into(),
+                thinking: Some(ThinkingMode::Disabled),
+                reasoning_effort: Some(ReasoningEffort::Max),
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        assert!(text.contains("permission = \"ask\""));
+        assert!(text.contains("max_steps = 5"));
+        assert!(text.contains("model = \"deepseek-v4-pro\""));
+        assert!(text.contains("thinking = \"disabled\""));
+        assert!(text.contains("reasoning_effort = \"max\""));
     }
 }

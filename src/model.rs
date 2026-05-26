@@ -64,6 +64,11 @@ impl OpenAiModelClient {
             http: reqwest::Client::new(),
         }
     }
+
+    pub fn update_endpoint(&mut self, api_kind: ApiKind, base_url: String) {
+        self.api_kind = api_kind;
+        self.base_url = base_url;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

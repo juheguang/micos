@@ -57,6 +57,13 @@ pub enum SessionEvent {
         permission: PermissionMode,
         cwd: PathBuf,
     },
+    ConfigChanged {
+        timestamp: String,
+        model: String,
+        base_url: String,
+        thinking: Option<ThinkingMode>,
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     UserInput {
         timestamp: String,
         text: String,

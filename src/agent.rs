@@ -1,5 +1,5 @@
-use crate::config::SessionConfig;
-use crate::model::{ModelClient, ModelRequest};
+use crate::config::{ModelSettings, SessionConfig, ThinkingMode};
+use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::session::{now, Session, SessionEvent, StopReason};
 use crate::tools::{
     permission_decision, BuiltinTool, Tool, ToolContext, ToolPermissionDecision, ToolResult,
@@ -77,6 +77,11 @@ impl<C: ModelClient> Agent<C> {
         let mut consecutive_tool_failures = 0usize;
 
         for _step in 0..self.config.max_steps {
+            let reasoning_effort = if self.config.thinking == Some(ThinkingMode::Disabled) {
+                None
+            } else {
+                self.config.reasoning_effort.map(|value| value.to_string())
+            };
             let request = ModelRequest {
                 model: self.config.model.clone(),
                 input: self.transcript.clone(),
@@ -84,7 +89,7 @@ impl<C: ModelClient> Agent<C> {
                 instructions: system_instructions(),
                 parallel_tool_calls: false,
                 thinking: self.config.thinking.map(|value| value.to_string()),
-                reasoning_effort: self.config.reasoning_effort.map(|value| value.to_string()),
+                reasoning_effort,
             };
 
             let mut recording_ui = SessionRecordingUi {
@@ -263,6 +268,21 @@ impl<C: ModelClient> Agent<C> {
     }
 }
 
+impl Agent<OpenAiModelClient> {
+    pub fn apply_model_settings(&mut self, settings: ModelSettings) -> Result<()> {
+        self.config.apply_model_settings(&settings);
+        self.client
+            .update_endpoint(self.config.api_kind, self.config.base_url.clone());
+        self.session.append(&SessionEvent::ConfigChanged {
+            timestamp: now(),
+            model: self.config.model.clone(),
+            base_url: self.config.base_url.clone(),
+            thinking: self.config.thinking,
+            reasoning_effort: self.config.reasoning_effort,
+        })
+    }
+}
+
 struct SessionRecordingUi<'a, S> {
     session: &'a Session,
     inner: &'a mut S,
@@ -334,18 +354,21 @@ mod tests {
 
     struct MockModel {
         responses: Arc<Mutex<VecDeque<anyhow::Result<ModelResponse>>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     impl MockModel {
         fn new(responses: Vec<anyhow::Result<ModelResponse>>) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(responses.into())),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
 
     impl ModelClient for MockModel {
-        async fn respond(&self, _request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        async fn respond(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+            self.requests.lock().unwrap().push(request);
             self.responses
                 .lock()
                 .unwrap()
@@ -410,6 +433,19 @@ mod tests {
 
         let reason = agent.run_turn("hello".into()).await.unwrap();
         assert_eq!(reason, StopReason::FinalAnswer);
+    }
+
+    #[tokio::test]
+    async fn disabled_thinking_omits_reasoning_effort() {
+        let mut agent = test_agent(PermissionMode::Safe, 3, vec![Ok(final_response("done"))]);
+        agent.config.thinking = Some(ThinkingMode::Disabled);
+        agent.config.reasoning_effort = Some(crate::config::ReasoningEffort::Max);
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests[0].thinking.as_deref(), Some("disabled"));
+        assert_eq!(requests[0].reasoning_effort, None);
     }
 
     #[tokio::test]
