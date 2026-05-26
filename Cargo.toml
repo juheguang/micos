@@ -1,0 +1,23 @@
+[package]
+name = "micos"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+crossterm = "0.27"
+dotenvy = "0.15"
+futures-util = "0.3"
+indicatif = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustyline = "14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+time = { version = "0.3", features = ["formatting", "serde"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
