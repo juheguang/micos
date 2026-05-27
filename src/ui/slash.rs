@@ -284,7 +284,7 @@ fn summarize_trace_line(line: &str) -> Option<String> {
                 .unwrap_or_else(|| "{}".into())
         )),
         "permission_decision" => Some(format!(
-            "permission_decision: {} {} decision={} reason={} source={} mode={} elapsed={}ms",
+            "permission_decision: {} {} decision={} reason={} source={} mode={} elapsed={}ms{}",
             value
                 .get("tool")
                 .and_then(Value::as_str)
@@ -312,7 +312,12 @@ fn summarize_trace_line(line: &str) -> Option<String> {
                 .get("permission_mode")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown"),
-            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0)
+            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|message| format!(" message={}", trim_one_line(message, 100)))
+                .unwrap_or_default()
         )),
         "tool_finished" => Some(format!(
             "tool_finished: {} success={} elapsed={}ms",

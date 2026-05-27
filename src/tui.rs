@@ -5,7 +5,7 @@ use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
     format_help, format_sessions, format_status, format_trace, format_transcript, AgentEvent,
-    SlashCommand, UiSink,
+    ApprovalDecision, SlashCommand, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -71,7 +71,7 @@ enum TuiAgentMessage {
     ApprovalRequest {
         name: String,
         summary: String,
-        response: std_mpsc::Sender<bool>,
+        response: std_mpsc::Sender<ApprovalDecision>,
     },
     TurnFinished {
         agent: Agent<OpenAiModelClient>,
@@ -90,14 +90,14 @@ impl UiSink for TuiAgentSink {
         Ok(())
     }
 
-    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<bool> {
+    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<ApprovalDecision> {
         let (response, decision) = std_mpsc::channel();
         let _ = self.tx.send(TuiAgentMessage::ApprovalRequest {
             name: name.to_string(),
             summary: summary.to_string(),
             response,
         });
-        Ok(decision.recv().unwrap_or(false))
+        Ok(decision.recv().unwrap_or(ApprovalDecision::Deny))
     }
 }
 
@@ -525,22 +525,30 @@ impl TuiUi {
                 | KeyCode::Tab
                 | KeyCode::Enter
                 | KeyCode::Esc
+                | KeyCode::Char('s')
+                | KeyCode::Char('S')
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y')
+                | KeyCode::Char('p')
+                | KeyCode::Char('P')
+                | KeyCode::Char('n')
+                | KeyCode::Char('N')
         ) {
             return Ok(false);
         }
         let picker = self.approval_picker.as_mut().expect("picker checked above");
         match picker.handle_key(key) {
             ApprovalAction::None => {}
-            ApprovalAction::Decide(approved) => {
-                self.finish_approval(approved);
+            ApprovalAction::Decide(decision) => {
+                self.finish_approval(decision);
             }
         }
         Ok(true)
     }
 
-    fn finish_approval(&mut self, approved: bool) {
+    fn finish_approval(&mut self, decision: ApprovalDecision) {
         if let Some(mut picker) = self.approval_picker.take() {
-            picker.send(approved);
+            picker.send(decision);
         }
         self.remove_permission_message();
         self.run_status = RunStatus::Working;
@@ -648,7 +656,7 @@ impl TuiUi {
         self.messages.push(TuiMessage {
             kind: MessageKind::Warning,
             title: format!("permission {name}"),
-            body: summary.to_string(),
+            body: format!("{summary}\ny once / enter session / p project / n deny"),
             status: Some(MessageStatus::Running),
             transient: true,
         });
@@ -670,7 +678,7 @@ impl UiSink for TuiUi {
         self.render()
     }
 
-    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<bool> {
+    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<ApprovalDecision> {
         self.push_permission_message(name, summary);
         self.render()?;
         loop {
@@ -681,15 +689,21 @@ impl UiSink for TuiUi {
                 continue;
             }
             let decision = match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+                KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
+                    Some(ApprovalDecision::AllowSession)
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::AllowOnce),
+                KeyCode::Char('p') | KeyCode::Char('P') => Some(ApprovalDecision::AllowProject),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    Some(ApprovalDecision::Deny)
+                }
                 _ => None,
             };
-            if let Some(approved) = decision {
+            if let Some(decision) = decision {
                 self.remove_permission_message();
                 self.run_status = RunStatus::Working;
                 self.render()?;
-                return Ok(approved);
+                return Ok(decision);
             }
         }
     }
@@ -980,7 +994,7 @@ mod tests {
         composer.handle_key(key(KeyCode::Char('/')));
         assert!(bottom_panel_height(&composer, None, None) > 1);
         assert_eq!(bottom_panel_height(&ComposerState::new(), None, None), 1);
-        assert_eq!(bottom_panel_height(&ComposerState::new(), None, Some(0)), 4);
+        assert_eq!(bottom_panel_height(&ComposerState::new(), None, Some(0)), 6);
     }
 
     #[test]
@@ -1092,20 +1106,21 @@ mod tests {
         assert_eq!(picker.selected(), 0);
         assert_eq!(picker.handle_key(key(KeyCode::Down)), ApprovalAction::None);
         assert_eq!(picker.selected(), 1);
-        assert_eq!(
-            picker.handle_key(key(KeyCode::Enter)),
-            ApprovalAction::Decide(false)
-        );
+        let action = picker.handle_key(key(KeyCode::Enter));
+        assert_eq!(action, ApprovalAction::Decide(ApprovalDecision::AllowOnce));
+        if let ApprovalAction::Decide(decision) = action {
+            picker.send(decision);
+        }
         drop(picker);
-        assert!(!decision.recv().unwrap());
+        assert_eq!(decision.recv().unwrap(), ApprovalDecision::AllowOnce);
 
         let (response, decision) = std_mpsc::channel();
         let mut picker = ApprovalPickerState::new(response);
         assert_eq!(
             picker.handle_key(key(KeyCode::Esc)),
-            ApprovalAction::Decide(false)
+            ApprovalAction::Decide(ApprovalDecision::Deny)
         );
-        picker.send(false);
-        assert!(!decision.recv().unwrap());
+        picker.send(ApprovalDecision::Deny);
+        assert_eq!(decision.recv().unwrap(), ApprovalDecision::Deny);
     }
 }

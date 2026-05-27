@@ -5,6 +5,14 @@ use anyhow::Result;
 use serde_json::Value;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowSession,
+    AllowProject,
+    Deny,
+}
+
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
     TurnStarted {
@@ -43,8 +51,8 @@ pub enum AgentEvent {
 pub trait UiSink {
     fn on_event(&mut self, event: AgentEvent) -> Result<()>;
 
-    fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<bool> {
-        Ok(false)
+    fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<ApprovalDecision> {
+        Ok(ApprovalDecision::Deny)
     }
 }
 
@@ -56,7 +64,7 @@ impl UiSink for NullUi {
         Ok(())
     }
 
-    fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<bool> {
-        Ok(false)
+    fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<ApprovalDecision> {
+        Ok(ApprovalDecision::Deny)
     }
 }

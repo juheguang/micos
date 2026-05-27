@@ -1,14 +1,14 @@
-use crate::config::{ModelSettings, SessionConfig, ThinkingMode};
+use crate::config::{save_permission_rule, ModelSettings, SessionConfig, ThinkingMode};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::tools::{
     BuiltinToolRegistry, DecisionReason, ModePermissionPolicy, PermissionDecision,
-    PermissionPolicy, PolicyDecision, PolicyEngine, RuleSource, ToolContext, ToolRegistry,
-    ToolResult,
+    PermissionPolicy, PermissionRule, PolicyDecision, PolicyEngine, RuleBehavior, RuleSource,
+    ToolContext, ToolRegistry, ToolResult,
 };
 #[cfg(test)]
 use crate::ui::NullUi;
-use crate::ui::{AgentEvent, UiSink};
+use crate::ui::{AgentEvent, ApprovalDecision, UiSink};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -274,7 +274,7 @@ where
     }
 
     async fn execute_tool<S: UiSink + Send>(
-        &self,
+        &mut self,
         call_id: &str,
         name: &str,
         arguments: Value,
@@ -303,7 +303,50 @@ where
             PermissionDecision::Ask => {
                 let approval_start = Instant::now();
                 match ui.approve_tool(name, &metadata.argument_summary) {
-                    Ok(true) => {
+                    Ok(ApprovalDecision::AllowOnce) => {
+                        let runtime = PolicyDecision {
+                            decision: PermissionDecision::Allow,
+                            reason: DecisionReason::RuntimeApproval,
+                            rule_source: Some(RuleSource::Session),
+                            message: format!("{name} approved once by user"),
+                        };
+                        if let Err(error) = self.record_permission_decision(
+                            call_id,
+                            name,
+                            &metadata.argument_summary,
+                            &runtime,
+                            approval_start.elapsed().as_millis(),
+                        ) {
+                            return ToolResult::error(error.to_string());
+                        }
+                    }
+                    Ok(ApprovalDecision::AllowSession) => {
+                        let runtime = PolicyDecision {
+                            decision: PermissionDecision::Allow,
+                            reason: DecisionReason::RuntimeApproval,
+                            rule_source: Some(RuleSource::Session),
+                            message: format!("{name} approved for this session"),
+                        };
+                        if let Err(error) = self.record_permission_decision(
+                            call_id,
+                            name,
+                            &metadata.argument_summary,
+                            &runtime,
+                            approval_start.elapsed().as_millis(),
+                        ) {
+                            return ToolResult::error(error.to_string());
+                        }
+                        if let Err(error) = self.add_approval_rule(
+                            RuleSource::Session,
+                            call_id,
+                            name,
+                            &arguments,
+                            &metadata.argument_summary,
+                        ) {
+                            return ToolResult::error(error.to_string());
+                        }
+                    }
+                    Ok(ApprovalDecision::AllowProject) => {
                         let runtime = PolicyDecision {
                             decision: PermissionDecision::Allow,
                             reason: DecisionReason::RuntimeApproval,
@@ -319,8 +362,17 @@ where
                         ) {
                             return ToolResult::error(error.to_string());
                         }
+                        if let Err(error) = self.add_approval_rule(
+                            RuleSource::Config,
+                            call_id,
+                            name,
+                            &arguments,
+                            &metadata.argument_summary,
+                        ) {
+                            return ToolResult::error(error.to_string());
+                        }
                     }
-                    Ok(false) => {
+                    Ok(ApprovalDecision::Deny) => {
                         let runtime = PolicyDecision {
                             decision: PermissionDecision::Deny,
                             reason: DecisionReason::RuntimeApproval,
@@ -374,7 +426,34 @@ where
             rule_source: decision.rule_source,
             permission_mode: self.config.permission,
             elapsed_ms,
+            message: Some(decision.message.clone()),
         })
+    }
+
+    fn add_approval_rule(
+        &mut self,
+        source: RuleSource,
+        call_id: &str,
+        tool: &str,
+        arguments: &Value,
+        argument_summary: &str,
+    ) -> Result<()> {
+        let rule_text = suggest_approval_rule(tool, arguments);
+        let rule = PermissionRule::parse(source, RuleBehavior::Allow, &rule_text)?;
+        if source == RuleSource::Config {
+            save_permission_rule(&self.config.cwd, RuleBehavior::Allow, &rule_text)?;
+        }
+        if !self.config.permission_rules.contains(&rule) {
+            self.config.permission_rules.push(rule.clone());
+        }
+        self.permission_policy.add_rule(rule);
+        let update = PolicyDecision {
+            decision: PermissionDecision::Allow,
+            reason: DecisionReason::RuntimeApproval,
+            rule_source: Some(source),
+            message: format!("added permission rule: {rule_text}"),
+        };
+        self.record_permission_decision(call_id, tool, argument_summary, &update, 0)
     }
 }
 
@@ -431,7 +510,7 @@ where
         self.inner.on_event(event)
     }
 
-    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<bool> {
+    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<ApprovalDecision> {
         self.inner.approve_tool(name, summary)
     }
 }
@@ -446,6 +525,52 @@ fn function_call_output(call_id: &str, result: &ToolResult) -> Value {
             "error": result.error,
         })).unwrap()
     })
+}
+
+fn suggest_approval_rule(tool: &str, arguments: &Value) -> String {
+    match tool {
+        "write_file" => suggest_write_file_rule(arguments),
+        "shell" => suggest_shell_rule(arguments),
+        _ => tool.to_string(),
+    }
+}
+
+fn suggest_write_file_rule(arguments: &Value) -> String {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("./");
+    if path.is_empty() || path.contains(['(', ')']) {
+        return "write_file".into();
+    }
+    let first = path.split('/').next().unwrap_or(path);
+    if matches!(first, "src" | "tests" | "docs" | "assets") && path.contains('/') {
+        format!("write_file({first}/*)")
+    } else {
+        format!("write_file({path})")
+    }
+}
+
+fn suggest_shell_rule(arguments: &Value) -> String {
+    let command = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if command.is_empty() || command.contains(['(', ')']) {
+        return "shell".into();
+    }
+    if command.starts_with("git status") {
+        return "shell(git status*)".into();
+    }
+    if command.starts_with("git diff") {
+        return "shell(git diff*)".into();
+    }
+    format!("shell({command})")
 }
 
 fn system_instructions() -> String {
@@ -464,6 +589,7 @@ mod tests {
     use crate::config::{PermissionMode, SessionConfig};
     use crate::model::{ModelFunctionCall, ModelRequest, ModelResponse};
     use crate::tools::{PermissionRule, RuleBehavior};
+    use crate::ui::ApprovalDecision;
     use anyhow::anyhow;
     use serde_json::json;
     use std::collections::VecDeque;
@@ -473,6 +599,40 @@ mod tests {
     struct MockModel {
         responses: Arc<Mutex<VecDeque<anyhow::Result<ModelResponse>>>>,
         requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    struct ApprovalUi {
+        approvals: Arc<Mutex<VecDeque<ApprovalDecision>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl ApprovalUi {
+        fn new(approvals: Vec<ApprovalDecision>) -> Self {
+            Self {
+                approvals: Arc::new(Mutex::new(approvals.into())),
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl UiSink for ApprovalUi {
+        fn on_event(&mut self, _event: AgentEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<ApprovalDecision> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self
+                .approvals
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ApprovalDecision::Deny))
+        }
     }
 
     impl MockModel {
@@ -673,6 +833,114 @@ mod tests {
         assert!(log.contains("\"reason\":\"rule\""));
         assert!(log.contains("\"rule_source\":\"config\""));
         assert!(log.contains("\"elapsed_ms\""));
+    }
+
+    #[test]
+    fn suggests_permission_rules_for_common_tools() {
+        assert_eq!(
+            suggest_approval_rule("write_file", &json!({"path":"src/agent.rs"})),
+            "write_file(src/*)"
+        );
+        assert_eq!(
+            suggest_approval_rule("write_file", &json!({"path":"README.md"})),
+            "write_file(README.md)"
+        );
+        assert_eq!(
+            suggest_approval_rule("shell", &json!({"command":"git diff -- src/agent.rs"})),
+            "shell(git diff*)"
+        );
+        assert_eq!(
+            suggest_approval_rule("shell", &json!({"command":"cargo test"})),
+            "shell(cargo test)"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_approval_allows_matching_later_tool_without_prompt() {
+        let config = temp_config(PermissionMode::Ask, 5);
+        let mut agent = test_agent_with_config(
+            config,
+            vec![
+                Ok(tool_response(
+                    "write_file",
+                    "call_1",
+                    json!({"path":"src/a.rs","content":"a"}),
+                )),
+                Ok(tool_response(
+                    "write_file",
+                    "call_2",
+                    json!({"path":"src/b.rs","content":"b"}),
+                )),
+                Ok(final_response("done")),
+            ],
+        );
+        let path = agent.session.path().clone();
+        let mut ui = ApprovalUi::new(vec![ApprovalDecision::AllowSession]);
+
+        let reason = agent
+            .run_turn_with_ui("write files".into(), &mut ui)
+            .await
+            .unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        assert_eq!(ui.call_count(), 1);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("added permission rule: write_file(src/*)"));
+        assert!(log.contains("\"rule_source\":\"session\""));
+    }
+
+    #[tokio::test]
+    async fn project_approval_writes_config_rule() {
+        let config = temp_config(PermissionMode::Ask, 3);
+        let config_path = config.cwd.join(".micos/config.toml");
+        let mut agent = test_agent_with_config(
+            config,
+            vec![
+                Ok(tool_response(
+                    "write_file",
+                    "call_1",
+                    json!({"path":"README.md","content":"readme"}),
+                )),
+                Ok(final_response("done")),
+            ],
+        );
+        let mut ui = ApprovalUi::new(vec![ApprovalDecision::AllowProject]);
+
+        let reason = agent
+            .run_turn_with_ui("write readme".into(), &mut ui)
+            .await
+            .unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let text = std::fs::read_to_string(config_path).unwrap();
+        assert!(text.contains("[permissions]"));
+        assert!(text.contains("allow = [\"write_file(README.md)\"]"));
+    }
+
+    #[tokio::test]
+    async fn deny_rule_does_not_prompt_for_approval() {
+        let mut config = temp_config(PermissionMode::Ask, 3);
+        config.permission_rules =
+            vec![
+                PermissionRule::parse(RuleSource::Config, RuleBehavior::Deny, "shell(rm *)")
+                    .unwrap(),
+            ];
+        let mut agent = test_agent_with_config(
+            config,
+            vec![Ok(tool_response(
+                "shell",
+                "call_1",
+                json!({"command":"rm -rf x"}),
+            ))],
+        );
+        let mut ui = ApprovalUi::new(vec![ApprovalDecision::AllowSession]);
+
+        let reason = agent
+            .run_turn_with_ui("remove".into(), &mut ui)
+            .await
+            .unwrap();
+        assert_eq!(reason, StopReason::ToolDenied);
+        assert_eq!(ui.call_count(), 0);
     }
 
     #[tokio::test]

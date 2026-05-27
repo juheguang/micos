@@ -117,6 +117,8 @@ pub enum SessionEvent {
         rule_source: Option<RuleSource>,
         permission_mode: PermissionMode,
         elapsed_ms: u128,
+        #[serde(default)]
+        message: Option<String>,
     },
     ToolFinished {
         timestamp: String,

@@ -1,6 +1,6 @@
 use super::{
     format_help, format_sessions, format_status, format_trace, format_transcript, AgentEvent,
-    UiSink,
+    ApprovalDecision, UiSink,
 };
 use crate::config::SessionConfig;
 use crate::session::StopReason;
@@ -257,18 +257,27 @@ impl UiSink for ConsoleUi {
         Ok(())
     }
 
-    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<bool> {
+    fn approve_tool(&mut self, name: &str, summary: &str) -> Result<ApprovalDecision> {
         self.on_event(AgentEvent::PermissionPrompt {
             name: name.to_string(),
             summary: summary.to_string(),
         })?;
-        print!("Allow? [y/N] ");
+        print!("Allow? [y once / S session / p project / n deny] ");
         io::stdout().flush().context("flush permission prompt")?;
         let mut line = String::new();
         io::stdin()
             .read_line(&mut line)
             .context("read permission response")?;
-        Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+        Ok(parse_approval_decision(&line))
+    }
+}
+
+fn parse_approval_decision(line: &str) -> ApprovalDecision {
+    match line.trim() {
+        "" | "s" | "S" | "session" | "SESSION" => ApprovalDecision::AllowSession,
+        "y" | "Y" | "yes" | "YES" | "once" | "ONCE" => ApprovalDecision::AllowOnce,
+        "p" | "P" | "project" | "PROJECT" => ApprovalDecision::AllowProject,
+        _ => ApprovalDecision::Deny,
     }
 }
 
@@ -294,4 +303,18 @@ fn trim_one_line(text: &str, max_chars: usize) -> String {
         compact.push_str("...");
     }
     compact
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_approval_decisions() {
+        assert_eq!(parse_approval_decision(""), ApprovalDecision::AllowSession);
+        assert_eq!(parse_approval_decision("s"), ApprovalDecision::AllowSession);
+        assert_eq!(parse_approval_decision("y"), ApprovalDecision::AllowOnce);
+        assert_eq!(parse_approval_decision("p"), ApprovalDecision::AllowProject);
+        assert_eq!(parse_approval_decision("n"), ApprovalDecision::Deny);
+    }
 }

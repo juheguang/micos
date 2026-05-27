@@ -325,6 +325,53 @@ pub fn save_model_settings(cwd: &Path, settings: &ModelSettings) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("write config file {}", path.display()))
 }
 
+pub fn save_permission_rule(cwd: &Path, behavior: RuleBehavior, rule_text: &str) -> Result<()> {
+    let dir = cwd.join(".micos");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create config directory {}", dir.display()))?;
+    let path = dir.join("config.toml");
+    let mut table = read_config_table(&path)?;
+    let key = match behavior {
+        RuleBehavior::Allow => "allow",
+        RuleBehavior::Ask => "ask",
+        RuleBehavior::Deny => "deny",
+    };
+
+    let permissions = table
+        .entry("permissions")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let permissions = permissions
+        .as_table_mut()
+        .context("permissions config must be a table")?;
+    let rules = permissions
+        .entry(key)
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let rules = rules
+        .as_array_mut()
+        .with_context(|| format!("permissions.{key} must be an array"))?;
+    let exists = rules.iter().any(|rule| rule.as_str() == Some(rule_text));
+    if !exists {
+        rules.push(toml::Value::String(rule_text.to_string()));
+    }
+
+    let text = toml::to_string_pretty(&toml::Value::Table(table)).context("serialize config")?;
+    std::fs::write(&path, text).with_context(|| format!("write config file {}", path.display()))
+}
+
+fn read_config_table(path: &Path) -> Result<toml::map::Map<String, toml::Value>> {
+    if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read config file {}", path.display()))?;
+        text.parse::<toml::Value>()
+            .with_context(|| format!("parse config file {}", path.display()))?
+            .as_table()
+            .cloned()
+            .context("config root must be a table")
+    } else {
+        Ok(toml::map::Map::new())
+    }
+}
+
 impl EnvConfig {
     pub fn from_process() -> Result<Self> {
         let permission = match std::env::var("MICOS_PERMISSION") {
@@ -560,5 +607,26 @@ deny = ["shell(rm *)", "shell(curl *)"]
         assert!(text.contains("model = \"deepseek-v4-pro\""));
         assert!(text.contains("thinking = \"disabled\""));
         assert!(text.contains("reasoning_effort = \"max\""));
+    }
+
+    #[test]
+    fn saves_permission_rule_without_duplicates_or_dropping_config() {
+        let cwd = std::env::temp_dir().join(format!("micos-permission-{}", uuid::Uuid::new_v4()));
+        let config_dir = cwd.join(".micos");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "permission = \"ask\"\nmax_steps = 5\n[permissions]\ndeny = [\"shell(rm *)\"]\n",
+        )
+        .unwrap();
+
+        save_permission_rule(&cwd, RuleBehavior::Allow, "write_file(src/*)").unwrap();
+        save_permission_rule(&cwd, RuleBehavior::Allow, "write_file(src/*)").unwrap();
+
+        let text = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        assert!(text.contains("permission = \"ask\""));
+        assert!(text.contains("max_steps = 5"));
+        assert!(text.contains("deny = [\"shell(rm *)\"]"));
+        assert_eq!(text.matches("write_file(src/*)").count(), 1);
     }
 }

@@ -243,6 +243,12 @@ impl PermissionPolicy for PolicyEngine {
                 && rule.applies_to_tool(tool_name)
         })
     }
+
+    fn add_rule(&mut self, rule: PermissionRule) {
+        if !self.rules.contains(&rule) {
+            self.rules.push(rule);
+        }
+    }
 }
 
 impl PermissionRule {

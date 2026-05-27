@@ -104,7 +104,7 @@ REPL 支持常用 slash commands：
 - `/clear`：清屏。
 - `/exit`：退出。
 
-模型输出会以流式方式显示。工具调用会先显示工具卡片；`ask` 权限模式下，`write_file` 和 `shell` 会在执行前确认。
+模型输出会以流式方式显示。工具调用会先显示工具卡片；`ask` 权限模式下，`write_file` 和未知风险的 `shell` 会在执行前确认。批准时可以选择仅本次、本 session 记住，或写入项目配置。
 
 ## 内置工具
 
@@ -133,8 +133,8 @@ permission = "ask"
 max_steps = 20
 
 [permissions]
-allow = ["list_files", "read_file"]
-ask = ["write_file", "shell(git push *)"]
+allow = ["list_files", "read_file", "shell(git status*)", "shell(git diff*)"]
+ask = ["shell(git push *)"]
 deny = ["shell(rm *)", "shell(curl *)"]
 ```
 
@@ -145,6 +145,15 @@ deny = ["shell(rm *)", "shell(curl *)"]
 - `*` 是简单通配符。`shell` 规则会把 `&&`、`||`、`;`、`|`、`|&`、`&` 和换行分隔出的子命令逐段检查。
 
 每次工具权限判断都会写入 session JSONL 的 `permission_decision` 事件。REPL 中可用 `/trace` 查看当前 session 的最近工具与权限 trace。
+
+当工具需要批准时，交互选项为：
+
+- `y`：只允许本次调用。
+- `s` 或直接回车：为当前 session 加入一条 allow rule。
+- `p`：把 allow rule 追加写入 `.micos/config.toml` 的 `[permissions].allow`。
+- `n` 或 Esc：拒绝本次调用。
+
+`write_file` 会优先生成较窄的路径规则，例如 `write_file(src/*)` 或 `write_file(README.md)`；`shell` 会优先生成当前命令规则，例如 `shell(cargo test)`，常见查看命令会生成 `shell(git diff*)` 这类前缀规则。已有 deny rule 仍然优先。
 
 ## 测试
 

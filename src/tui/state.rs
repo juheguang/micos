@@ -2,7 +2,9 @@ use super::POPUP_LIMIT;
 use crate::config::{
     ModelSettings, ReasoningEffort, ThinkingMode, DEEPSEEK_CHAT_COMPLETIONS_BASE_URL,
 };
-use crate::ui::{slash_command_exact, slash_command_matches, SlashCommand, SlashCommandInfo};
+use crate::ui::{
+    slash_command_exact, slash_command_matches, ApprovalDecision, SlashCommand, SlashCommandInfo,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::mpsc as std_mpsc;
 use unicode_segmentation::UnicodeSegmentation;
@@ -10,11 +12,11 @@ use unicode_width::UnicodeWidthStr;
 
 pub(super) struct ApprovalPickerState {
     selected: usize,
-    response: Option<std_mpsc::Sender<bool>>,
+    response: Option<std_mpsc::Sender<ApprovalDecision>>,
 }
 
 impl ApprovalPickerState {
-    pub(super) fn new(response: std_mpsc::Sender<bool>) -> Self {
+    pub(super) fn new(response: std_mpsc::Sender<ApprovalDecision>) -> Self {
         Self {
             selected: 0,
             response: Some(response),
@@ -28,32 +30,56 @@ impl ApprovalPickerState {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> ApprovalAction {
         match key.code {
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
-                self.selected = 1 - self.selected;
+                self.selected = if matches!(key.code, KeyCode::Up | KeyCode::Left) {
+                    self.selected.checked_sub(1).unwrap_or(3)
+                } else {
+                    (self.selected + 1) % 4
+                };
                 ApprovalAction::None
             }
-            KeyCode::Tab | KeyCode::Enter => ApprovalAction::Decide(self.selected == 0),
-            KeyCode::Esc => ApprovalAction::Decide(false),
+            KeyCode::Tab | KeyCode::Enter => ApprovalAction::Decide(self.selected_decision()),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                ApprovalAction::Decide(ApprovalDecision::AllowSession)
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                ApprovalAction::Decide(ApprovalDecision::AllowOnce)
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                ApprovalAction::Decide(ApprovalDecision::AllowProject)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                ApprovalAction::Decide(ApprovalDecision::Deny)
+            }
             _ => ApprovalAction::None,
         }
     }
 
-    pub(super) fn send(&mut self, approved: bool) {
+    pub(super) fn send(&mut self, decision: ApprovalDecision) {
         if let Some(response) = self.response.take() {
-            let _ = response.send(approved);
+            let _ = response.send(decision);
+        }
+    }
+
+    fn selected_decision(&self) -> ApprovalDecision {
+        match self.selected {
+            0 => ApprovalDecision::AllowSession,
+            1 => ApprovalDecision::AllowOnce,
+            2 => ApprovalDecision::AllowProject,
+            _ => ApprovalDecision::Deny,
         }
     }
 }
 
 impl Drop for ApprovalPickerState {
     fn drop(&mut self) {
-        self.send(false);
+        self.send(ApprovalDecision::Deny);
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ApprovalAction {
     None,
-    Decide(bool),
+    Decide(ApprovalDecision),
 }
 
 #[derive(Clone, Debug)]

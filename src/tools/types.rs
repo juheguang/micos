@@ -1,5 +1,5 @@
 use crate::config::PermissionMode;
-use crate::tools::policy::{PermissionDecision, PolicyDecision, PolicyEngine};
+use crate::tools::policy::{PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -33,6 +33,8 @@ pub trait PermissionPolicy {
     ) -> PolicyDecision;
 
     fn hides_tool_schema(&self, permission: PermissionMode, tool_name: &str) -> bool;
+
+    fn add_rule(&mut self, _rule: PermissionRule) {}
 }
 
 #[derive(Clone, Debug)]

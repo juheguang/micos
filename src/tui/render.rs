@@ -123,7 +123,7 @@ pub(super) fn bottom_panel_height(
     if model_panel.is_some() {
         9
     } else if approval_selected.is_some() {
-        4
+        6
     } else if composer.popup_open() {
         let rows = composer.matches().len().min(POPUP_LIMIT).max(1);
         rows as u16 + 2
@@ -242,7 +242,9 @@ fn draw_approval_picker(frame: &mut Frame<'_>, footer_area: Rect, selected: usiz
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     let items = [
-        ("Approve", "allow this tool call"),
+        ("Session", "remember this rule for this session"),
+        ("Once", "allow this call only"),
+        ("Project", "save this rule to .micos/config.toml"),
         ("Deny", "skip this tool call"),
     ];
     let lines = items
