@@ -171,7 +171,7 @@ impl UiSink for ConsoleUi {
                 io::stdout().flush().context("flush reasoning delta")?;
             }
             AgentEvent::ToolCallStarted {
-                call_id,
+                call_id: _,
                 name,
                 arguments,
                 permission,
@@ -179,13 +179,11 @@ impl UiSink for ConsoleUi {
                 self.ensure_line_after_stream();
                 let summary = ToolSummary::from_arguments(&name, &arguments).summary;
                 println!(
-                    "{} {}  {} {}  {} {}",
+                    "{} {}  {} {}",
                     self.paint("tool", Paint::AccentBold),
                     name,
                     self.paint("permission", Paint::Muted),
-                    permission,
-                    self.paint("call", Paint::Muted),
-                    call_id
+                    permission
                 );
                 println!("  {summary}");
                 if !self.plain {
@@ -200,7 +198,7 @@ impl UiSink for ConsoleUi {
                 }
             }
             AgentEvent::ToolCallFinished {
-                call_id,
+                call_id: _,
                 name,
                 result,
                 elapsed,
@@ -214,14 +212,12 @@ impl UiSink for ConsoleUi {
                     self.paint("failed", Paint::Error)
                 };
                 println!(
-                    "{} {}  {}  {} {:.2?}  {} {}",
+                    "{} {}  {}  {} {:.2?}",
                     self.paint("tool", Paint::Muted),
                     name,
                     status,
                     self.paint("elapsed", Paint::Muted),
-                    elapsed,
-                    self.paint("call", Paint::Muted),
-                    call_id
+                    elapsed
                 );
                 let summary = summarize_result(&result);
                 if !summary.is_empty() {

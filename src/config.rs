@@ -1,3 +1,4 @@
+use crate::tools::{parse_permission_rules, PermissionRule, RuleBehavior, RuleSource};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -135,6 +136,7 @@ pub struct SessionConfig {
     pub thinking: Option<ThinkingMode>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub permission: PermissionMode,
+    pub permission_rules: Vec<PermissionRule>,
     pub max_steps: usize,
     pub cwd: PathBuf,
 }
@@ -165,8 +167,19 @@ pub struct FileConfig {
     pub thinking: Option<ThinkingMode>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub permission: Option<PermissionMode>,
+    pub permissions: Option<FilePermissionsConfig>,
     pub max_steps: Option<usize>,
     pub cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct FilePermissionsConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -212,6 +225,8 @@ impl SessionConfig {
             .or(file.model)
             .unwrap_or_else(|| default_model_for_base_url(&base_url).to_string());
 
+        let permission_rules = resolve_permission_rules(file.permissions.as_ref())?;
+
         Ok(Self {
             api_kind,
             model,
@@ -226,6 +241,7 @@ impl SessionConfig {
                 .or(env.permission)
                 .or(file.permission)
                 .unwrap_or(PermissionMode::Ask),
+            permission_rules,
             max_steps: cli
                 .max_steps
                 .or(env.max_steps)
@@ -242,6 +258,31 @@ impl SessionConfig {
         self.thinking = settings.thinking;
         self.reasoning_effort = settings.reasoning_effort;
     }
+}
+
+fn resolve_permission_rules(
+    permissions: Option<&FilePermissionsConfig>,
+) -> Result<Vec<PermissionRule>> {
+    let Some(permissions) = permissions else {
+        return Ok(Vec::new());
+    };
+    let mut rules = Vec::new();
+    rules.extend(parse_permission_rules(
+        RuleSource::Config,
+        RuleBehavior::Allow,
+        &permissions.allow,
+    )?);
+    rules.extend(parse_permission_rules(
+        RuleSource::Config,
+        RuleBehavior::Ask,
+        &permissions.ask,
+    )?);
+    rules.extend(parse_permission_rules(
+        RuleSource::Config,
+        RuleBehavior::Deny,
+        &permissions.deny,
+    )?);
+    Ok(rules)
 }
 
 pub fn save_model_settings(cwd: &Path, settings: &ModelSettings) -> Result<()> {
@@ -390,6 +431,7 @@ mod tests {
                 thinking: Some(ThinkingMode::Disabled),
                 reasoning_effort: Some(ReasoningEffort::High),
                 permission: Some(PermissionMode::Safe),
+                permissions: None,
                 max_steps: Some(3),
                 cwd: None,
             },
@@ -460,6 +502,34 @@ reasoning_effort = "max"
         );
         assert_eq!(cfg.thinking, Some(ThinkingMode::Enabled));
         assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn file_config_accepts_permission_rules() {
+        let file: FileConfig = toml::from_str(
+            r#"
+permission = "safe"
+
+[permissions]
+allow = ["list_files", "read_file"]
+ask = ["write_file", "shell(git push *)"]
+deny = ["shell(rm *)", "shell(curl *)"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = SessionConfig::resolve(
+            PathBuf::from("/tmp/micos"),
+            file,
+            EnvConfig::default(),
+            ConfigOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.permission, PermissionMode::Safe);
+        assert_eq!(cfg.permission_rules.len(), 6);
+        assert_eq!(cfg.permission_rules[0].source, RuleSource::Config);
+        assert_eq!(cfg.permission_rules[0].behavior, RuleBehavior::Allow);
     }
 
     #[test]

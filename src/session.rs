@@ -1,4 +1,5 @@
 use crate::config::{ApiKind, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode};
+use crate::tools::{DecisionReason, PermissionDecision, RuleSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -105,6 +106,17 @@ pub enum SessionEvent {
         name: String,
         arguments: serde_json::Value,
         permission: PermissionMode,
+    },
+    PermissionDecision {
+        timestamp: String,
+        call_id: String,
+        tool: String,
+        argument_summary: String,
+        decision: PermissionDecision,
+        reason: DecisionReason,
+        rule_source: Option<RuleSource>,
+        permission_mode: PermissionMode,
+        elapsed_ms: u128,
     },
     ToolFinished {
         timestamp: String,

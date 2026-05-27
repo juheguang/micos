@@ -2,8 +2,9 @@ use crate::config::{ModelSettings, SessionConfig, ThinkingMode};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::tools::{
-    BuiltinToolRegistry, ModePermissionPolicy, PermissionPolicy, ToolContext,
-    ToolPermissionDecision, ToolRegistry, ToolResult,
+    BuiltinToolRegistry, DecisionReason, ModePermissionPolicy, PermissionDecision,
+    PermissionPolicy, PolicyDecision, PolicyEngine, RuleSource, ToolContext, ToolRegistry,
+    ToolResult,
 };
 #[cfg(test)]
 use crate::ui::NullUi;
@@ -26,12 +27,13 @@ pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermiss
 
 impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
     pub fn new(config: SessionConfig, client: C, session: Session) -> Self {
+        let permission_rules = config.permission_rules.clone();
         Self {
             config,
             client,
             session,
             tools: BuiltinToolRegistry::default(),
-            permission_policy: ModePermissionPolicy,
+            permission_policy: PolicyEngine::new(permission_rules),
             transcript: Vec::new(),
         }
     }
@@ -117,7 +119,9 @@ where
             let request = ModelRequest {
                 model: self.config.model.clone(),
                 input: self.transcript.clone(),
-                tools: self.tools.schemas(),
+                tools: self
+                    .tools
+                    .schemas_for_policy(&self.permission_policy, self.config.permission),
                 instructions: system_instructions(),
                 parallel_tool_calls: false,
                 thinking: self.config.thinking.map(|value| value.to_string()),
@@ -197,7 +201,9 @@ where
                 })?;
 
                 let start = Instant::now();
-                let result = self.execute_tool(&call.name, arguments.clone(), ui).await;
+                let result = self
+                    .execute_tool(&call.call_id, &call.name, arguments.clone(), ui)
+                    .await;
                 let elapsed = start.elapsed();
                 self.session.append(&SessionEvent::ToolOutput {
                     timestamp: now(),
@@ -269,23 +275,73 @@ where
 
     async fn execute_tool<S: UiSink + Send>(
         &self,
+        call_id: &str,
         name: &str,
         arguments: Value,
         ui: &mut S,
     ) -> ToolResult {
-        match self
-            .permission_policy
-            .decide(self.config.permission, name, &arguments)
-        {
-            ToolPermissionDecision::Allowed => {}
-            ToolPermissionDecision::NeedsApproval { summary } => {
-                match ui.approve_tool(name, &summary) {
-                    Ok(true) => {}
-                    Ok(false) => return ToolResult::denied(format!("{name} denied by user")),
+        let metadata = self
+            .tools
+            .metadata(name, &arguments)
+            .unwrap_or_else(|| crate::tools::ToolMetadata::unknown("unknown", &arguments));
+        let start = Instant::now();
+        let decision =
+            self.permission_policy
+                .decide(self.config.permission, &metadata, name, &arguments);
+        if let Err(error) = self.record_permission_decision(
+            call_id,
+            name,
+            &metadata.argument_summary,
+            &decision,
+            start.elapsed().as_millis(),
+        ) {
+            return ToolResult::error(error.to_string());
+        }
+
+        match decision.decision {
+            PermissionDecision::Allow => {}
+            PermissionDecision::Ask => {
+                let approval_start = Instant::now();
+                match ui.approve_tool(name, &metadata.argument_summary) {
+                    Ok(true) => {
+                        let runtime = PolicyDecision {
+                            decision: PermissionDecision::Allow,
+                            reason: DecisionReason::RuntimeApproval,
+                            rule_source: Some(RuleSource::Session),
+                            message: format!("{name} approved by user"),
+                        };
+                        if let Err(error) = self.record_permission_decision(
+                            call_id,
+                            name,
+                            &metadata.argument_summary,
+                            &runtime,
+                            approval_start.elapsed().as_millis(),
+                        ) {
+                            return ToolResult::error(error.to_string());
+                        }
+                    }
+                    Ok(false) => {
+                        let runtime = PolicyDecision {
+                            decision: PermissionDecision::Deny,
+                            reason: DecisionReason::RuntimeApproval,
+                            rule_source: Some(RuleSource::Session),
+                            message: format!("{name} denied by user"),
+                        };
+                        if let Err(error) = self.record_permission_decision(
+                            call_id,
+                            name,
+                            &metadata.argument_summary,
+                            &runtime,
+                            approval_start.elapsed().as_millis(),
+                        ) {
+                            return ToolResult::error(error.to_string());
+                        }
+                        return ToolResult::denied(runtime.message);
+                    }
                     Err(error) => return ToolResult::error(error.to_string()),
                 }
             }
-            ToolPermissionDecision::Denied { reason } => return ToolResult::denied(reason),
+            PermissionDecision::Deny => return ToolResult::denied(decision.message),
         }
 
         self.tools
@@ -298,6 +354,27 @@ where
                 },
             )
             .await
+    }
+
+    fn record_permission_decision(
+        &self,
+        call_id: &str,
+        tool: &str,
+        argument_summary: &str,
+        decision: &PolicyDecision,
+        elapsed_ms: u128,
+    ) -> Result<()> {
+        self.session.append(&SessionEvent::PermissionDecision {
+            timestamp: now(),
+            call_id: call_id.to_string(),
+            tool: tool.to_string(),
+            argument_summary: argument_summary.to_string(),
+            decision: decision.decision,
+            reason: decision.reason,
+            rule_source: decision.rule_source,
+            permission_mode: self.config.permission,
+            elapsed_ms,
+        })
     }
 }
 
@@ -386,6 +463,7 @@ mod tests {
     use super::*;
     use crate::config::{PermissionMode, SessionConfig};
     use crate::model::{ModelFunctionCall, ModelRequest, ModelResponse};
+    use crate::tools::{PermissionRule, RuleBehavior};
     use anyhow::anyhow;
     use serde_json::json;
     use std::collections::VecDeque;
@@ -452,6 +530,7 @@ mod tests {
             thinking: None,
             reasoning_effort: None,
             permission,
+            permission_rules: Vec::new(),
             max_steps,
             cwd,
         }
@@ -463,6 +542,14 @@ mod tests {
         responses: Vec<anyhow::Result<ModelResponse>>,
     ) -> Agent<MockModel> {
         let config = temp_config(permission, max_steps);
+        let session = Session::new(&config).unwrap();
+        Agent::new(config, MockModel::new(responses), session)
+    }
+
+    fn test_agent_with_config(
+        config: SessionConfig,
+        responses: Vec<anyhow::Result<ModelResponse>>,
+    ) -> Agent<MockModel> {
         let session = Session::new(&config).unwrap();
         Agent::new(config, MockModel::new(responses), session)
     }
@@ -504,6 +591,9 @@ mod tests {
         assert_eq!(reason, StopReason::FinalAnswer);
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\"type\":\"tool_call\""));
+        assert!(log.contains("\"type\":\"permission_decision\""));
+        assert!(log.contains("\"decision\":\"allow\""));
+        assert!(log.contains("\"reason\":\"tool\""));
         assert!(log.contains("\"type\":\"tool_output\""));
         assert!(log.contains("\"reason\":\"final_answer\""));
     }
@@ -522,6 +612,67 @@ mod tests {
 
         let reason = agent.run_turn("write".into()).await.unwrap();
         assert_eq!(reason, StopReason::ToolDenied);
+    }
+
+    #[tokio::test]
+    async fn whole_tool_deny_filters_model_schema() {
+        let mut config = temp_config(PermissionMode::Ask, 3);
+        config.permission_rules =
+            vec![PermissionRule::parse(RuleSource::Config, RuleBehavior::Deny, "shell").unwrap()];
+        let mut agent = test_agent_with_config(config, vec![Ok(final_response("done"))]);
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let requests = agent.client.requests.lock().unwrap();
+        let tool_names = requests[0]
+            .tools
+            .iter()
+            .map(|schema| schema["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_names, vec!["list_files", "read_file", "write_file"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_shell_deny_keeps_schema_and_records_trace() {
+        let mut config = temp_config(PermissionMode::Auto, 3);
+        config.permission_rules =
+            vec![
+                PermissionRule::parse(RuleSource::Config, RuleBehavior::Deny, "shell(rm *)")
+                    .unwrap(),
+            ];
+        let path_config = config.clone();
+        let mut agent = test_agent_with_config(
+            config,
+            vec![Ok(tool_response(
+                "shell",
+                "call_1",
+                json!({"command":"rm -rf x"}),
+            ))],
+        );
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("remove".into()).await.unwrap();
+        assert_eq!(reason, StopReason::ToolDenied);
+        let requests = agent.client.requests.lock().unwrap();
+        let tool_names = requests[0]
+            .tools
+            .iter()
+            .map(|schema| schema["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_names,
+            vec!["list_files", "read_file", "write_file", "shell"]
+        );
+        assert_eq!(path_config.permission_rules.len(), 1);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"permission_decision\""));
+        assert!(log.contains("\"tool\":\"shell\""));
+        assert!(log.contains("\"argument_summary\":\"command=rm -rf x\""));
+        assert!(log.contains("\"decision\":\"deny\""));
+        assert!(log.contains("\"reason\":\"rule\""));
+        assert!(log.contains("\"rule_source\":\"config\""));
+        assert!(log.contains("\"elapsed_ms\""));
     }
 
     #[tokio::test]

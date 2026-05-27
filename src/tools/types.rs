@@ -1,10 +1,12 @@
 use crate::config::PermissionMode;
+use crate::tools::policy::{PermissionDecision, PolicyDecision, PolicyEngine};
 use serde_json::Value;
 use std::path::PathBuf;
 
 #[allow(async_fn_in_trait)]
 pub trait Tool {
     fn name(&self) -> &'static str;
+    fn metadata(&self, arguments: &Value) -> ToolMetadata;
     fn schema(&self) -> Value;
     async fn execute(&self, input: Value, ctx: ToolContext) -> ToolResult;
 }
@@ -12,6 +14,12 @@ pub trait Tool {
 #[allow(async_fn_in_trait)]
 pub trait ToolRegistry {
     fn schemas(&self) -> Vec<Value>;
+    fn schemas_for_policy(
+        &self,
+        policy: &dyn PermissionPolicy,
+        permission: PermissionMode,
+    ) -> Vec<Value>;
+    fn metadata(&self, name: &str, arguments: &Value) -> Option<ToolMetadata>;
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> ToolResult;
 }
 
@@ -19,9 +27,12 @@ pub trait PermissionPolicy {
     fn decide(
         &self,
         permission: PermissionMode,
+        metadata: &ToolMetadata,
         tool_name: &str,
         arguments: &Value,
-    ) -> ToolPermissionDecision;
+    ) -> PolicyDecision;
+
+    fn hides_tool_schema(&self, permission: PermissionMode, tool_name: &str) -> bool;
 }
 
 #[derive(Clone, Debug)]
@@ -39,14 +50,30 @@ pub struct ToolResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ToolPermissionDecision {
-    Allowed,
-    NeedsApproval { summary: String },
-    Denied { reason: String },
+pub struct ToolMetadata {
+    pub name: &'static str,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub concurrency_safe: bool,
+    pub argument_summary: String,
+    pub permission_hint: PermissionDecision,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ModePermissionPolicy;
+impl ToolMetadata {
+    pub fn unknown(name: &'static str, arguments: &Value) -> Self {
+        Self {
+            name,
+            read_only: false,
+            destructive: false,
+            concurrency_safe: false,
+            argument_summary: arguments.to_string(),
+            permission_hint: PermissionDecision::Allow,
+        }
+    }
+}
+
+pub type ModePermissionPolicy = PolicyEngine;
+pub type ToolPermissionDecision = PolicyDecision;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolSummary {
@@ -89,6 +116,16 @@ impl ToolSummary {
             _ => arguments.to_string(),
         };
         Self { summary }
+    }
+}
+
+impl From<PolicyDecision> for ToolResult {
+    fn from(decision: PolicyDecision) -> Self {
+        match decision.decision {
+            PermissionDecision::Allow => ToolResult::ok("allowed"),
+            PermissionDecision::Ask => ToolResult::error("approval required"),
+            PermissionDecision::Deny => ToolResult::denied(decision.message),
+        }
     }
 }
 

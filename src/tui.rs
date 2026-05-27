@@ -872,6 +872,7 @@ mod tests {
             thinking: Some(ThinkingMode::Enabled),
             reasoning_effort: Some(ReasoningEffort::High),
             permission: crate::config::PermissionMode::Ask,
+            permission_rules: Vec::new(),
             max_steps: 20,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
@@ -905,6 +906,7 @@ mod tests {
             thinking: Some(ThinkingMode::Enabled),
             reasoning_effort: Some(ReasoningEffort::High),
             permission: crate::config::PermissionMode::Ask,
+            permission_rules: Vec::new(),
             max_steps: 20,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };

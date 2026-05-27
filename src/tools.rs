@@ -5,10 +5,14 @@ mod types;
 
 pub use builtin::{BuiltinTool, BuiltinToolRegistry};
 pub use path::{resolve_under_cwd, truncate_text};
-pub use policy::{is_safe_shell_command, permission_decision};
+pub use policy::{
+    classify_shell_command, is_safe_shell_command, parse_permission_rules, split_shell_command,
+    DecisionReason, PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine, RuleBehavior,
+    RuleSource, ShellSafety,
+};
 pub use types::{
-    ModePermissionPolicy, PermissionPolicy, Tool, ToolContext, ToolPermissionDecision,
-    ToolRegistry, ToolResult, ToolSummary,
+    ModePermissionPolicy, PermissionPolicy, Tool, ToolContext, ToolMetadata,
+    ToolPermissionDecision, ToolRegistry, ToolResult, ToolSummary,
 };
 #[cfg(test)]
 mod tests {
@@ -37,39 +41,55 @@ mod tests {
         assert!(!is_safe_shell_command("cat file > out"));
         assert!(!is_safe_shell_command("find . -delete"));
         assert!(!is_safe_shell_command("git diff --output=patch.txt"));
-        assert!(!is_safe_shell_command("ls | head"));
+        assert!(is_safe_shell_command("ls | head"));
+        assert!(!is_safe_shell_command("ls | rm -rf x"));
     }
 
     #[test]
     fn permission_policy_covers_tools_and_modes() {
+        let policy = PolicyEngine::default();
+        let read_meta = BuiltinTool::ReadFile.metadata(&json!({"path":"x"}));
+        let write_meta = BuiltinTool::WriteFile.metadata(&json!({"path":"x"}));
+        let shell_meta = BuiltinTool::Shell.metadata(&json!({"command":"rm -rf x"}));
         assert_eq!(
-            permission_decision(PermissionMode::Safe, "list_files", &json!({})),
-            ToolPermissionDecision::Allowed
+            policy
+                .decide(PermissionMode::Safe, &read_meta, "read_file", &json!({}))
+                .decision,
+            PermissionDecision::Allow
         );
-        assert!(matches!(
-            permission_decision(PermissionMode::Safe, "write_file", &json!({"path":"x"})),
-            ToolPermissionDecision::Denied { .. }
-        ));
-        assert!(matches!(
-            permission_decision(PermissionMode::Ask, "write_file", &json!({"path":"x"})),
-            ToolPermissionDecision::NeedsApproval { .. }
-        ));
         assert_eq!(
-            permission_decision(
-                PermissionMode::Auto,
-                "shell",
-                &json!({"command":"rm -rf x"})
-            ),
-            ToolPermissionDecision::Allowed
+            policy
+                .decide(
+                    PermissionMode::Safe,
+                    &write_meta,
+                    "write_file",
+                    &json!({"path":"x"})
+                )
+                .decision,
+            PermissionDecision::Deny
         );
-        assert!(matches!(
-            permission_decision(
-                PermissionMode::Safe,
-                "shell",
-                &json!({"command":"rm -rf x"})
-            ),
-            ToolPermissionDecision::Denied { .. }
-        ));
+        assert_eq!(
+            policy
+                .decide(
+                    PermissionMode::Ask,
+                    &write_meta,
+                    "write_file",
+                    &json!({"path":"x"})
+                )
+                .decision,
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy
+                .decide(
+                    PermissionMode::Auto,
+                    &shell_meta,
+                    "shell",
+                    &json!({"command":"rm -rf x"})
+                )
+                .decision,
+            PermissionDecision::Deny
+        );
     }
 
     #[test]

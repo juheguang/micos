@@ -1,6 +1,6 @@
 use super::{
-    permission_decision, resolve_under_cwd, truncate_text, Tool, ToolContext,
-    ToolPermissionDecision, ToolRegistry, ToolResult,
+    classify_shell_command, resolve_under_cwd, truncate_text, PermissionDecision, ShellSafety,
+    Tool, ToolContext, ToolMetadata, ToolRegistry, ToolResult, ToolSummary,
 };
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
@@ -65,6 +65,25 @@ impl ToolRegistry for BuiltinToolRegistry {
         self.tools.iter().map(Tool::schema).collect()
     }
 
+    fn schemas_for_policy(
+        &self,
+        policy: &dyn super::PermissionPolicy,
+        permission: crate::config::PermissionMode,
+    ) -> Vec<Value> {
+        self.tools
+            .iter()
+            .filter(|tool| !policy.hides_tool_schema(permission, tool.name()))
+            .map(Tool::schema)
+            .collect()
+    }
+
+    fn metadata(&self, name: &str, arguments: &Value) -> Option<ToolMetadata> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| tool.metadata(arguments))
+    }
+
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> ToolResult {
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
             return ToolResult::error(format!("unknown tool: {name}"));
@@ -80,6 +99,33 @@ impl Tool for BuiltinTool {
             BuiltinTool::ReadFile => "read_file",
             BuiltinTool::WriteFile => "write_file",
             BuiltinTool::Shell => "shell",
+        }
+    }
+
+    fn metadata(&self, arguments: &Value) -> ToolMetadata {
+        let (read_only, destructive, concurrency_safe, permission_hint) = match self {
+            BuiltinTool::ListFiles | BuiltinTool::ReadFile => {
+                (true, false, true, PermissionDecision::Allow)
+            }
+            BuiltinTool::WriteFile => (false, true, false, PermissionDecision::Ask),
+            BuiltinTool::Shell => match classify_shell_command(
+                arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                ShellSafety::Safe => (false, false, false, PermissionDecision::Allow),
+                ShellSafety::Dangerous => (false, true, false, PermissionDecision::Deny),
+                ShellSafety::Unknown => (false, false, false, PermissionDecision::Ask),
+            },
+        };
+        ToolMetadata {
+            name: self.name(),
+            read_only,
+            destructive,
+            concurrency_safe,
+            argument_summary: ToolSummary::from_arguments(self.name(), arguments).summary,
+            permission_hint,
         }
     }
 
@@ -148,7 +194,6 @@ impl Tool for BuiltinTool {
     async fn execute(&self, input: Value, ctx: ToolContext) -> ToolResult {
         match self.execute_inner(input, ctx).await {
             Ok(result) => result,
-            Err(ToolExecError::Denied(message)) => ToolResult::denied(message),
             Err(ToolExecError::Other(error)) => ToolResult::error(error.to_string()),
         }
     }
@@ -171,8 +216,6 @@ impl BuiltinTool {
 
 #[derive(Debug, Error)]
 enum ToolExecError {
-    #[error("{0}")]
-    Denied(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -246,13 +289,6 @@ async fn read_file(input: Value, cwd: &Path) -> std::result::Result<String, Tool
 
 async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<String, ToolExecError> {
     let input: WriteInput = serde_json::from_value(input).context("parse write_file input")?;
-    if let ToolPermissionDecision::Denied { reason } = permission_decision(
-        ctx.permission,
-        "write_file",
-        &json!({"path": input.path.clone()}),
-    ) {
-        return Err(ToolExecError::Denied(reason));
-    }
     let path = resolve_under_cwd(&ctx.cwd, &input.path)?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -270,13 +306,6 @@ async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<Stri
 
 async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<String, ToolExecError> {
     let input: ShellInput = serde_json::from_value(input).context("parse shell input")?;
-    if let ToolPermissionDecision::Denied { reason } = permission_decision(
-        ctx.permission,
-        "shell",
-        &json!({"command": input.command.clone()}),
-    ) {
-        return Err(ToolExecError::Denied(reason));
-    }
 
     let timeout_ms = input
         .timeout_ms
