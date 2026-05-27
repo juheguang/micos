@@ -50,6 +50,18 @@ MICOS_API_KEY=service-key
 
 `micos` 会根据 `MICOS_BASE_URL` 自动选择请求格式：以 `/responses` 结尾的 URL 使用 Responses API，其它 URL 使用 Chat Completions。
 
+## 基础 Prompt
+
+`micos` 会为每次模型请求注入一份精简的基础 system prompt，覆盖 identity、task discipline、tool use、permissions、context governance、verification 和 reporting style。它借鉴 coding agent 常见约束：改代码前先读相关文件、工具由 harness 执行、权限拒绝要尊重、验证结果不能伪造、长任务中保持当前目标、最终汇报保持紧凑。
+
+项目可以在 `.micos/config.toml` 中追加额外约束：
+
+```toml
+append_system_prompt = "Use this repository's existing module boundaries and keep final replies concise."
+```
+
+该字段只追加到基础 prompt 之后，不会替换基础 prompt。
+
 ## DeepSeek 思考模式
 
 DeepSeek Chat Completions 支持思考模式。`micos` 提供两个可选配置：
@@ -102,6 +114,8 @@ REPL 支持常用 slash commands：
 - `/transcript`：显示当前 transcript 路径和最近事件摘要。
 - `/trace`：显示最近工具调用、权限决策、拒绝原因和 stop reason。
 - `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
+- `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
+- `/model`：在 TUI 模式中选择模型和思考设置。
 - `/clear`：清屏。
 - `/exit`：退出。
 
@@ -133,6 +147,7 @@ reasoning_effort = "max"
 permission = "ask"
 max_steps = 20
 context_window_tokens = 200000
+append_system_prompt = "Prefer concise engineering reports."
 
 [permissions]
 allow = ["list_files", "read_file", "shell(git status*)", "shell(git diff*)"]
@@ -149,6 +164,28 @@ deny = ["shell(rm *)", "shell(curl *)"]
 `context_window_tokens` 默认是 `200000`。当 `base_url` 是 DeepSeek 官方 API 且 model 为 `deepseek-v4-*` 时，默认窗口自动使用 `1000000`；显式配置仍然优先。
 
 每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小和分类占用。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/context` 和 `/trace` 查看当前 session 的上下文和权限 trace。
+
+## 手动 Compact
+
+`/compact` 会对当前 model-visible transcript 发起一次无工具模型调用，生成固定结构摘要：
+
+- Primary Request and Intent
+- Key Technical Concepts
+- Files and Code Sections
+- Errors and Fixes
+- Decisions Made
+- Pending Tasks
+- Current Work
+- Next Step
+
+compact 成功后，运行时 transcript 会被替换为一条 summary message，后续模型请求会把它当作早期上下文。原始事件仍完整保存在 `.micos/sessions/*.jsonl` 中。
+
+compact 会在 session JSONL 中记录：
+
+- compact 前后的 `context_snapshot`
+- `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`
+
+如果 compact 模型调用失败，当前 transcript 不会被替换。
 
 当工具需要批准时，交互选项为：
 

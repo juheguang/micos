@@ -4,8 +4,8 @@ use crate::model::OpenAiModelClient;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
-    format_context, format_help, format_sessions, format_status, format_trace, format_transcript,
-    AgentEvent, ApprovalDecision, SlashCommand, UiSink,
+    format_compact_report, format_context, format_help, format_sessions, format_status,
+    format_trace, format_transcript, AgentEvent, ApprovalDecision, SlashCommand, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -76,6 +76,11 @@ enum TuiAgentMessage {
     TurnFinished {
         agent: Agent<OpenAiModelClient>,
         result: std::result::Result<StopReason, String>,
+        elapsed: Duration,
+    },
+    CompactFinished {
+        agent: Agent<OpenAiModelClient>,
+        result: std::result::Result<crate::agent::ContextCompactReport, String>,
         elapsed: Duration,
     },
 }
@@ -361,6 +366,32 @@ impl TuiUi {
                         }
                     }
                 }
+                TuiAgentMessage::CompactFinished {
+                    agent,
+                    result,
+                    elapsed,
+                } => {
+                    self.agent = Some(agent);
+                    self.agent_task = None;
+                    self.run_status = RunStatus::Idle;
+                    match result {
+                        Ok(report) => self.push_message_with_status(
+                            MessageKind::System,
+                            "/compact",
+                            format!(
+                                "{}\nfinished in {}",
+                                format_compact_report(&report),
+                                format_duration(elapsed)
+                            ),
+                            Some(MessageStatus::Success),
+                        ),
+                        Err(message) => self.push_message(
+                            MessageKind::Error,
+                            "/compact",
+                            format!("compact failed: {message}"),
+                        ),
+                    }
+                }
             }
         }
         Ok(())
@@ -389,6 +420,41 @@ impl TuiUi {
                 .map_err(|error| error.to_string());
             let elapsed = start.elapsed();
             let _ = tx.send(TuiAgentMessage::TurnFinished {
+                agent,
+                result,
+                elapsed,
+            });
+        }));
+    }
+
+    fn start_compact(&mut self) {
+        if self.agent_task.is_some() {
+            self.push_message(
+                MessageKind::Warning,
+                "busy",
+                "agent is still working on the current turn",
+            );
+            return;
+        }
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+        self.run_status = RunStatus::Working;
+        self.push_message_with_status(
+            MessageKind::System,
+            "/compact",
+            "compacting current model-visible context",
+            Some(MessageStatus::Running),
+        );
+        let tx = self.agent_tx.clone();
+        self.agent_task = Some(tokio::spawn(async move {
+            let start = Instant::now();
+            let result = agent
+                .compact_context()
+                .await
+                .map_err(|error| error.to_string());
+            let elapsed = start.elapsed();
+            let _ = tx.send(TuiAgentMessage::CompactFinished {
                 agent,
                 result,
                 elapsed,
@@ -462,6 +528,7 @@ impl TuiUi {
                     format_context(agent.config(), agent.session_path(), &agent.context_stats()),
                 );
             }
+            SlashCommand::Compact => self.start_compact(),
             SlashCommand::Model => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.model_panel = Some(ModelPanelState::from_settings(
@@ -905,6 +972,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 20,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            append_system_prompt: None,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);
@@ -940,6 +1008,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 20,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            append_system_prompt: None,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);

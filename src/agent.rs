@@ -1,6 +1,9 @@
 use crate::config::{save_permission_rule, ModelSettings, SessionConfig, ThinkingMode};
-use crate::context::{ContextBuilder, ContextStats};
+use crate::context::{
+    compacted_summary_message, estimate_text_tokens, ContextBuilder, ContextStats,
+};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
+use crate::prompt::{compact_instructions, PromptBuilder};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::tools::{
     BuiltinToolRegistry, DecisionReason, ModePermissionPolicy, PermissionDecision,
@@ -16,6 +19,14 @@ use std::time::Instant;
 use uuid::Uuid;
 
 pub type Agent<C> = AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextCompactReport {
+    pub before_tokens: usize,
+    pub after_tokens: usize,
+    pub summary_tokens: usize,
+    pub messages_replaced: usize,
+}
 
 pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermissionPolicy> {
     config: SessionConfig,
@@ -80,6 +91,72 @@ where
 
     pub fn context_stats(&self) -> ContextStats {
         self.build_model_context().stats
+    }
+
+    pub async fn compact_context(&mut self) -> Result<ContextCompactReport> {
+        let before_context = self.build_model_context();
+        self.record_context_snapshot(&before_context.stats)?;
+        let messages_replaced = self.transcript.len();
+
+        let request = ModelRequest {
+            model: self.config.model.clone(),
+            input: before_context.input,
+            tools: Vec::new(),
+            instructions: compact_instructions(&before_context.instructions),
+            parallel_tool_calls: false,
+            thinking: self.config.thinking.map(|value| value.to_string()),
+            reasoning_effort: if self.config.thinking == Some(ThinkingMode::Disabled) {
+                None
+            } else {
+                self.config.reasoning_effort.map(|value| value.to_string())
+            },
+        };
+
+        let response = match self.client.respond(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.session.append(&SessionEvent::Error {
+                    timestamp: now(),
+                    message: error.to_string(),
+                })?;
+                return Err(error);
+            }
+        };
+        let summary = response.assistant_text.join("\n").trim().to_string();
+        if summary.is_empty() {
+            let error = anyhow::anyhow!("compact produced an empty summary");
+            self.session.append(&SessionEvent::Error {
+                timestamp: now(),
+                message: error.to_string(),
+            })?;
+            return Err(error);
+        }
+
+        let summary_tokens = estimate_text_tokens(&summary);
+        self.transcript = vec![compacted_summary_message(&summary)];
+        let after_context = self.build_model_context();
+        self.record_context_snapshot(&after_context.stats)?;
+        self.session.append(&SessionEvent::ContextCompacted {
+            timestamp: now(),
+            before_tokens: before_context.stats.total_tokens_estimate,
+            after_tokens: after_context.stats.total_tokens_estimate,
+            summary_tokens,
+            messages_replaced,
+        })?;
+
+        Ok(ContextCompactReport {
+            before_tokens: before_context.stats.total_tokens_estimate,
+            after_tokens: after_context.stats.total_tokens_estimate,
+            summary_tokens,
+            messages_replaced,
+        })
+    }
+
+    pub async fn compact_context_with_ui<S: UiSink + Send>(
+        &mut self,
+        _ui: &mut S,
+    ) -> Result<ContextCompactReport> {
+        self.compact_context().await
     }
 
     pub async fn stop(&self, reason: StopReason) -> Result<()> {
@@ -441,7 +518,7 @@ where
             .schemas_for_policy(&self.permission_policy, self.config.permission);
         ContextBuilder::new(self.config.context_window_tokens).build(
             self.transcript.clone(),
-            system_instructions(),
+            PromptBuilder::build(&self.config),
             tools,
         )
     }
@@ -588,16 +665,6 @@ fn suggest_shell_rule(arguments: &Value) -> String {
     format!("shell({command})")
 }
 
-fn system_instructions() -> String {
-    [
-        "You are micos, a minimal local coding agent harness.",
-        "Use the provided tools when local filesystem or shell context is required.",
-        "All tool execution is performed by the harness. Respect tool errors and permission denials.",
-        "When the task is complete, answer directly without calling another tool.",
-    ]
-    .join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +775,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            append_system_prompt: None,
             cwd,
         }
     }
@@ -749,6 +817,65 @@ mod tests {
         let requests = agent.client.requests.lock().unwrap();
         assert_eq!(requests[0].thinking.as_deref(), Some("disabled"));
         assert_eq!(requests[0].reasoning_effort, None);
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_uses_prompt_builder_with_append_prompt() {
+        let mut config = temp_config(PermissionMode::Safe, 3);
+        config.append_system_prompt = Some("Prefer project-specific wording.".into());
+        let mut agent = test_agent_with_config(config, vec![Ok(final_response("done"))]);
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let requests = agent.client.requests.lock().unwrap();
+        assert!(requests[0].instructions.contains("## Identity"));
+        assert!(requests[0]
+            .instructions
+            .contains("Read relevant files before changing code"));
+        assert!(requests[0]
+            .instructions
+            .contains("## Project additional instructions"));
+        assert!(requests[0]
+            .instructions
+            .contains("Prefer project-specific wording."));
+    }
+
+    #[tokio::test]
+    async fn compact_replaces_visible_transcript_with_summary() {
+        let summary = "## Primary Request and Intent\nContinue the task.\n\n## Key Technical Concepts\nPrompt governance.\n\n## Files and Code Sections\nsrc/agent.rs.\n\n## Errors and Fixes\nNone.\n\n## Decisions Made\nUse manual compact.\n\n## Pending Tasks\nRun tests.\n\n## Current Work\nImplementing compact.\n\n## Next Step\nVerify.";
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![
+                Ok(final_response("first answer")),
+                Ok(final_response(summary)),
+                Ok(final_response("done")),
+            ],
+        );
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("start".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let report = agent.compact_context().await.unwrap();
+        assert_eq!(report.messages_replaced, 2);
+        assert!(report.before_tokens > report.summary_tokens);
+        assert!(report.after_tokens > report.summary_tokens);
+
+        let reason = agent.run_turn("continue".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let requests = agent.client.requests.lock().unwrap();
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[1].instructions.contains("## Compact task"));
+        assert_eq!(requests[2].input.len(), 2);
+        assert!(requests[2].input[0]
+            .to_string()
+            .contains("This is a compacted summary of earlier model-visible context"));
+        assert!(requests[2].input[0].to_string().contains("## Next Step"));
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"context_compacted\""));
+        assert!(log.contains("\"messages_replaced\":2"));
+        assert!(log.contains("\"summary_tokens\""));
     }
 
     #[tokio::test]

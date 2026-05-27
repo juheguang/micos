@@ -72,6 +72,7 @@ pub fn estimate_context_stats(
     ];
     let mut user_messages = 0usize;
     let mut assistant_messages = 0usize;
+    let mut compacted_summary = 0usize;
     let mut tool_calls = 0usize;
     let mut tool_outputs = 0usize;
     let mut other = 0usize;
@@ -79,6 +80,9 @@ pub fn estimate_context_stats(
     for item in input {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => match item.get("role").and_then(Value::as_str) {
+                Some("user") if is_compacted_summary_message(item) => {
+                    compacted_summary += estimate_json_tokens(item, 4)
+                }
                 Some("user") => user_messages += estimate_json_tokens(item, 4),
                 Some("assistant") => assistant_messages += estimate_json_tokens(item, 4),
                 _ => other += estimate_json_tokens(item, 4),
@@ -92,6 +96,7 @@ pub fn estimate_context_stats(
     categories.extend([
         ContextCategory::new("user_messages", user_messages),
         ContextCategory::new("assistant_messages", assistant_messages),
+        ContextCategory::new("compacted_summary", compacted_summary),
         ContextCategory::new("tool_calls", tool_calls),
         ContextCategory::new("tool_outputs", tool_outputs),
         ContextCategory::new("other", other),
@@ -131,6 +136,28 @@ fn estimate_json_values_tokens(values: &[Value], chars_per_token: usize) -> usiz
 
 fn estimate_json_tokens(value: &Value, chars_per_token: usize) -> usize {
     estimate_len_tokens(value.to_string().chars().count(), chars_per_token)
+}
+
+pub fn compacted_summary_message(summary: &str) -> Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("This is a compacted summary of earlier model-visible context.\n\n{summary}")
+        }]
+    })
+}
+
+fn is_compacted_summary_message(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            text.starts_with("This is a compacted summary of earlier model-visible context.")
+        })
 }
 
 fn estimate_len_tokens(chars: usize, chars_per_token: usize) -> usize {
@@ -186,6 +213,7 @@ mod tests {
         let input = vec![
             json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}),
             json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}),
+            compacted_summary_message("summary"),
             json!({"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":\"cargo test\"}"}),
             json!({"type":"function_call_output","call_id":"call_1","output":"large output"}),
         ];
@@ -204,6 +232,7 @@ mod tests {
         assert!(category("tool_schemas") > 0);
         assert!(category("user_messages") > 0);
         assert!(category("assistant_messages") > 0);
+        assert!(category("compacted_summary") > 0);
         assert!(category("tool_calls") > 0);
         assert!(category("tool_outputs") > 0);
         assert!(category("free_space") > 0);

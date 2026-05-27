@@ -224,6 +224,10 @@ async fn handle_console_slash<C: ModelClient>(
             let stats = agent.context_stats();
             ui.print_context(agent.config(), agent.session_path(), &stats);
         }
+        SlashCommand::Compact => match agent.compact_context_with_ui(ui).await {
+            Ok(report) => ui.print_compact_report(&report),
+            Err(error) => eprintln!("compact failed: {error}"),
+        },
         SlashCommand::Model => {
             eprintln!("The /model picker is only available in TUI mode. Restart without --no-tui.")
         }

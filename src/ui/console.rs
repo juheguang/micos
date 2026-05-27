@@ -1,7 +1,8 @@
 use super::{
-    format_context, format_help, format_sessions, format_status, format_trace, format_transcript,
-    AgentEvent, ApprovalDecision, UiSink,
+    format_compact_report, format_context, format_help, format_sessions, format_status,
+    format_trace, format_transcript, AgentEvent, ApprovalDecision, UiSink,
 };
+use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
 use crate::session::StopReason;
@@ -115,6 +116,10 @@ impl ConsoleUi {
         stats: &ContextStats,
     ) {
         println!("{}", format_context(config, session_path, stats));
+    }
+
+    pub fn print_compact_report(&mut self, report: &ContextCompactReport) {
+        println!("{}", format_compact_report(report));
     }
 
     pub fn clear(&mut self) -> Result<()> {

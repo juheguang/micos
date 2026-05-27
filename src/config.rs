@@ -140,6 +140,7 @@ pub struct SessionConfig {
     pub permission_rules: Vec<PermissionRule>,
     pub max_steps: usize,
     pub context_window_tokens: usize,
+    pub append_system_prompt: Option<String>,
     pub cwd: PathBuf,
 }
 
@@ -173,6 +174,7 @@ pub struct FileConfig {
     pub permissions: Option<FilePermissionsConfig>,
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
+    pub append_system_prompt: Option<String>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -262,6 +264,7 @@ impl SessionConfig {
                 .or(file.max_steps)
                 .unwrap_or(DEFAULT_MAX_STEPS),
             context_window_tokens,
+            append_system_prompt: file.append_system_prompt,
             cwd,
         })
     }
@@ -490,6 +493,7 @@ mod tests {
             cfg.context_window_tokens,
             crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS
         );
+        assert_eq!(cfg.append_system_prompt, None);
     }
 
     #[test]
@@ -505,6 +509,7 @@ mod tests {
                 permissions: None,
                 max_steps: Some(3),
                 context_window_tokens: Some(123_000),
+                append_system_prompt: None,
                 cwd: None,
             },
             EnvConfig {
@@ -588,6 +593,7 @@ base_url = "https://api.deepseek.com/chat/completions"
 thinking = "enabled"
 	reasoning_effort = "max"
 	context_window_tokens = 123000
+	append_system_prompt = "Prefer concise replies."
 	"#,
         )
         .unwrap();
@@ -600,6 +606,10 @@ thinking = "enabled"
         assert_eq!(cfg.thinking, Some(ThinkingMode::Enabled));
         assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Max));
         assert_eq!(cfg.context_window_tokens, Some(123_000));
+        assert_eq!(
+            cfg.append_system_prompt,
+            Some("Prefer concise replies.".into())
+        );
     }
 
     #[test]

@@ -73,6 +73,13 @@ pub enum SessionEvent {
         usage_percent: usize,
         categories: Vec<ContextCategory>,
     },
+    ContextCompacted {
+        timestamp: String,
+        before_tokens: usize,
+        after_tokens: usize,
+        summary_tokens: usize,
+        messages_replaced: usize,
+    },
     ConfigChanged {
         timestamp: String,
         model: String,
@@ -214,4 +221,27 @@ pub fn now() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_compacted_event_serializes_with_expected_fields() {
+        let event = SessionEvent::ContextCompacted {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            before_tokens: 100,
+            after_tokens: 40,
+            summary_tokens: 20,
+            messages_replaced: 3,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "context_compacted");
+        assert_eq!(value["before_tokens"], 100);
+        assert_eq!(value["after_tokens"], 40);
+        assert_eq!(value["summary_tokens"], 20);
+        assert_eq!(value["messages_replaced"], 3);
+    }
 }

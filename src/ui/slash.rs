@@ -1,3 +1,4 @@
+use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
 use crate::session::SESSION_DIR;
@@ -15,6 +16,7 @@ pub enum SlashCommand {
     Transcript,
     Trace,
     Context,
+    Compact,
     Model,
     Clear,
     Exit,
@@ -57,6 +59,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "context",
         description: "show estimated context usage",
         command: SlashCommand::Context,
+    },
+    SlashCommandInfo {
+        name: "compact",
+        description: "summarize and replace current model-visible context",
+        command: SlashCommand::Compact,
     },
     SlashCommandInfo {
         name: "model",
@@ -253,6 +260,20 @@ pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &Conte
     output.join("\n")
 }
 
+pub fn format_compact_report(report: &ContextCompactReport) -> String {
+    [
+        "context compacted".to_string(),
+        format!("messages replaced: {}", report.messages_replaced),
+        format!(
+            "tokens: {} -> {}",
+            format_tokens(report.before_tokens),
+            format_tokens(report.after_tokens)
+        ),
+        format!("summary tokens: {}", format_tokens(report.summary_tokens)),
+    ]
+    .join("\n")
+}
+
 fn trim_one_line(text: &str, max_chars: usize) -> String {
     let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() > max_chars {
@@ -440,6 +461,10 @@ mod tests {
             InputCommand::Slash(SlashCommand::Help)
         );
         assert_eq!(
+            parse_input("/compact"),
+            InputCommand::Slash(SlashCommand::Compact)
+        );
+        assert_eq!(
             parse_input("/missing"),
             InputCommand::UnknownSlash("/missing".into())
         );
@@ -460,12 +485,14 @@ mod tests {
                 "transcript",
                 "trace",
                 "context",
+                "compact",
                 "model",
                 "clear",
                 "exit"
             ]
         );
         assert_eq!(slash_command_exact("/status"), Some(SlashCommand::Status));
+        assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
         assert_eq!(
             slash_command_matches("/sta")
@@ -490,6 +517,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 3,
             context_window_tokens: 1_000,
+            append_system_prompt: None,
             cwd,
         };
         let path = std::env::temp_dir().join(format!("micos-context-{}.jsonl", Uuid::new_v4()));
