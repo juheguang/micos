@@ -11,7 +11,10 @@ use crate::context::{
 use crate::memory::ProjectMemory;
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::plan::{self, ActivePlan, HandoffReport};
-use crate::prompt::{compact_instructions, PromptBuild, PromptBuilder, PromptRuntimeContext};
+use crate::prompt::{
+    compact_instructions, compact_repair_instructions, PromptBuild, PromptBuilder,
+    PromptRuntimeContext,
+};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::session_replay::{replay_session, resolve_session_target, SessionResumeReport};
 use crate::tools::{
@@ -239,19 +242,10 @@ where
         self.record_context_snapshot(&before_context)?;
         let messages_replaced = compact_plan.messages_replaced;
 
-        let request = ModelRequest {
-            model: self.config.model.clone(),
-            input: compact_plan.summary_input.clone(),
-            tools: Vec::new(),
-            instructions: compact_instructions(&before_context.instructions),
-            parallel_tool_calls: false,
-            thinking: self.config.thinking.map(|value| value.to_string()),
-            reasoning_effort: if self.config.thinking == Some(ThinkingMode::Disabled) {
-                None
-            } else {
-                self.config.reasoning_effort.map(|value| value.to_string())
-            },
-        };
+        let request = self.compact_model_request(
+            compact_plan.summary_input.clone(),
+            compact_instructions(&before_context.instructions),
+        );
 
         let response = match self.client.respond(request).await {
             Ok(response) => response,
@@ -263,17 +257,41 @@ where
                 return Err(error);
             }
         };
-        let summary = normalize_compact_summary(&response.assistant_text.join("\n"));
-        let validation =
+        let mut summary = normalize_compact_summary(&response.assistant_text.join("\n"));
+        let mut validation =
             validate_compact_summary(&summary, compact_plan.latest_user_text.as_deref());
+        let mut validation_status = validation.status.clone();
         if !validation.passed {
-            let error =
-                anyhow::anyhow!("compact summary validation failed: {}", validation.message);
-            self.session.append(&SessionEvent::Error {
-                timestamp: now(),
-                message: error.to_string(),
-            })?;
-            return Err(error);
+            let repair_reason = validation.message.clone();
+            let repair_request = self.compact_model_request(
+                compact_plan.summary_input.clone(),
+                compact_repair_instructions(&before_context.instructions, &repair_reason, &summary),
+            );
+            let repair_response = match self.client.respond(repair_request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    self.session.append(&SessionEvent::Error {
+                        timestamp: now(),
+                        message: error.to_string(),
+                    })?;
+                    return Err(error);
+                }
+            };
+            summary = normalize_compact_summary(&repair_response.assistant_text.join("\n"));
+            validation =
+                validate_compact_summary(&summary, compact_plan.latest_user_text.as_deref());
+            if !validation.passed {
+                let error = anyhow::anyhow!(
+                    "compact summary validation failed after repair: {}",
+                    validation.message
+                );
+                self.session.append(&SessionEvent::Error {
+                    timestamp: now(),
+                    message: error.to_string(),
+                })?;
+                return Err(error);
+            }
+            validation_status = format!("repaired:{repair_reason}");
         }
 
         let summary_tokens = estimate_text_tokens(&summary);
@@ -303,7 +321,7 @@ where
             messages_replaced,
             retained_messages: compact_plan.retained_messages,
             compression_ratio_percent,
-            validation_status: validation.status.clone(),
+            validation_status: validation_status.clone(),
         })?;
         let _ = self.write_handoff("compact")?;
 
@@ -315,8 +333,24 @@ where
             messages_replaced,
             retained_messages: compact_plan.retained_messages,
             compression_ratio_percent,
-            validation_status: validation.status,
+            validation_status,
         })
+    }
+
+    fn compact_model_request(&self, input: Vec<Value>, instructions: String) -> ModelRequest {
+        ModelRequest {
+            model: self.config.model.clone(),
+            input,
+            tools: Vec::new(),
+            instructions,
+            parallel_tool_calls: false,
+            thinking: self.config.thinking.map(|value| value.to_string()),
+            reasoning_effort: if self.config.thinking == Some(ThinkingMode::Disabled) {
+                None
+            } else {
+                self.config.reasoning_effort.map(|value| value.to_string())
+            },
+        }
     }
 
     pub async fn compact_context_with_ui<S: UiSink + Send>(
@@ -1268,6 +1302,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_repairs_invalid_summary_once() {
+        let repaired = "## Primary Request and Intent\nContinue after latest user request turn 4.\n\n## Key Technical Concepts\nCompact repair.\n\n## Files and Code Sections\nsrc/agent.rs.\n\n## Errors and Fixes\nInitial summary missed required sections.\n\n## Decisions Made\nRetry once.\n\n## Pending Tasks\nRun tests.\n\n## Current Work\nRepairing compact.\n\n## Next Step\nVerify with cargo test.";
+        let mut responses = (0..5)
+            .map(|index| Ok(final_response(&format!("answer {index}"))))
+            .collect::<Vec<_>>();
+        responses.push(Ok(final_response(
+            "## Primary Request and Intent\nMissing required sections.",
+        )));
+        responses.push(Ok(final_response(repaired)));
+        let mut agent = test_agent(PermissionMode::Safe, 3, responses);
+        let path = agent.session.path().clone();
+
+        for index in 0..5 {
+            let reason = agent.run_turn(format!("turn {index}")).await.unwrap();
+            assert_eq!(reason, StopReason::FinalAnswer);
+        }
+        let report = agent.compact_context().await.unwrap();
+
+        assert!(report.compacted);
+        assert_eq!(
+            report.validation_status,
+            "repaired:missing_heading:Key Technical Concepts"
+        );
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests[5].instructions.contains("## Compact task"));
+        assert!(requests[6].instructions.contains("## Compact repair task"));
+        assert!(requests[6]
+            .instructions
+            .contains("missing_heading:Key Technical Concepts"));
+        assert!(requests[6].tools.is_empty());
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"context_summary\""));
+        assert!(log.contains("## Primary Request and Intent"));
+        assert!(log.contains("\"type\":\"context_compacted\""));
+        assert!(log
+            .contains("\"validation_status\":\"repaired:missing_heading:Key Technical Concepts\""));
+    }
+
+    #[tokio::test]
     async fn compact_validation_failure_keeps_original_transcript() {
         let mut responses = (0..5)
             .map(|index| Ok(final_response(&format!("answer {index}"))))
@@ -1275,6 +1349,7 @@ mod tests {
         responses.push(Ok(final_response(
             "## Primary Request and Intent\nMissing required sections.",
         )));
+        responses.push(Ok(final_response("still invalid")));
         responses.push(Ok(final_response("done")));
         let mut agent = test_agent(PermissionMode::Safe, 3, responses);
         let path = agent.session.path().clone();
@@ -1286,17 +1361,17 @@ mod tests {
         let error = agent.compact_context().await.unwrap_err();
         assert!(error
             .to_string()
-            .contains("compact summary validation failed"));
+            .contains("compact summary validation failed after repair"));
         let reason = agent.run_turn("after failure".into()).await.unwrap();
         assert_eq!(reason, StopReason::FinalAnswer);
 
         let requests = agent.client.requests.lock().unwrap();
-        assert_eq!(requests[6].input.len(), 11);
-        assert!(requests[6].input[0].to_string().contains("turn 0"));
+        assert_eq!(requests[7].input.len(), 11);
+        assert!(requests[7].input[0].to_string().contains("turn 0"));
         let log = std::fs::read_to_string(path).unwrap();
         assert!(!log.contains("\"type\":\"context_summary\""));
         assert!(!log.contains("\"type\":\"context_compacted\""));
-        assert!(log.contains("compact summary validation failed"));
+        assert!(log.contains("compact summary validation failed after repair"));
     }
 
     #[tokio::test]

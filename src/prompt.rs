@@ -245,6 +245,21 @@ pub fn compact_instructions(base_instructions: &str) -> String {
     )
 }
 
+pub fn compact_repair_instructions(
+    base_instructions: &str,
+    validation_error: &str,
+    previous_summary: &str,
+) -> String {
+    let headings = COMPACT_SUMMARY_FORMAT
+        .iter()
+        .map(|heading| format!("## {heading}\n..."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "{base_instructions}\n\n## Compact repair task\nThe previous compact summary failed validation with `{validation_error}`. Regenerate a valid compact summary from the model-visible conversation. Output only the repaired summary. Use exactly these Markdown H2 headings, with the leading `##`, in this order:\n\n{headings}\n\nPreserve the latest user request verbatim or near-verbatim and include explicit test or verification status. Do not invent test results or completed work.\n\nPrevious failed summary:\n\n{previous_summary}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +379,17 @@ mod tests {
         assert!(prompt.contains("explicit constraints and prohibitions"));
         assert!(prompt.contains("test and verification status"));
         assert!(prompt.contains("with the leading `##`"));
+    }
+
+    #[test]
+    fn compact_repair_prompt_includes_error_and_previous_summary() {
+        let prompt = compact_repair_instructions("base", "missing_heading:Next Step", "bad");
+        assert!(prompt.contains("Compact repair task"));
+        assert!(prompt.contains("missing_heading:Next Step"));
+        assert!(prompt.contains("Previous failed summary"));
+        assert!(prompt.contains("bad"));
+        for heading in COMPACT_SUMMARY_FORMAT {
+            assert!(prompt.contains(&format!("## {heading}")));
+        }
     }
 }

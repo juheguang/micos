@@ -196,17 +196,25 @@ deny = ["shell(rm *)", "shell(curl *)"]
 
 compact 成功后，运行时 transcript 会变成 `summary message + recent tail`：早期 model-visible context 由 summary 承接，最近 8 条 transcript items 继续保留原文，且会向前扩展以避免 `function_call` / `function_call_output` 被切断。原始事件仍完整保存在 `.micos/sessions/*.jsonl` 中。
 
-compact summary 会先做基础校验：必须非空、包含固定 headings、保留最近用户请求片段，并说明 test/verification 状态。校验失败时不会替换当前 transcript。
+compact summary 会先做基础校验：必须非空、包含固定 headings、保留最近用户请求片段，并说明 test/verification 状态。常见 heading 变体会被规范化为标准 `## Heading`。如果首次校验失败，`micos` 会用同一段 model-visible transcript 再发起一次无工具 repair 调用；repair 仍失败时不会替换当前 transcript。
 
 compact 会在 session JSONL 中记录：
 
 - compact 前后的 `context_snapshot`
 - `context_summary`，字段包含 `timestamp`、`summary`、`summary_tokens`、`messages_replaced`、`retained_messages`、`summary_format_version`、`trigger`
-- `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`、`retained_messages`、`compression_ratio_percent`、`validation_status`
+- `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`、`retained_messages`、`compression_ratio_percent`、`validation_status`。如果 repair 成功，`validation_status` 形如 `repaired:<reason>`。
 
 `/summary` 会从当前 session JSONL 中反向查找最近一条 `context_summary`，并显示完整摘要。`/transcript` 只显示一行 `context_summary` 摘要，不展开正文。
 
-如果当前 model-visible transcript 为空，或太短以至于 recent tail 会保留全部内容，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_summary` 或 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
+如果当前 model-visible transcript 为空，或太短以至于 recent tail 会保留全部内容，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_summary` 或 `context_compacted`。如果 compact 或 repair 模型调用失败，当前 transcript 不会被替换。
+
+本地 smoke：
+
+```bash
+scripts/smoke-no-tui.sh
+```
+
+该脚本启动本地 fake Responses API，覆盖 `/status`、`/context`、`/permission`、`/compact`、`/summary` 和 `/exit`，不依赖真实网络或真实 API key。
 
 ## Resume
 

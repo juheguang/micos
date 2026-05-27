@@ -33,14 +33,16 @@ The goal is not to match Claude Code feature count. The goal is a small local ru
 
 ## Immediate Rule
 
-Before adding new large capabilities, finish the current 0.4.2 working tree:
+Before adding new large capabilities, keep the current stabilization gate green:
 
 - run full unit tests
-- run a no-network smoke path for core slash commands
-- commit and push the current TUI, permission, handoff, resume, write policy, and compact fixes
+- run the no-network smoke path for core slash commands
+- keep TUI, permission, handoff, resume, write policy, and compact behavior covered by tests or smoke
 - update this document if implementation changes the release boundary
 
 ## 0.4.3 Stabilization Release
+
+Status: implemented.
 
 Goal: make the current feature set reliable enough for daily local use.
 
@@ -197,8 +199,7 @@ These areas matter, but they should wait until 0.4.3 through 0.4.6 are stable:
 
 Start here for the next coding session:
 
-1. Finish and commit the current 0.4.2 working tree.
-2. Add compact repair retry and tests.
-3. Add no-TUI smoke script for the core slash commands.
-4. Run manual TUI smoke for `/permission`, `/resume`, `/compact`, and `/exit`.
-5. Cut 0.4.3 after stabilization passes.
+1. Run `cargo test` and `scripts/smoke-no-tui.sh` before starting feature work.
+2. Do a short manual TUI smoke for `/permission`, `/resume`, `/compact`, and `/exit` when touching UI paths.
+3. Start 0.4.4 with tool output governance and `/verify`.
+4. Keep compact repair retry limited to one attempt unless a future release adds explicit user controls.
