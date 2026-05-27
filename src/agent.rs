@@ -22,11 +22,14 @@ pub type Agent<C> = AgentRuntime<C, Session, BuiltinToolRegistry, ModePermission
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCompactReport {
+    pub compacted: bool,
     pub before_tokens: usize,
     pub after_tokens: usize,
     pub summary_tokens: usize,
     pub messages_replaced: usize,
 }
+
+const MODEL_VISIBLE_TOOL_OUTPUT_LIMIT: usize = 12 * 1024;
 
 pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermissionPolicy> {
     config: SessionConfig,
@@ -94,6 +97,17 @@ where
     }
 
     pub async fn compact_context(&mut self) -> Result<ContextCompactReport> {
+        if self.transcript.is_empty() {
+            let stats = self.build_model_context().stats;
+            return Ok(ContextCompactReport {
+                compacted: false,
+                before_tokens: stats.total_tokens_estimate,
+                after_tokens: stats.total_tokens_estimate,
+                summary_tokens: 0,
+                messages_replaced: 0,
+            });
+        }
+
         let before_context = self.build_model_context();
         self.record_context_snapshot(&before_context.stats)?;
         let messages_replaced = self.transcript.len();
@@ -145,6 +159,7 @@ where
         })?;
 
         Ok(ContextCompactReport {
+            compacted: true,
             before_tokens: before_context.stats.total_tokens_estimate,
             after_tokens: after_context.stats.total_tokens_estimate,
             summary_tokens,
@@ -611,12 +626,55 @@ fn function_call_output(call_id: &str, result: &ToolResult) -> Value {
     json!({
         "type": "function_call_output",
         "call_id": call_id,
-        "output": serde_json::to_string(&json!({
-            "success": result.success,
-            "output": result.output,
-            "error": result.error,
-        })).unwrap()
+        "output": serde_json::to_string(&project_tool_result_for_model(result)).unwrap()
     })
+}
+
+fn project_tool_result_for_model(result: &ToolResult) -> Value {
+    let output = truncate_model_visible_output(&result.output, MODEL_VISIBLE_TOOL_OUTPUT_LIMIT);
+    json!({
+        "success": result.success,
+        "output": output.preview,
+        "error": result.error,
+        "truncated": output.truncated,
+        "original_bytes": output.original_bytes,
+        "preview_bytes": output.preview_bytes,
+        "omitted_bytes": output.omitted_bytes,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelVisibleOutput {
+    preview: String,
+    truncated: bool,
+    original_bytes: usize,
+    preview_bytes: usize,
+    omitted_bytes: usize,
+}
+
+fn truncate_model_visible_output(text: &str, limit: usize) -> ModelVisibleOutput {
+    if text.len() <= limit {
+        return ModelVisibleOutput {
+            preview: text.to_string(),
+            truncated: false,
+            original_bytes: text.len(),
+            preview_bytes: text.len(),
+            omitted_bytes: 0,
+        };
+    }
+
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let preview = text[..end].to_string();
+    ModelVisibleOutput {
+        preview,
+        truncated: true,
+        original_bytes: text.len(),
+        preview_bytes: end,
+        omitted_bytes: text.len() - end,
+    }
 }
 
 fn suggest_approval_rule(tool: &str, arguments: &Value) -> String {
@@ -857,6 +915,7 @@ mod tests {
         let reason = agent.run_turn("start".into()).await.unwrap();
         assert_eq!(reason, StopReason::FinalAnswer);
         let report = agent.compact_context().await.unwrap();
+        assert!(report.compacted);
         assert_eq!(report.messages_replaced, 2);
         assert!(report.before_tokens > report.summary_tokens);
         assert!(report.after_tokens > report.summary_tokens);
@@ -876,6 +935,21 @@ mod tests {
         assert!(log.contains("\"type\":\"context_compacted\""));
         assert!(log.contains("\"messages_replaced\":2"));
         assert!(log.contains("\"summary_tokens\""));
+    }
+
+    #[tokio::test]
+    async fn compact_empty_transcript_does_not_call_model_or_write_compacted_event() {
+        let mut agent = test_agent(PermissionMode::Safe, 3, Vec::new());
+        let path = agent.session.path().clone();
+
+        let report = agent.compact_context().await.unwrap();
+
+        assert!(!report.compacted);
+        assert_eq!(report.messages_replaced, 0);
+        assert_eq!(report.summary_tokens, 0);
+        assert_eq!(agent.client.requests.lock().unwrap().len(), 0);
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("\"type\":\"context_compacted\""));
     }
 
     #[tokio::test]
@@ -1000,6 +1074,118 @@ mod tests {
         assert_eq!(
             suggest_approval_rule("shell", &json!({"command":"cargo test"})),
             "shell(cargo test)"
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_output_projection_keeps_small_output() {
+        let result = ToolResult::ok("small output");
+        let value = project_tool_result_for_model(&result);
+
+        assert_eq!(value["success"], true);
+        assert_eq!(value["output"], "small output");
+        assert_eq!(value["truncated"], false);
+        assert_eq!(value["original_bytes"], 12);
+        assert_eq!(value["preview_bytes"], 12);
+        assert_eq!(value["omitted_bytes"], 0);
+    }
+
+    #[test]
+    fn model_visible_tool_output_projection_truncates_large_output() {
+        let output = format!("{}你好", "x".repeat(MODEL_VISIBLE_TOOL_OUTPUT_LIMIT + 8));
+        let result = ToolResult::ok(output.clone());
+        let value = project_tool_result_for_model(&result);
+        let preview = value["output"].as_str().unwrap();
+
+        assert_eq!(value["success"], true);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["original_bytes"], output.len());
+        assert!(preview.len() <= MODEL_VISIBLE_TOOL_OUTPUT_LIMIT);
+        assert_eq!(
+            value["preview_bytes"].as_u64().unwrap() as usize,
+            preview.len()
+        );
+        assert_eq!(
+            value["omitted_bytes"].as_u64().unwrap() as usize,
+            output.len() - preview.len()
+        );
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    struct LargeOutputRegistry {
+        output: String,
+    }
+
+    impl ToolRegistry for LargeOutputRegistry {
+        fn schemas(&self) -> Vec<Value> {
+            vec![
+                json!({"name":"large_output","description":"large output","parameters":{"type":"object"}}),
+            ]
+        }
+
+        fn schemas_for_policy(
+            &self,
+            _policy: &dyn PermissionPolicy,
+            _permission: PermissionMode,
+        ) -> Vec<Value> {
+            self.schemas()
+        }
+
+        fn metadata(&self, _name: &str, arguments: &Value) -> Option<crate::tools::ToolMetadata> {
+            Some(crate::tools::ToolMetadata {
+                name: "large_output",
+                read_only: true,
+                destructive: false,
+                concurrency_safe: true,
+                argument_summary: arguments.to_string(),
+                permission_hint: PermissionDecision::Allow,
+            })
+        }
+
+        async fn execute(&self, _name: &str, _input: Value, _ctx: ToolContext) -> ToolResult {
+            ToolResult::ok(self.output.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_log_keeps_original_tool_output_while_model_sees_preview() {
+        let output = "z".repeat(MODEL_VISIBLE_TOOL_OUTPUT_LIMIT + 32);
+        let config = temp_config(PermissionMode::Safe, 3);
+        let session = Session::new(&config).unwrap();
+        let path = session.path().clone();
+        let model = MockModel::new(vec![
+            Ok(tool_response("large_output", "call_1", json!({}))),
+            Ok(final_response("done")),
+        ]);
+        let requests = model.requests.clone();
+        let mut agent = AgentRuntime::with_parts(
+            config,
+            model,
+            session,
+            LargeOutputRegistry {
+                output: output.clone(),
+            },
+            PolicyEngine::new(Vec::new()),
+        );
+
+        let reason = agent.run_turn("large output".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains(&output));
+
+        let requests = requests.lock().unwrap();
+        let projected = requests[1].input[2]["output"].as_str().unwrap();
+        let projected: Value = serde_json::from_str(projected).unwrap();
+        assert_eq!(projected["truncated"], true);
+        assert_eq!(projected["original_bytes"], output.len());
+        assert_eq!(
+            projected["preview_bytes"].as_u64().unwrap() as usize,
+            MODEL_VISIBLE_TOOL_OUTPUT_LIMIT
+        );
+        assert_eq!(
+            projected["output"].as_str().unwrap().len(),
+            MODEL_VISIBLE_TOOL_OUTPUT_LIMIT
         );
     }
 

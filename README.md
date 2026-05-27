@@ -52,7 +52,7 @@ MICOS_API_KEY=service-key
 
 ## 基础 Prompt
 
-`micos` 会为每次模型请求注入一份精简的基础 system prompt，覆盖 identity、task discipline、tool use、permissions、context governance、verification 和 reporting style。它借鉴 coding agent 常见约束：改代码前先读相关文件、工具由 harness 执行、权限拒绝要尊重、验证结果不能伪造、长任务中保持当前目标、最终汇报保持紧凑。
+`micos` 会为每次模型请求注入一份精简的基础 system prompt，覆盖 identity、task discipline、tool use、permissions、context governance、verification 和 reporting style。它借鉴 coding agent 常见约束：改代码前先读相关文件、工具由 harness 执行、权限拒绝要尊重、验证结果不能伪造、长任务中保持当前目标、保护用户已有改动、避免擅自执行破坏性 git 命令，并保持最终汇报紧凑。
 
 项目可以在 `.micos/config.toml` 中追加额外约束：
 
@@ -185,7 +185,17 @@ compact 会在 session JSONL 中记录：
 - compact 前后的 `context_snapshot`
 - `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`
 
-如果 compact 模型调用失败，当前 transcript 不会被替换。
+如果当前 model-visible transcript 为空，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
+
+## Model-visible 工具输出
+
+工具原始输出仍会完整写入 session JSONL 的 `tool_output` 和 `tool_finished` 事件，供审计和排查使用。为了避免大输出污染后续模型上下文，传回模型的 `function_call_output` 会使用 bounded preview：
+
+- 小输出完整传回模型。
+- 超过 12 KiB 的输出只传回 preview。
+- preview JSON 中包含 `truncated`、`original_bytes`、`preview_bytes`、`omitted_bytes`。
+
+这层治理只影响模型可见上下文，不改变工具本身的执行结果和本地日志。
 
 当工具需要批准时，交互选项为：
 

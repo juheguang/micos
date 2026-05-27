@@ -35,7 +35,7 @@ const BASE_SECTIONS: &[PromptSection] = &[
     },
     PromptSection {
         title: "Task discipline",
-        body: "Stay focused on the current user request. Read relevant files before changing code. Keep edits scoped to the nearby subsystem and avoid unrelated refactors unless they are required to finish the task.",
+        body: "Stay focused on the current user request. Read relevant files before changing code. Keep edits scoped to the nearby subsystem and avoid unrelated refactors unless they are required to finish the task. For long tasks, keep the current goal and next step clear.",
     },
     PromptSection {
         title: "Tool use",
@@ -47,15 +47,15 @@ const BASE_SECTIONS: &[PromptSection] = &[
     },
     PromptSection {
         title: "Context governance",
-        body: "Preserve the active goal during long tasks. Treat compacted summaries as authoritative context for earlier visible conversation, while recognizing that raw session logs may contain more detail when the harness exposes them.",
+        body: "Preserve the active goal during long tasks. Treat compacted summaries as authoritative context for earlier visible conversation, while recognizing that raw session logs may contain more detail when the harness exposes them. Do not overwrite or revert user changes you did not make; work with the current worktree state.",
     },
     PromptSection {
         title: "Verification",
-        body: "Do not claim tests, builds, or checks passed unless you actually ran them and saw the result. If verification was skipped or failed, say that plainly and include the relevant limitation.",
+        body: "Do not claim tests, builds, or checks passed unless you actually ran them and saw the result. If verification was skipped or failed, say that plainly and include the relevant limitation. Report command failures with enough detail for the user to act.",
     },
     PromptSection {
         title: "Reporting style",
-        body: "Answer in a compact engineering style. Lead with the outcome, mention files or commands that matter, and avoid broad background unless it changes the user's next decision.",
+        body: "Answer in a compact engineering style. Lead with the outcome, mention files or commands that matter, and avoid broad background unless it changes the user's next decision. Do not run destructive git commands such as reset or checkout unless the user explicitly asks.",
     },
 ];
 
@@ -77,7 +77,7 @@ pub fn compact_instructions(base_instructions: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{base_instructions}\n\n## Compact task\nSummarize the model-visible conversation so future turns can continue with minimal loss. Preserve user intent, constraints, decisions, files touched, commands run, verification status, current work, and the next concrete step. Use exactly these Markdown headings in this order:\n{headings}\n\nBe concise and factual. Do not invent test results or completed work."
+        "{base_instructions}\n\n## Compact task\nSummarize the model-visible conversation so future turns can continue with minimal loss. Preserve the user's original request, explicit constraints and prohibitions, files read or changed, commands run, test and verification status, errors and fixes, decisions made, current work, and the next concrete step. Use exactly these Markdown headings in this order:\n{headings}\n\nBe concise and factual. Do not invent test results or completed work."
     )
 }
 
@@ -121,7 +121,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(prompt.contains("Read relevant files before changing code"));
+        assert!(prompt.contains("Do not overwrite or revert user changes"));
         assert!(prompt.contains("Do not claim tests, builds, or checks passed"));
+        assert!(prompt.contains("Do not run destructive git commands"));
+        assert!(prompt.contains("For long tasks, keep the current goal"));
     }
 
     #[test]
@@ -143,5 +146,7 @@ mod tests {
             assert!(prompt.contains(heading));
         }
         assert!(prompt.contains("Do not invent test results"));
+        assert!(prompt.contains("explicit constraints and prohibitions"));
+        assert!(prompt.contains("test and verification status"));
     }
 }

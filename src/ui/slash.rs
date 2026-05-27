@@ -261,6 +261,10 @@ pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &Conte
 }
 
 pub fn format_compact_report(report: &ContextCompactReport) -> String {
+    if !report.compacted {
+        return "nothing to compact".to_string();
+    }
+
     [
         "context compacted".to_string(),
         format!("messages replaced: {}", report.messages_replaced),
