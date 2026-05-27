@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod memory;
 pub mod model;
+pub mod plan;
 pub mod prompt;
 pub mod session;
 pub mod session_replay;

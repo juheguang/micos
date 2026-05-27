@@ -8,6 +8,7 @@ use crate::context::{
 };
 use crate::memory::ProjectMemory;
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
+use crate::plan::{self, ActivePlan, HandoffReport};
 use crate::prompt::{compact_instructions, PromptBuild, PromptBuilder, PromptRuntimeContext};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::session_replay::{replay_session, resolve_session_target, SessionResumeReport};
@@ -54,6 +55,7 @@ pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermiss
     permission_policy: P,
     transcript: Vec<Value>,
     project_memory: Option<ProjectMemory>,
+    active_plan: Option<ActivePlan>,
 }
 
 impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
@@ -67,6 +69,7 @@ impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
             permission_policy: PolicyEngine::new(permission_rules),
             transcript: Vec::new(),
             project_memory: None,
+            active_plan: None,
         }
     }
 }
@@ -87,6 +90,7 @@ impl<C, R, T, P> AgentRuntime<C, R, T, P> {
             permission_policy,
             transcript: Vec::new(),
             project_memory: None,
+            active_plan: None,
         }
     }
 }
@@ -126,6 +130,10 @@ where
         self.project_memory.as_ref()
     }
 
+    pub fn active_plan(&self) -> Option<&ActivePlan> {
+        self.active_plan.as_ref()
+    }
+
     pub fn install_project_memory(&mut self, memory: ProjectMemory) -> Result<()> {
         self.session.append(&SessionEvent::MemoryLoaded {
             timestamp: now(),
@@ -137,6 +145,32 @@ where
         })?;
         self.project_memory = Some(memory);
         Ok(())
+    }
+
+    pub fn install_active_plan(&mut self, active_plan: ActivePlan) {
+        self.active_plan = Some(active_plan);
+    }
+
+    pub fn write_handoff(&mut self, trigger: &str) -> Result<HandoffReport> {
+        let timestamp = now();
+        let (active_plan, report) = plan::write_handoff(
+            &self.config.cwd,
+            self.session.path(),
+            trigger,
+            timestamp.clone(),
+        )?;
+        self.session.append(&SessionEvent::HandoffWritten {
+            timestamp,
+            path: report.path.clone(),
+            trigger: report.trigger.clone(),
+            files_touched: report.files_touched,
+            commands_run: report.commands_run,
+            verification_status: report.verification_status.clone(),
+            known_failures: report.known_failures,
+            tokens_estimate: report.tokens_estimate,
+        })?;
+        self.active_plan = Some(active_plan);
+        Ok(report)
     }
 
     pub fn resume_session(&mut self, target: &str) -> Result<SessionResumeReport> {
@@ -256,6 +290,7 @@ where
             compression_ratio_percent,
             validation_status: validation.status.clone(),
         })?;
+        let _ = self.write_handoff("compact")?;
 
         Ok(ContextCompactReport {
             compacted: true,
@@ -346,6 +381,7 @@ where
                         message: error.to_string(),
                     })?;
                     self.stop(StopReason::ApiError).await?;
+                    self.write_handoff(&StopReason::ApiError.to_string())?;
                     ui.on_event(AgentEvent::Stop {
                         reason: StopReason::ApiError,
                     })?;
@@ -418,7 +454,7 @@ where
                     success: result.success,
                     output: result.output.clone(),
                     error: result.error.clone(),
-                    elapsed_ms: elapsed.as_millis(),
+                    elapsed_ms: elapsed_millis_u64(elapsed),
                 })?;
                 if result.denied {
                     self.session.append(&SessionEvent::PermissionDenied {
@@ -439,6 +475,7 @@ where
                     self.transcript
                         .push(function_call_output(&call.call_id, &result));
                     self.stop(StopReason::ToolDenied).await?;
+                    self.write_handoff(&StopReason::ToolDenied.to_string())?;
                     ui.on_event(AgentEvent::Stop {
                         reason: StopReason::ToolDenied,
                     })?;
@@ -453,6 +490,7 @@ where
                         self.transcript
                             .push(function_call_output(&call.call_id, &result));
                         self.stop(StopReason::ToolError).await?;
+                        self.write_handoff(&StopReason::ToolError.to_string())?;
                         ui.on_event(AgentEvent::Stop {
                             reason: StopReason::ToolError,
                         })?;
@@ -466,6 +504,7 @@ where
         }
 
         self.stop(StopReason::MaxSteps).await?;
+        self.write_handoff(&StopReason::MaxSteps.to_string())?;
         ui.on_event(AgentEvent::Stop {
             reason: StopReason::MaxSteps,
         })?;
@@ -624,7 +663,7 @@ where
             reason: decision.reason,
             rule_source: decision.rule_source,
             permission_mode: self.config.permission,
-            elapsed_ms,
+            elapsed_ms: millis_u64(elapsed_ms),
             message: Some(decision.message.clone()),
         })
     }
@@ -641,10 +680,15 @@ where
     }
 
     fn prompt_runtime_context(&self) -> PromptRuntimeContext {
-        let runtime = PromptRuntimeContext::from_config(&self.config);
+        let mut runtime = PromptRuntimeContext::from_config(&self.config);
         if let Some(memory) = self.project_memory.as_ref() {
             if let Some(index) = memory.active_index_text() {
-                return runtime.with_project_memory(&memory.index_path, index);
+                runtime = runtime.with_project_memory(&memory.index_path, index);
+            }
+        }
+        if let Some(active_plan) = self.active_plan.as_ref() {
+            if let Some(text) = active_plan.active_text() {
+                runtime = runtime.with_active_plan(&active_plan.active_path, text);
             }
         }
         runtime
@@ -705,6 +749,14 @@ where
             reasoning_effort: self.config.reasoning_effort,
         })
     }
+}
+
+fn elapsed_millis_u64(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn millis_u64(elapsed_ms: u128) -> u64 {
+    elapsed_ms.min(u64::MAX as u128) as u64
 }
 
 struct SessionRecordingUi<'a, R, S> {
@@ -938,6 +990,81 @@ mod tests {
         assert!(log.contains("\"type\":\"memory_loaded\""));
         assert!(log.contains("\"index_tokens\""));
         assert!(log.contains("\"topic_count\":0"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_includes_active_plan_when_loaded() {
+        let config = temp_config(PermissionMode::Safe, 3);
+        let plan_root = config.cwd.join(crate::plan::PLAN_DIR);
+        std::fs::create_dir_all(&plan_root).unwrap();
+        std::fs::write(
+            plan_root.join(crate::plan::ACTIVE_PLAN_FILE),
+            "# Active Plan\n\n## Next Step\nRun cargo test.",
+        )
+        .unwrap();
+        let active_plan = ActivePlan::load_or_init(&config.cwd).unwrap();
+        let mut agent = test_agent_with_config(config, vec![Ok(final_response("done"))]);
+        agent.install_active_plan(active_plan);
+
+        let reason = agent.run_turn("continue".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let requests = agent.client.requests.lock().unwrap();
+        assert!(requests[0].instructions.contains("## Active plan"));
+        assert!(requests[0].instructions.contains("Run cargo test."));
+    }
+
+    #[tokio::test]
+    async fn write_handoff_updates_active_plan_and_session_event() {
+        let mut agent = test_agent(PermissionMode::Safe, 3, vec![Ok(final_response("done"))]);
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("finish docs".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let report = agent.write_handoff("manual").unwrap();
+
+        assert_eq!(report.trigger, "manual");
+        assert_eq!(report.verification_status, "unverified");
+        assert!(report.path.exists());
+        assert!(agent
+            .active_plan()
+            .and_then(ActivePlan::active_text)
+            .unwrap()
+            .contains("Latest user request: finish docs"));
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"handoff_written\""));
+        assert!(log.contains("\"trigger\":\"manual\""));
+    }
+
+    #[tokio::test]
+    async fn non_final_stop_writes_handoff() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![Ok(tool_response(
+                "write_file",
+                "call_1",
+                json!({"path": "x.txt", "content": "x"}),
+            ))],
+        );
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("write".into()).await.unwrap();
+        assert_eq!(reason, StopReason::ToolDenied);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"handoff_written\""));
+        assert!(log.contains("\"trigger\":\"tool_denied\""));
+        let plan = std::fs::read_to_string(
+            agent
+                .config
+                .cwd
+                .join(crate::plan::PLAN_DIR)
+                .join(crate::plan::ACTIVE_PLAN_FILE),
+        )
+        .unwrap();
+        assert!(plan.contains("non-final stop: tool_denied"));
     }
 
     #[tokio::test]

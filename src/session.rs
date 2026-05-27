@@ -83,6 +83,16 @@ pub enum SessionEvent {
         topic_count: usize,
         created_index: bool,
     },
+    HandoffWritten {
+        timestamp: String,
+        path: PathBuf,
+        trigger: String,
+        files_touched: usize,
+        commands_run: usize,
+        verification_status: String,
+        known_failures: usize,
+        tokens_estimate: usize,
+    },
     ContextSnapshot {
         timestamp: String,
         model: String,
@@ -169,7 +179,7 @@ pub enum SessionEvent {
         reason: DecisionReason,
         rule_source: Option<RuleSource>,
         permission_mode: PermissionMode,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
         #[serde(default)]
         message: Option<String>,
     },
@@ -180,7 +190,7 @@ pub enum SessionEvent {
         success: bool,
         output: String,
         error: Option<String>,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
     },
     PermissionDenied {
         timestamp: String,
@@ -329,6 +339,30 @@ mod tests {
         assert_eq!(value["index_tokens"], 42);
         assert_eq!(value["topic_count"], 2);
         assert_eq!(value["created_index"], true);
+    }
+
+    #[test]
+    fn handoff_written_event_serializes_with_expected_fields() {
+        let event = SessionEvent::HandoffWritten {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            path: PathBuf::from(".micos/plans/active.md"),
+            trigger: "manual".into(),
+            files_touched: 2,
+            commands_run: 1,
+            verification_status: "verified: cargo test".into(),
+            known_failures: 0,
+            tokens_estimate: 80,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "handoff_written");
+        assert_eq!(value["path"], ".micos/plans/active.md");
+        assert_eq!(value["trigger"], "manual");
+        assert_eq!(value["files_touched"], 2);
+        assert_eq!(value["commands_run"], 1);
+        assert_eq!(value["verification_status"], "verified: cargo test");
+        assert_eq!(value["known_failures"], 0);
+        assert_eq!(value["tokens_estimate"], 80);
     }
 
     #[test]

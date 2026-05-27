@@ -30,6 +30,15 @@ impl PromptBuilder {
             ));
         }
 
+        if let Some(active_plan) = runtime.active_plan.as_ref() {
+            sections.push(PromptSectionView::new(
+                "active_plan",
+                "Active plan",
+                active_plan.source.display().to_string(),
+                active_plan.text.clone(),
+            ));
+        }
+
         if let Some(append) = config.append_system_prompt.as_deref() {
             let append = append.trim();
             if !append.is_empty() {
@@ -114,6 +123,7 @@ pub struct PromptRuntimeContext {
     pub context_window_tokens: usize,
     pub current_date: String,
     pub project_memory: Option<PromptMemoryIndex>,
+    pub active_plan: Option<PromptMemoryIndex>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +142,7 @@ impl PromptRuntimeContext {
             context_window_tokens: config.context_window_tokens,
             current_date: OffsetDateTime::now_utc().date().to_string(),
             project_memory: None,
+            active_plan: None,
         }
     }
 
@@ -141,6 +152,14 @@ impl PromptRuntimeContext {
         text: impl Into<String>,
     ) -> Self {
         self.project_memory = Some(PromptMemoryIndex {
+            source: source.as_ref().to_path_buf(),
+            text: text.into(),
+        });
+        self
+    }
+
+    pub fn with_active_plan(mut self, source: impl AsRef<Path>, text: impl Into<String>) -> Self {
+        self.active_plan = Some(PromptMemoryIndex {
             source: source.as_ref().to_path_buf(),
             text: text.into(),
         });
@@ -257,10 +276,15 @@ mod tests {
     #[test]
     fn prompt_sections_keep_stable_order() {
         let config = config(None);
-        let runtime = runtime(&config).with_project_memory(
-            "/tmp/micos/.micos/memory/MEMORY.md",
-            "# Repo Facts\nUse tests.",
-        );
+        let runtime = runtime(&config)
+            .with_project_memory(
+                "/tmp/micos/.micos/memory/MEMORY.md",
+                "# Repo Facts\nUse tests.",
+            )
+            .with_active_plan(
+                "/tmp/micos/.micos/plans/active.md",
+                "# Active Plan\nContinue implementation.",
+            );
         let build = PromptBuilder::build(&config, &runtime);
         let prompt = build.instructions;
         let expected = [
@@ -273,6 +297,7 @@ mod tests {
             "## Reporting style",
             "## Runtime context",
             "## Project memory",
+            "## Active plan",
         ];
         let positions = expected
             .iter()
@@ -280,7 +305,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(build.sections[0].id, "identity");
-        assert_eq!(build.sections.last().unwrap().id, "project_memory");
+        assert_eq!(build.sections.last().unwrap().id, "active_plan");
         assert!(prompt.contains("Read relevant files before changing code"));
         assert!(prompt.contains("Do not overwrite or revert user changes"));
         assert!(prompt.contains("Do not claim tests, builds, or checks passed"));
@@ -289,6 +314,7 @@ mod tests {
         assert!(prompt.contains("cwd: /tmp/micos"));
         assert!(prompt.contains("current date: 2026-05-27"));
         assert!(prompt.contains("# Repo Facts"));
+        assert!(prompt.contains("Continue implementation."));
     }
 
     #[test]

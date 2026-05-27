@@ -6,6 +6,7 @@ use micos::config::{
 };
 use micos::memory::ProjectMemory;
 use micos::model::{ModelClient, OpenAiModelClient};
+use micos::plan::ActivePlan;
 use micos::session::{now, Session, SessionEvent, StopReason};
 use micos::tui;
 use micos::ui::{parse_input, ConsoleUi, InputCommand, SlashCommand, SlashInvocation};
@@ -144,6 +145,16 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
             return Err(error);
         }
     }
+    match ActivePlan::load_or_init(&agent.config().cwd) {
+        Ok(active_plan) => agent.install_active_plan(active_plan),
+        Err(error) => {
+            agent.session().append(&SessionEvent::Error {
+                timestamp: now(),
+                message: format!("load active plan failed: {error}"),
+            })?;
+            return Err(error);
+        }
+    }
     let initial_resume_report = if let Some(target) = args.resume.as_deref() {
         Some(agent.resume_session(target)?)
     } else {
@@ -192,11 +203,13 @@ async fn run_console_chat<C: ModelClient>(
                 }
             }
             Err(ReadlineError::Interrupted) => {
+                write_handoff_or_warn(agent, "user_interrupt");
                 agent.stop(StopReason::UserInterrupt).await?;
                 eprintln!("Interrupted.");
                 break;
             }
             Err(ReadlineError::Eof) => {
+                write_handoff_or_warn(agent, "user_exit");
                 agent.stop(StopReason::UserExit).await?;
                 break;
             }
@@ -287,11 +300,17 @@ async fn handle_console_slash<C: ModelClient>(
                 eprintln!("project memory is not loaded");
             }
         }
+        SlashCommand::Handoff => match agent.write_handoff("manual") {
+            Ok(report) => ui.print_handoff_report(&report),
+            Err(error) => eprintln!("handoff failed: {error}"),
+        },
+        SlashCommand::Plan => ui.print_active_plan(agent.active_plan()),
         SlashCommand::Model => {
             eprintln!("The /model picker is only available in TUI mode. Restart without --no-tui.")
         }
         SlashCommand::Clear => ui.clear()?,
         SlashCommand::Exit => {
+            write_handoff_or_warn(agent, "user_exit");
             agent.stop(StopReason::UserExit).await?;
             return Ok(false);
         }
@@ -301,6 +320,12 @@ async fn handle_console_slash<C: ModelClient>(
 
 fn should_use_tui(no_tui: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
     !no_tui && stdin_tty && stdout_tty
+}
+
+fn write_handoff_or_warn<C: ModelClient>(agent: &mut Agent<C>, trigger: &str) {
+    if let Err(error) = agent.write_handoff(trigger) {
+        eprintln!("handoff failed: {error}");
+    }
 }
 
 #[cfg(test)]

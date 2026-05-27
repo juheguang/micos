@@ -4,10 +4,10 @@ use crate::model::OpenAiModelClient;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
-    format_compact_report, format_context, format_help, format_memory, format_memory_index,
-    format_prompt, format_resume_report, format_sessions, format_status, format_summary,
-    format_trace, format_transcript, AgentEvent, ApprovalDecision, SlashCommand, SlashInvocation,
-    UiSink,
+    format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
+    format_memory, format_memory_index, format_prompt, format_resume_report, format_sessions,
+    format_status, format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision,
+    SlashCommand, SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -218,8 +218,24 @@ impl TuiUi {
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
-                        if let Some(agent) = self.agent.as_ref() {
-                            agent.stop(StopReason::UserInterrupt).await?;
+                        if self.agent.is_some() {
+                            let handoff_result = self
+                                .agent
+                                .as_mut()
+                                .expect("agent checked above")
+                                .write_handoff("user_interrupt");
+                            if let Err(error) = handoff_result {
+                                self.push_message(
+                                    MessageKind::Warning,
+                                    "/handoff",
+                                    format!("handoff failed: {error}"),
+                                );
+                            }
+                            self.agent
+                                .as_ref()
+                                .expect("agent checked above")
+                                .stop(StopReason::UserInterrupt)
+                                .await?;
                             self.push_message(MessageKind::Warning, "stopped", "interrupted");
                             self.run_status = RunStatus::Idle;
                             self.render()?;
@@ -612,6 +628,33 @@ impl TuiUi {
                     }
                 }
             }
+            SlashCommand::Handoff => {
+                let result = self
+                    .agent
+                    .as_mut()
+                    .expect("agent checked above")
+                    .write_handoff("manual");
+                match result {
+                    Ok(report) => self.push_message(
+                        MessageKind::System,
+                        "/handoff",
+                        format_handoff_report(&report),
+                    ),
+                    Err(error) => self.push_message(
+                        MessageKind::Warning,
+                        "/handoff",
+                        format!("handoff failed: {error}"),
+                    ),
+                }
+            }
+            SlashCommand::Plan => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/plan",
+                    format_active_plan(agent.active_plan()),
+                );
+            }
             SlashCommand::Model => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.model_panel = Some(ModelPanelState::from_settings(
@@ -627,8 +670,24 @@ impl TuiUi {
                 self.stick_to_bottom = true;
             }
             SlashCommand::Exit => {
-                if let Some(agent) = self.agent.as_ref() {
-                    agent.stop(StopReason::UserExit).await?;
+                if self.agent.is_some() {
+                    let handoff_result = self
+                        .agent
+                        .as_mut()
+                        .expect("agent checked above")
+                        .write_handoff("user_exit");
+                    if let Err(error) = handoff_result {
+                        self.push_message(
+                            MessageKind::Warning,
+                            "/handoff",
+                            format!("handoff failed: {error}"),
+                        );
+                    }
+                    self.agent
+                        .as_ref()
+                        .expect("agent checked above")
+                        .stop(StopReason::UserExit)
+                        .await?;
                 }
                 return Ok(false);
             }

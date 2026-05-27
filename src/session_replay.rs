@@ -319,6 +319,43 @@ mod tests {
     }
 
     #[test]
+    fn replay_ignores_permission_trace_events() {
+        let path = write_session(&[
+            session_start(Uuid::new_v4()),
+            SessionEvent::PermissionDecision {
+                timestamp: "t".into(),
+                call_id: "call_1".into(),
+                tool: "shell".into(),
+                argument_summary: "command=cargo test".into(),
+                decision: crate::tools::PermissionDecision::Allow,
+                reason: crate::tools::DecisionReason::Tool,
+                rule_source: None,
+                permission_mode: PermissionMode::Safe,
+                elapsed_ms: 2,
+                message: Some("allowed".into()),
+            },
+            SessionEvent::ToolFinished {
+                timestamp: "t".into(),
+                call_id: "call_1".into(),
+                name: "shell".into(),
+                success: true,
+                output: "ok".into(),
+                error: None,
+                elapsed_ms: 3,
+            },
+            SessionEvent::UserInput {
+                timestamp: "t".into(),
+                text: "continue".into(),
+            },
+        ]);
+
+        let replay = replay_session(&path).unwrap();
+
+        assert_eq!(replay.transcript.len(), 1);
+        assert_eq!(replay.transcript[0]["role"], "user");
+    }
+
+    #[test]
     fn replays_compacted_summary_with_retained_tail() {
         let path = write_session(&[
             session_start(Uuid::new_v4()),

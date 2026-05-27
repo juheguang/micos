@@ -54,7 +54,7 @@ MICOS_API_KEY=service-key
 
 `micos` 会为每次模型请求注入一份精简的基础 system prompt，覆盖 identity、task discipline、tool use、permissions、context governance、verification 和 reporting style。它借鉴 coding agent 常见约束：改代码前先读相关文件、工具由 harness 执行、权限拒绝要尊重、验证结果不能伪造、长任务中保持当前目标、保护用户已有改动、避免擅自执行破坏性 git 命令，并保持最终汇报紧凑。
 
-Prompt 由 registry 组装，最终仍作为单个 `instructions` 字符串发给模型，但运行时会保留 section metadata。`/prompt` 可以查看当前请求的 prompt section、来源和估算 token。基础 section 之后会追加一个 runtime context section，包含 cwd、model、API kind、permission mode、context window 和当前日期。
+Prompt 由 registry 组装，最终仍作为单个 `instructions` 字符串发给模型，但运行时会保留 section metadata。`/prompt` 可以查看当前请求的 prompt section、来源和估算 token。基础 section 之后会追加 runtime context、Project memory 和 Active plan 等运行时 section；runtime context 包含 cwd、model、API kind、permission mode、context window 和当前日期。
 
 项目可以在 `.micos/config.toml` 中追加额外约束：
 
@@ -121,6 +121,8 @@ REPL 支持常用 slash commands：
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
 - `/resume <session-id-or-path>`：从旧 session JSONL 恢复当前运行时 model-visible context。
 - `/memory`：显示项目本地 memory index 和 topic 列表。
+- `/handoff`：把当前 session 的可续接状态写入 `.micos/plans/active.md`。
+- `/plan`：显示当前 active plan / handoff 正文。
 - `/model`：在 TUI 模式中选择模型和思考设置。
 - `/clear`：清屏。
 - `/exit`：退出。
@@ -234,6 +236,35 @@ REPL/TUI 支持：
 - `/memory <topic-file.md>`：读取 `.micos/memory/topics/` 下的单个 topic 文件；路径逃逸会被拒绝。
 
 session JSONL 会在启动时写入 `memory_loaded`，字段包含 `timestamp`、`root`、`index_path`、`index_tokens`、`topic_count`、`created_index`。
+
+## Active Plan / Handoff
+
+每次 `chat` 启动时，`micos` 会初始化项目本地 active plan：
+
+```text
+.micos/plans/active.md
+```
+
+如果该文件非空，会作为 `Active plan` prompt section 注入每次模型请求。它用于承接当前任务的可执行状态，和 compact summary 的职责不同：compact 管理当前 model-visible transcript，active plan 用磁盘文件保留下一次继续工作所需的状态。
+
+`/handoff` 会基于当前 session JSONL 确定性生成 handoff，不额外调用模型。输出固定包含：
+
+- Current State
+- Next Step
+- Files Touched
+- Commands Run
+- Verification Status
+- Known Failures
+- Last Updated
+
+`micos` 会在这些场景自动写 handoff：`/exit`、Ctrl-C/user interrupt、compact 成功、API/tool failure、`tool_denied`、`tool_error` 和 `max_steps` 等非 final stop。原始 session JSONL 仍完整保留；active plan 只是下一轮 prompt 可见的当前状态文件。
+
+REPL/TUI 支持：
+
+- `/handoff`：手动刷新 `.micos/plans/active.md`，并显示路径、触发原因、文件/命令数量、验证状态和 token 估算。
+- `/plan`：显示当前 active plan 正文；若文件为空则显示没有记录。
+
+session JSONL 会在写 handoff 后记录 `handoff_written`，字段包含 `timestamp`、`path`、`trigger`、`files_touched`、`commands_run`、`verification_status`、`known_failures`、`tokens_estimate`。
 
 ## Model-visible 工具输出
 

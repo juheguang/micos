@@ -54,14 +54,17 @@ micos 现在已经有几块基础：
 - `context_summary` 保存手动 compact 结果。
 - `PromptBuilder` 已有 section metadata 和 runtime section。
 - model-visible tool output 已经有 preview/full 分离。
+- `/resume` 可以从旧 session JSONL 恢复 model-visible transcript。
+- `.micos/memory/MEMORY.md` 会作为 Project memory 注入 fresh session。
+- `.micos/plans/active.md` 会作为 Active plan 注入 fresh session，并由 `/handoff` 或非 final stop 刷新。
 
-但距离长程稳定还缺三类能力：
+后续还缺三类能力：
 
-- **没有 `/resume`**：session JSONL 还不能恢复成 runtime transcript 和 model-visible state。
-- **没有 project memory / active plan**：fresh session 没有 `.micos/memory/`、`.micos/plans/` 这类稳定入口。
-- **compact 仍然太粗**：当前策略是 summary message 替换旧 transcript，没有 recent tail、pair preservation、summary validation、handoff artifact。
+- **memory promotion 仍缺**：session 结论还没有受控提升为 durable memory 的流程。
+- **handoff 仍偏粗**：当前是确定性日志投影，适合续接，但还没有 todo 状态、git diff 摘要或验证证据引用。
+- **context governance 还没有自动策略**：已有手动 compact 和 active plan，尚未做自动 compact、预算阈值和 topic 按需注入。
 
-这说明 micos 现在的 compact 是 context cleanup，不是长程任务状态系统。
+这说明 micos 已经有长程任务状态系统的基础骨架，但还没有形成可审计、可晋升、可按需检索的完整 memory 生命周期。
 
 ## 建议目标结构
 
@@ -117,10 +120,12 @@ base prompt
 
 ### 0.4.2 Active Plan / Handoff
 
-- 新增 `.micos/plans/active.md`。
-- 在 `/exit`、compact、失败 stop、用户 interrupt 前写 handoff。
+- 已新增 `.micos/plans/active.md`。
+- 已新增 `/handoff` 和 `/plan`。
+- 已在 `/exit`、compact 成功、失败 stop、用户 interrupt 前写 handoff。
 - handoff 固定记录 current state、next step、files touched、commands run、verification status、known failures。
-- 新 session 自动注入 latest handoff。
+- 新 session 会自动注入非空 active plan。
+- session JSONL 已新增 `handoff_written`。
 
 ### 0.4.3 Memory Promotion
 

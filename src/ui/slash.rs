@@ -2,6 +2,7 @@ use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
 use crate::memory::ProjectMemory;
+use crate::plan::{ActivePlan, HandoffReport};
 use crate::prompt::PromptBuild;
 use crate::session::SESSION_DIR;
 use crate::session_replay::SessionResumeReport;
@@ -24,6 +25,8 @@ pub enum SlashCommand {
     Compact,
     Resume,
     Memory,
+    Handoff,
+    Plan,
     Model,
     Clear,
     Exit,
@@ -91,6 +94,16 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "memory",
         description: "show project memory index and topics",
         command: SlashCommand::Memory,
+    },
+    SlashCommandInfo {
+        name: "handoff",
+        description: "write current active handoff to .micos/plans/active.md",
+        command: SlashCommand::Handoff,
+    },
+    SlashCommandInfo {
+        name: "plan",
+        description: "show current active plan handoff",
+        command: SlashCommand::Plan,
     },
     SlashCommandInfo {
         name: "model",
@@ -440,6 +453,26 @@ pub fn format_memory_index(memory: &ProjectMemory) -> String {
         .to_string()
 }
 
+pub fn format_active_plan(plan: Option<&ActivePlan>) -> String {
+    plan.and_then(ActivePlan::active_text)
+        .unwrap_or("No active plan recorded.")
+        .to_string()
+}
+
+pub fn format_handoff_report(report: &HandoffReport) -> String {
+    [
+        "handoff written".to_string(),
+        format!("path: {}", report.path.display()),
+        format!("trigger: {}", report.trigger),
+        format!("files touched: {}", report.files_touched),
+        format!("commands run: {}", report.commands_run),
+        format!("verification: {}", report.verification_status),
+        format!("known failures: {}", report.known_failures),
+        format!("tokens: {}", format_tokens(report.tokens_estimate)),
+    ]
+    .join("\n")
+}
+
 fn trim_one_line(text: &str, max_chars: usize) -> String {
     let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() > max_chars {
@@ -656,6 +689,11 @@ mod tests {
             invocation(SlashCommand::Memory, "build.md")
         );
         assert_eq!(
+            parse_input("/handoff"),
+            invocation(SlashCommand::Handoff, "")
+        );
+        assert_eq!(parse_input("/plan"), invocation(SlashCommand::Plan, ""));
+        assert_eq!(
             parse_input("/missing"),
             InputCommand::UnknownSlash("/missing".into())
         );
@@ -681,6 +719,8 @@ mod tests {
                 "compact",
                 "resume",
                 "memory",
+                "handoff",
+                "plan",
                 "model",
                 "clear",
                 "exit"
@@ -690,6 +730,8 @@ mod tests {
         assert_eq!(slash_command_exact("/summary"), Some(SlashCommand::Summary));
         assert_eq!(slash_command_exact("/prompt"), Some(SlashCommand::Prompt));
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
+        assert_eq!(slash_command_exact("/handoff"), Some(SlashCommand::Handoff));
+        assert_eq!(slash_command_exact("/plan"), Some(SlashCommand::Plan));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
         assert_eq!(slash_command_exact("/resume target"), None);
         assert_eq!(
@@ -822,6 +864,33 @@ mod tests {
         assert!(overview.contains("build.md"));
         assert!(overview.contains("Build"));
         assert_eq!(format_memory_index(&memory), "# Facts\nUse cargo test.");
+    }
+
+    #[test]
+    fn formats_active_plan_and_handoff_report() {
+        let plan = ActivePlan {
+            root: std::path::PathBuf::from(".micos/plans"),
+            active_path: std::path::PathBuf::from(".micos/plans/active.md"),
+            active_text: "# Active Plan\n\n## Next Step\nContinue.".into(),
+            active_tokens: 10,
+            created_dir: false,
+        };
+        let report = HandoffReport {
+            path: std::path::PathBuf::from(".micos/plans/active.md"),
+            trigger: "manual".into(),
+            files_touched: 1,
+            commands_run: 2,
+            verification_status: "unverified".into(),
+            known_failures: 0,
+            tokens_estimate: 10,
+        };
+
+        assert!(format_active_plan(Some(&plan)).contains("## Next Step"));
+        assert_eq!(format_active_plan(None), "No active plan recorded.");
+        let output = format_handoff_report(&report);
+        assert!(output.contains("handoff written"));
+        assert!(output.contains("trigger: manual"));
+        assert!(output.contains("verification: unverified"));
     }
 
     #[test]
