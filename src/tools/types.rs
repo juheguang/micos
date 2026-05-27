@@ -1,6 +1,7 @@
 use crate::config::PermissionMode;
 use crate::tools::policy::{PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine};
 use serde_json::Value;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[allow(async_fn_in_trait)]
@@ -30,6 +31,7 @@ pub trait PermissionPolicy {
         metadata: &ToolMetadata,
         tool_name: &str,
         arguments: &Value,
+        cwd: &Path,
     ) -> PolicyDecision;
 
     fn hides_tool_schema(&self, permission: PermissionMode, tool_name: &str) -> bool;

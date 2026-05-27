@@ -1,6 +1,7 @@
 use super::{
-    classify_shell_command, resolve_under_cwd, truncate_text, PermissionDecision, ShellSafety,
-    Tool, ToolContext, ToolMetadata, ToolRegistry, ToolResult, ToolSummary,
+    classify_shell_command, path_has_symlink_component, resolve_under_cwd, truncate_text,
+    PermissionDecision, ShellSafety, Tool, ToolContext, ToolMetadata, ToolRegistry, ToolResult,
+    ToolSummary,
 };
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
@@ -290,6 +291,12 @@ async fn read_file(input: Value, cwd: &Path) -> std::result::Result<String, Tool
 async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<String, ToolExecError> {
     let input: WriteInput = serde_json::from_value(input).context("parse write_file input")?;
     let path = resolve_under_cwd(&ctx.cwd, &input.path)?;
+    if path_has_symlink_component(&ctx.cwd, &path)? {
+        return Err(ToolExecError::Other(anyhow!(
+            "refusing to write through symlink path {}",
+            path.display()
+        )));
+    }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await

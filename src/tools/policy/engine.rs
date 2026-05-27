@@ -1,8 +1,9 @@
-use super::super::{PermissionPolicy, ToolMetadata};
+use super::super::{path_has_symlink_component, resolve_under_cwd, PermissionPolicy, ToolMetadata};
 use crate::config::PermissionMode;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::{Component, Path};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +163,7 @@ impl PolicyEngine {
         metadata: &ToolMetadata,
         tool_name: &str,
         arguments: &Value,
+        cwd: &Path,
     ) -> PolicyDecision {
         if matches!(tool_name, "list_files" | "read_file") || metadata.read_only {
             return decision(
@@ -173,26 +175,7 @@ impl PolicyEngine {
         }
 
         match tool_name {
-            "write_file" => match permission {
-                PermissionMode::Safe => decision(
-                    PermissionDecision::Deny,
-                    DecisionReason::Mode,
-                    Some(RuleSource::RuntimeDefault),
-                    "write_file is denied in safe permission mode",
-                ),
-                PermissionMode::Ask => decision(
-                    PermissionDecision::Ask,
-                    DecisionReason::Mode,
-                    Some(RuleSource::RuntimeDefault),
-                    "write_file requires approval in ask permission mode",
-                ),
-                PermissionMode::Auto => decision(
-                    PermissionDecision::Allow,
-                    DecisionReason::Mode,
-                    Some(RuleSource::RuntimeDefault),
-                    "write_file allowed in auto permission mode",
-                ),
-            },
+            "write_file" => default_for_write_file(permission, cwd, arguments),
             "shell" => default_for_shell(permission, arguments),
             _ => decision(
                 PermissionDecision::Allow,
@@ -211,7 +194,13 @@ impl PermissionPolicy for PolicyEngine {
         metadata: &ToolMetadata,
         tool_name: &str,
         arguments: &Value,
+        cwd: &Path,
     ) -> PolicyDecision {
+        if tool_name == "write_file" {
+            if let Some(decision) = hard_write_file_guard(cwd, arguments) {
+                return decision;
+            }
+        }
         if let Some(decision) = self.decide_rule(RuleBehavior::Deny, tool_name, arguments) {
             return decision;
         }
@@ -233,7 +222,7 @@ impl PermissionPolicy for PolicyEngine {
                 "tool permission hint",
             );
         }
-        self.default_for_mode(permission, metadata, tool_name, arguments)
+        self.default_for_mode(permission, metadata, tool_name, arguments, cwd)
     }
 
     fn hides_tool_schema(&self, _permission: PermissionMode, tool_name: &str) -> bool {
@@ -468,10 +457,122 @@ fn default_for_shell(permission: PermissionMode, arguments: &Value) -> PolicyDec
     }
 }
 
+fn default_for_write_file(
+    permission: PermissionMode,
+    cwd: &Path,
+    arguments: &Value,
+) -> PolicyDecision {
+    match permission {
+        PermissionMode::Safe => decision(
+            PermissionDecision::Deny,
+            DecisionReason::Mode,
+            Some(RuleSource::RuntimeDefault),
+            "write_file is denied in safe permission mode",
+        ),
+        PermissionMode::Ask => decision(
+            PermissionDecision::Ask,
+            DecisionReason::Mode,
+            Some(RuleSource::RuntimeDefault),
+            "write_file requires approval in ask permission mode",
+        ),
+        PermissionMode::Auto => {
+            let path = write_path(arguments);
+            if path.is_empty() {
+                return decision(
+                    PermissionDecision::Deny,
+                    DecisionReason::SafetyCheck,
+                    Some(RuleSource::RuntimeDefault),
+                    "write_file is missing path",
+                );
+            }
+            if is_generated_path(path) {
+                return decision(
+                    PermissionDecision::Ask,
+                    DecisionReason::SafetyCheck,
+                    Some(RuleSource::RuntimeDefault),
+                    format!("write_file targets generated or dependency path: {path}"),
+                );
+            }
+            if !is_project_cwd(cwd) {
+                return decision(
+                    PermissionDecision::Ask,
+                    DecisionReason::Mode,
+                    Some(RuleSource::RuntimeDefault),
+                    "write_file requires approval because cwd is not recognized as a project",
+                );
+            }
+            decision(
+                PermissionDecision::Allow,
+                DecisionReason::Mode,
+                Some(RuleSource::RuntimeDefault),
+                "write_file allowed for project file in auto permission mode",
+            )
+        }
+    }
+}
+
+fn hard_write_file_guard(cwd: &Path, arguments: &Value) -> Option<PolicyDecision> {
+    let path = write_path(arguments);
+    if path.is_empty() {
+        return Some(decision(
+            PermissionDecision::Deny,
+            DecisionReason::SafetyCheck,
+            Some(RuleSource::RuntimeDefault),
+            "write_file is missing path",
+        ));
+    }
+    let resolved = match resolve_under_cwd(cwd, path) {
+        Ok(path) => path,
+        Err(error) => {
+            return Some(decision(
+                PermissionDecision::Deny,
+                DecisionReason::SafetyCheck,
+                Some(RuleSource::RuntimeDefault),
+                error.to_string(),
+            ));
+        }
+    };
+    match path_has_symlink_component(cwd, &resolved) {
+        Ok(true) => {
+            return Some(decision(
+                PermissionDecision::Deny,
+                DecisionReason::SafetyCheck,
+                Some(RuleSource::RuntimeDefault),
+                format!("write_file denied for symlink path: {}", resolved.display()),
+            ));
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Some(decision(
+                PermissionDecision::Deny,
+                DecisionReason::SafetyCheck,
+                Some(RuleSource::RuntimeDefault),
+                format!("write_file path inspection failed: {error}"),
+            ));
+        }
+    }
+    if is_sensitive_path(path) {
+        return Some(decision(
+            PermissionDecision::Deny,
+            DecisionReason::SafetyCheck,
+            Some(RuleSource::RuntimeDefault),
+            format!("write_file denied for sensitive path: {path}"),
+        ));
+    }
+    None
+}
+
 fn contains_unsafe_shell_syntax(command: &str) -> bool {
     [">", "<", "$(", "`"]
         .iter()
         .any(|needle| command.contains(needle))
+}
+
+fn write_path(arguments: &Value) -> &str {
+    arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn shell_command(arguments: &Value) -> &str {
@@ -479,6 +580,93 @@ fn shell_command(arguments: &Value) -> &str {
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or_default()
+}
+
+fn is_project_cwd(cwd: &Path) -> bool {
+    if is_user_home(cwd) {
+        return false;
+    }
+    cwd.ancestors().any(has_project_marker)
+}
+
+fn has_project_marker(path: &Path) -> bool {
+    [
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "deno.json",
+        "pnpm-workspace.yaml",
+    ]
+    .iter()
+    .any(|marker| path.join(marker).exists())
+}
+
+fn is_user_home(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    path == Path::new(&home)
+}
+
+fn is_sensitive_path(path: &str) -> bool {
+    let path = Path::new(path);
+    let mut saw_micos = false;
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        let name = part.to_string_lossy();
+        if name == ".micos" {
+            saw_micos = true;
+            continue;
+        }
+        if saw_micos {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            ".git" | ".ssh" | ".gnupg" | ".config" | ".codex" | ".claude"
+        ) {
+            return true;
+        }
+        if lower == ".env" || lower.starts_with(".env.") {
+            return true;
+        }
+        if lower == "id_rsa" || lower == "id_ed25519" || lower == "id_ecdsa" {
+            return true;
+        }
+        if lower.ends_with(".pem")
+            || lower.ends_with(".key")
+            || lower.ends_with(".p12")
+            || lower.ends_with(".pfx")
+        {
+            return true;
+        }
+        if lower.contains("secret")
+            || lower.contains("token")
+            || lower.contains("apikey")
+            || lower.contains("api_key")
+            || lower.contains("private_key")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_generated_path(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        matches!(
+            part.to_string_lossy().as_ref(),
+            "target" | "node_modules" | "dist" | "build" | ".next" | ".cache"
+        )
+    })
 }
 
 fn argument_summary(tool_name: &str, arguments: &Value) -> String {
@@ -550,6 +738,24 @@ fn decision(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
+
+    fn cwd() -> PathBuf {
+        std::env::temp_dir()
+    }
+
+    fn project_cwd() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "micos-policy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
+        path
+    }
 
     fn metadata(name: &'static str) -> ToolMetadata {
         ToolMetadata {
@@ -610,7 +816,8 @@ mod tests {
                     PermissionMode::Auto,
                     &metadata("shell"),
                     "shell",
-                    &json!({"command":"rm -rf x"})
+                    &json!({"command":"rm -rf x"}),
+                    &cwd()
                 )
                 .decision,
             PermissionDecision::Deny
@@ -621,7 +828,8 @@ mod tests {
                     PermissionMode::Ask,
                     &metadata("write_file"),
                     "write_file",
-                    &json!({"path":"x"})
+                    &json!({"path":"x"}),
+                    &cwd()
                 )
                 .decision,
             PermissionDecision::Allow
@@ -656,7 +864,8 @@ mod tests {
                     PermissionMode::Ask,
                     &metadata("shell"),
                     "shell",
-                    &json!({"command":"cargo test --all && cargo build"})
+                    &json!({"command":"cargo test --all && cargo build"}),
+                    &cwd()
                 )
                 .decision,
             PermissionDecision::Allow
@@ -667,7 +876,8 @@ mod tests {
                     PermissionMode::Ask,
                     &metadata("shell"),
                     "shell",
-                    &json!({"command":"cargo test --all && cargo fmt"})
+                    &json!({"command":"cargo test --all && cargo fmt"}),
+                    &cwd()
                 )
                 .decision,
             PermissionDecision::Ask
@@ -691,5 +901,122 @@ mod tests {
         )
         .unwrap()]);
         assert!(!scoped.hides_tool_schema(PermissionMode::Ask, "shell"));
+    }
+
+    #[test]
+    fn auto_allows_project_write_but_not_non_project_write() {
+        let engine = PolicyEngine::default();
+        let project = project_cwd();
+        assert_eq!(
+            engine
+                .decide(
+                    PermissionMode::Auto,
+                    &metadata("write_file"),
+                    "write_file",
+                    &json!({"path":"src/lib.rs"}),
+                    &project
+                )
+                .decision,
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            engine
+                .decide(
+                    PermissionMode::Auto,
+                    &metadata("write_file"),
+                    "write_file",
+                    &json!({"path":"notes.txt"}),
+                    &cwd()
+                )
+                .decision,
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn write_file_hard_denies_sensitive_paths_even_with_allow_rule() {
+        let engine = PolicyEngine::new(vec![PermissionRule::parse(
+            RuleSource::Config,
+            RuleBehavior::Allow,
+            "write_file",
+        )
+        .unwrap()]);
+        let project = project_cwd();
+        for path in [
+            ".git/config",
+            ".ssh/config",
+            ".env",
+            ".env.local",
+            "config/api_token.txt",
+            "keys/private.key",
+        ] {
+            assert_eq!(
+                engine
+                    .decide(
+                        PermissionMode::Auto,
+                        &metadata("write_file"),
+                        "write_file",
+                        &json!({"path":path}),
+                        &project
+                    )
+                    .decision,
+                PermissionDecision::Deny,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            engine
+                .decide(
+                    PermissionMode::Auto,
+                    &metadata("write_file"),
+                    "write_file",
+                    &json!({"path":".micos/plans/active.md"}),
+                    &project
+                )
+                .decision,
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn auto_asks_before_writing_generated_paths() {
+        let engine = PolicyEngine::default();
+        let project = project_cwd();
+        for path in ["target/debug/x", "node_modules/pkg/index.js", "dist/app.js"] {
+            assert_eq!(
+                engine
+                    .decide(
+                        PermissionMode::Auto,
+                        &metadata("write_file"),
+                        "write_file",
+                        &json!({"path":path}),
+                        &project
+                    )
+                    .decision,
+                PermissionDecision::Ask,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_denies_symlink_paths() {
+        let engine = PolicyEngine::default();
+        let project = project_cwd();
+        std::os::unix::fs::symlink("/tmp", project.join("linked")).unwrap();
+
+        assert_eq!(
+            engine
+                .decide(
+                    PermissionMode::Auto,
+                    &metadata("write_file"),
+                    "write_file",
+                    &json!({"path":"linked/out.txt"}),
+                    &project
+                )
+                .decision,
+            PermissionDecision::Deny
+        );
     }
 }

@@ -134,6 +134,10 @@ pub enum SessionEvent {
         thinking: Option<ThinkingMode>,
         reasoning_effort: Option<ReasoningEffort>,
     },
+    PermissionModeChanged {
+        timestamp: String,
+        permission: PermissionMode,
+    },
     UserInput {
         timestamp: String,
         text: String,
@@ -339,6 +343,18 @@ mod tests {
         assert_eq!(value["index_tokens"], 42);
         assert_eq!(value["topic_count"], 2);
         assert_eq!(value["created_index"], true);
+    }
+
+    #[test]
+    fn permission_mode_changed_event_serializes_with_expected_fields() {
+        let event = SessionEvent::PermissionModeChanged {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            permission: PermissionMode::Auto,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "permission_mode_changed");
+        assert_eq!(value["permission"], "auto");
     }
 
     #[test]

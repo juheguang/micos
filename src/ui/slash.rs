@@ -10,12 +10,15 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
+use std::time::SystemTime;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlashCommand {
     Help,
     Status,
+    Permission,
     Sessions,
     Transcript,
     Summary,
@@ -39,6 +42,23 @@ pub struct SlashCommandInfo {
     pub command: SlashCommand,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionChoice {
+    pub id: String,
+    pub path: PathBuf,
+    pub modified: SystemTime,
+}
+
+impl SessionChoice {
+    pub fn label(&self) -> String {
+        self.id.clone()
+    }
+
+    pub fn description(&self) -> String {
+        format!("{}  {}", humantime(self.modified), self.path.display())
+    }
+}
+
 pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
     SlashCommandInfo {
         name: "help",
@@ -49,6 +69,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "status",
         description: "show model, API, permission, cwd, and log path",
         command: SlashCommand::Status,
+    },
+    SlashCommandInfo {
+        name: "permission",
+        description: "show or set permission mode: safe, ask, or auto",
+        command: SlashCommand::Permission,
     },
     SlashCommandInfo {
         name: "sessions",
@@ -225,37 +250,66 @@ pub fn format_status(config: &SessionConfig, session_id: Uuid, session_path: &Pa
 }
 
 pub fn format_sessions(cwd: &Path) -> Result<String> {
+    let choices = recent_session_choices(cwd, 10)?;
     let dir = cwd.join(SESSION_DIR);
     if !dir.exists() {
         return Ok(format!("No sessions found at {}", dir.display()));
     }
 
-    let mut entries = fs::read_dir(&dir)
+    if choices.is_empty() {
+        return Ok(format!("No sessions found at {}", dir.display()));
+    }
+
+    Ok(choices
+        .into_iter()
+        .map(|choice| {
+            format!(
+                "{}  {}  {}",
+                humantime(choice.modified),
+                choice.id,
+                choice.path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub fn recent_session_choices(cwd: &Path, limit: usize) -> Result<Vec<SessionChoice>> {
+    let dir = cwd.join(SESSION_DIR);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut choices = fs::read_dir(&dir)
         .with_context(|| format!("read session directory {}", dir.display()))?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let metadata = entry.metadata().ok()?;
-            Some((entry.path(), metadata.modified().ok()?))
+            if !metadata.is_file() {
+                return None;
+            }
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let id = entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())?
+                .to_string();
+            Some(SessionChoice {
+                id,
+                path: entry.path(),
+                modified: metadata.modified().ok()?,
+            })
         })
         .collect::<Vec<_>>();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    sort_session_choices(&mut choices);
+    choices.truncate(limit);
+    Ok(choices)
+}
 
-    if entries.is_empty() {
-        return Ok(format!("No sessions found at {}", dir.display()));
-    }
-
-    Ok(entries
-        .into_iter()
-        .take(10)
-        .map(|(path, modified)| {
-            let id = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("unknown");
-            format!("{}  {}  {}", humantime(modified), id, path.display())
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+fn sort_session_choices(choices: &mut [SessionChoice]) {
+    choices.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
 }
 
 pub fn format_transcript(path: &Path) -> Result<String> {
@@ -681,6 +735,10 @@ mod tests {
             invocation(SlashCommand::Summary, "")
         );
         assert_eq!(
+            parse_input("/permission auto"),
+            invocation(SlashCommand::Permission, "auto")
+        );
+        assert_eq!(
             parse_input("/resume 019e6367-bb0e-7ec0-9243-1ac2f75295c4"),
             invocation(SlashCommand::Resume, "019e6367-bb0e-7ec0-9243-1ac2f75295c4")
         );
@@ -710,6 +768,7 @@ mod tests {
             vec![
                 "help",
                 "status",
+                "permission",
                 "sessions",
                 "transcript",
                 "summary",
@@ -727,6 +786,10 @@ mod tests {
             ]
         );
         assert_eq!(slash_command_exact("/status"), Some(SlashCommand::Status));
+        assert_eq!(
+            slash_command_exact("/permission"),
+            Some(SlashCommand::Permission)
+        );
         assert_eq!(slash_command_exact("/summary"), Some(SlashCommand::Summary));
         assert_eq!(slash_command_exact("/prompt"), Some(SlashCommand::Prompt));
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
@@ -864,6 +927,37 @@ mod tests {
         assert!(overview.contains("build.md"));
         assert!(overview.contains("Build"));
         assert_eq!(format_memory_index(&memory), "# Facts\nUse cargo test.");
+    }
+
+    #[test]
+    fn session_choices_sort_by_last_modified_descending() {
+        let mut choices = vec![
+            SessionChoice {
+                id: "older".into(),
+                path: std::path::PathBuf::from(".micos/sessions/older.jsonl"),
+                modified: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            },
+            SessionChoice {
+                id: "newer".into(),
+                path: std::path::PathBuf::from(".micos/sessions/newer.jsonl"),
+                modified: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+            },
+            SessionChoice {
+                id: "same-time".into(),
+                path: std::path::PathBuf::from(".micos/sessions/same-time.jsonl"),
+                modified: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            },
+        ];
+
+        sort_session_choices(&mut choices);
+
+        assert_eq!(
+            choices
+                .into_iter()
+                .map(|choice| choice.id)
+                .collect::<Vec<_>>(),
+            vec!["newer", "older", "same-time"]
+        );
     }
 
     #[test]

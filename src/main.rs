@@ -2,7 +2,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use micos::agent::Agent;
 use micos::config::{
-    resolve_api_key, ConfigOverrides, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode,
+    resolve_api_key, save_permission_mode, ConfigOverrides, PermissionMode, ReasoningEffort,
+    SessionConfig, ThinkingMode,
 };
 use micos::memory::ProjectMemory;
 use micos::model::{ModelClient, OpenAiModelClient};
@@ -251,6 +252,25 @@ async fn handle_console_slash<C: ModelClient>(
         SlashCommand::Help => ui.print_help(),
         SlashCommand::Status => {
             ui.print_status(agent.config(), agent.session_id(), agent.session_path())
+        }
+        SlashCommand::Permission => {
+            if invocation.args.is_empty() {
+                println!(
+                    "permission: {}\nusage: /permission safe|ask|auto",
+                    agent.config().permission
+                );
+            } else {
+                match invocation.args.parse::<PermissionMode>() {
+                    Ok(permission) => {
+                        save_permission_mode(&agent.config().cwd, permission)?;
+                        agent.apply_permission_mode(permission)?;
+                        ui.print_status(agent.config(), agent.session_id(), agent.session_path());
+                    }
+                    Err(error) => {
+                        eprintln!("permission failed: {error}");
+                    }
+                }
+            }
         }
         SlashCommand::Sessions => ui.print_sessions(&agent.config().cwd)?,
         SlashCommand::Transcript => ui.print_transcript(agent.session_path())?,

@@ -2,8 +2,8 @@ use crate::config::{
     ModelSettings, ReasoningEffort, ThinkingMode, DEEPSEEK_CHAT_COMPLETIONS_BASE_URL,
 };
 use crate::ui::{
-    parse_input, slash_command_matches, ApprovalDecision, InputCommand, SlashCommandInfo,
-    SlashInvocation,
+    parse_input, slash_command_matches, ApprovalDecision, InputCommand, SessionChoice,
+    SlashCommand, SlashCommandInfo, SlashInvocation,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::mpsc as std_mpsc;
@@ -89,7 +89,54 @@ pub(super) struct ComposerState {
     pub(super) popup_open: bool,
     popup_dismissed: bool,
     selected: usize,
+    resume_choices: Vec<SessionChoice>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PopupItem {
+    Command(SlashCommandInfo),
+    Permission(&'static PermissionChoice),
+    Resume(SessionChoice),
+}
+
+impl PopupItem {
+    pub(super) fn label(&self) -> String {
+        match self {
+            PopupItem::Command(command) => format!("/{}", command.name),
+            PopupItem::Permission(choice) => choice.name.to_string(),
+            PopupItem::Resume(choice) => choice.label(),
+        }
+    }
+
+    pub(super) fn description(&self) -> String {
+        match self {
+            PopupItem::Command(command) => command.description.to_string(),
+            PopupItem::Permission(choice) => choice.description.to_string(),
+            PopupItem::Resume(choice) => choice.description(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PermissionChoice {
+    name: &'static str,
+    description: &'static str,
+}
+
+const PERMISSION_CHOICES: &[PermissionChoice] = &[
+    PermissionChoice {
+        name: "safe",
+        description: "read-only shell defaults; write_file denied unless a rule allows it",
+    },
+    PermissionChoice {
+        name: "ask",
+        description: "ask before writes and risky shell commands",
+    },
+    PermissionChoice {
+        name: "auto",
+        description: "allow project writes and safe shell commands by default",
+    },
+];
 
 impl ComposerState {
     pub fn new() -> Self {
@@ -99,6 +146,7 @@ impl ComposerState {
             popup_open: false,
             popup_dismissed: false,
             selected: 0,
+            resume_choices: Vec::new(),
         }
     }
 
@@ -115,12 +163,43 @@ impl ComposerState {
         self.selected
     }
 
-    pub fn matches(&self) -> Vec<SlashCommandInfo> {
-        if self.buffer.starts_with('/') {
-            slash_command_matches(&self.buffer)
-        } else {
-            Vec::new()
+    pub fn matches(&self) -> Vec<PopupItem> {
+        if let Some(query) = self.permission_query() {
+            return PERMISSION_CHOICES
+                .iter()
+                .filter(|choice| query.is_empty() || choice.name.starts_with(query))
+                .map(PopupItem::Permission)
+                .collect();
         }
+        if let Some(query) = self.resume_query() {
+            return self
+                .resume_choices
+                .iter()
+                .filter(|choice| {
+                    query.is_empty()
+                        || choice.id.contains(query)
+                        || choice.path.display().to_string().contains(query)
+                })
+                .cloned()
+                .map(PopupItem::Resume)
+                .collect();
+        }
+        if self.buffer.starts_with('/') {
+            return slash_command_matches(&self.buffer)
+                .into_iter()
+                .map(PopupItem::Command)
+                .collect();
+        }
+        Vec::new()
+    }
+
+    pub fn wants_resume_choices(&self) -> bool {
+        self.resume_query().is_some()
+    }
+
+    pub fn set_resume_choices(&mut self, choices: Vec<SessionChoice>) {
+        self.resume_choices = choices;
+        self.clamp_selection();
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
@@ -161,7 +240,10 @@ impl ComposerState {
                 self.move_selection(1);
                 ComposerAction::None
             }
-            KeyCode::Tab if self.popup_open => self.accept_popup(),
+            KeyCode::Tab if self.popup_open => {
+                self.complete_popup();
+                ComposerAction::None
+            }
             KeyCode::Enter => self.enter(),
             KeyCode::Esc if self.popup_open => {
                 self.popup_open = false;
@@ -247,13 +329,6 @@ impl ComposerState {
     }
 
     fn enter(&mut self) -> ComposerAction {
-        if self.popup_open {
-            let matches = self.matches();
-            if !matches.is_empty() {
-                return self.accept_popup();
-            }
-            return ComposerAction::None;
-        }
         let trimmed = self.buffer.trim();
         if trimmed.is_empty() {
             self.clear();
@@ -271,17 +346,43 @@ impl ComposerState {
         ComposerAction::Submit(input)
     }
 
-    fn accept_popup(&mut self) -> ComposerAction {
+    fn complete_popup(&mut self) {
         let matches = self.matches();
         let Some(command) = matches.get(self.selected.min(matches.len().saturating_sub(1))) else {
-            return ComposerAction::None;
+            return;
         };
-        let action = ComposerAction::Command(SlashInvocation {
-            command: command.command,
-            args: String::new(),
-        });
-        self.clear();
-        action
+        match command {
+            PopupItem::Command(command) if command.command == SlashCommand::Permission => {
+                self.buffer = "/permission ".into();
+                self.cursor = self.buffer.len();
+                self.popup_dismissed = false;
+                self.refresh_popup();
+            }
+            PopupItem::Command(command) if command.command == SlashCommand::Resume => {
+                self.buffer = "/resume ".into();
+                self.cursor = self.buffer.len();
+                self.popup_dismissed = false;
+                self.refresh_popup();
+            }
+            PopupItem::Command(command) => {
+                self.buffer = format!("/{}", command.name);
+                self.cursor = self.buffer.len();
+                self.popup_open = false;
+                self.popup_dismissed = true;
+            }
+            PopupItem::Permission(choice) => {
+                self.buffer = format!("/permission {}", choice.name);
+                self.cursor = self.buffer.len();
+                self.popup_open = false;
+                self.popup_dismissed = true;
+            }
+            PopupItem::Resume(choice) => {
+                self.buffer = format!("/resume {}", choice.id);
+                self.cursor = self.buffer.len();
+                self.popup_open = false;
+                self.popup_dismissed = true;
+            }
+        };
     }
 
     fn clear(&mut self) {
@@ -297,11 +398,40 @@ impl ComposerState {
             .buffer
             .strip_prefix('/')
             .is_some_and(|body| !body.chars().any(char::is_whitespace));
-        self.popup_open = slash_without_args && !self.popup_dismissed;
+        self.popup_open = (slash_without_args
+            || self.permission_query().is_some()
+            || self.resume_query().is_some())
+            && !self.popup_dismissed;
+        self.clamp_selection();
+    }
+
+    fn clamp_selection(&mut self) {
         let len = self.matches().len();
         if len == 0 || self.selected >= len {
             self.selected = 0;
         }
+    }
+
+    fn resume_query(&self) -> Option<&str> {
+        let rest = self.buffer.strip_prefix("/resume")?;
+        if rest.is_empty() {
+            return Some("");
+        }
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.trim())
+    }
+
+    fn permission_query(&self) -> Option<&str> {
+        let rest = self.buffer.strip_prefix("/permission")?;
+        if rest.is_empty() {
+            return Some("");
+        }
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.trim())
     }
 
     pub(super) fn visible_input(&self, max_width: usize) -> (String, usize) {

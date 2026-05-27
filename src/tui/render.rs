@@ -30,6 +30,7 @@ pub(super) enum RunStatus {
     Idle,
     Working,
     Tool(String),
+    Handoff(String),
     WaitingApproval,
 }
 
@@ -39,6 +40,7 @@ impl RunStatus {
             RunStatus::Idle => "idle".into(),
             RunStatus::Working => "Working...".into(),
             RunStatus::Tool(name) => format!("Running {name}"),
+            RunStatus::Handoff(trigger) => format!("Writing handoff ({trigger})"),
             RunStatus::WaitingApproval => "Waiting for approval".into(),
         }
     }
@@ -217,7 +219,7 @@ fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState
         .skip(start)
         .take(visible_rows)
         .enumerate()
-        .map(|(index, command)| {
+        .map(|(index, item)| {
             let command_index = start + index;
             let style = if command_index == selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -226,10 +228,10 @@ fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState
             };
             Line::from(vec![
                 Span::styled(
-                    format!("/{:<12}", command.name),
+                    format!("{:<37}", item.label()),
                     style.add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(command.description, style),
+                Span::styled(item.description(), style),
             ])
         })
         .collect::<Vec<_>>();

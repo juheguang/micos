@@ -1,13 +1,14 @@
 use crate::agent::Agent;
-use crate::config::save_model_settings;
+use crate::config::{save_model_settings, save_permission_mode, PermissionMode};
 use crate::model::OpenAiModelClient;
+use crate::plan::HandoffReport;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
     format_memory, format_memory_index, format_prompt, format_resume_report, format_sessions,
-    format_status, format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision,
-    SlashCommand, SlashInvocation, UiSink,
+    format_status, format_summary, format_trace, format_transcript, recent_session_choices,
+    AgentEvent, ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -130,6 +131,7 @@ pub struct TuiUi {
     approval_picker: Option<ApprovalPickerState>,
     permission_message: Option<usize>,
     active_tool_message: Option<usize>,
+    active_handoff_message: Option<usize>,
     show_reasoning: bool,
     run_status: RunStatus,
     animation_tick: usize,
@@ -158,6 +160,7 @@ impl TuiUi {
             approval_picker: None,
             permission_message: None,
             active_tool_message: None,
+            active_handoff_message: None,
             show_reasoning: false,
             run_status: RunStatus::Idle,
             animation_tick: 0,
@@ -219,18 +222,7 @@ impl TuiUi {
                         && key.code == KeyCode::Char('c')
                     {
                         if self.agent.is_some() {
-                            let handoff_result = self
-                                .agent
-                                .as_mut()
-                                .expect("agent checked above")
-                                .write_handoff("user_interrupt");
-                            if let Err(error) = handoff_result {
-                                self.push_message(
-                                    MessageKind::Warning,
-                                    "/handoff",
-                                    format!("handoff failed: {error}"),
-                                );
-                            }
+                            self.write_handoff_with_status("user_interrupt")?;
                             self.agent
                                 .as_ref()
                                 .expect("agent checked above")
@@ -297,6 +289,7 @@ impl TuiUi {
     }
 
     fn render(&mut self) -> Result<()> {
+        self.refresh_resume_choices();
         if let Some(agent) = self.agent.as_ref() {
             self.footer_model = agent.config().model.clone();
             self.footer_thinking = short_thinking(agent.config().thinking).to_string();
@@ -349,6 +342,18 @@ impl TuiUi {
             })
             .context("draw terminal")?;
         Ok(())
+    }
+
+    fn refresh_resume_choices(&mut self) {
+        if !self.composer.wants_resume_choices() {
+            return;
+        }
+        let Some(agent) = self.agent.as_ref() else {
+            self.composer.set_resume_choices(Vec::new());
+            return;
+        };
+        let choices = recent_session_choices(&agent.config().cwd, 50).unwrap_or_default();
+        self.composer.set_resume_choices(choices);
     }
 
     fn tick_animation(&mut self) {
@@ -525,6 +530,39 @@ impl TuiUi {
                     format_status(agent.config(), agent.session_id(), agent.session_path()),
                 );
             }
+            SlashCommand::Permission => {
+                let (kind, body) = {
+                    let agent = self.agent.as_mut().expect("agent checked above");
+                    if invocation.args.is_empty() {
+                        (
+                            MessageKind::System,
+                            format!(
+                                "permission: {}\nusage: /permission safe|ask|auto",
+                                agent.config().permission
+                            ),
+                        )
+                    } else {
+                        match invocation.args.parse::<PermissionMode>() {
+                            Ok(permission) => {
+                                save_permission_mode(&agent.config().cwd, permission)?;
+                                agent.apply_permission_mode(permission)?;
+                                (
+                                    MessageKind::System,
+                                    format_status(
+                                        agent.config(),
+                                        agent.session_id(),
+                                        agent.session_path(),
+                                    ),
+                                )
+                            }
+                            Err(error) => {
+                                (MessageKind::Warning, format!("permission failed: {error}"))
+                            }
+                        }
+                    }
+                };
+                self.push_message(kind, "/permission", body);
+            }
             SlashCommand::Sessions => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.push_message(
@@ -629,23 +667,7 @@ impl TuiUi {
                 }
             }
             SlashCommand::Handoff => {
-                let result = self
-                    .agent
-                    .as_mut()
-                    .expect("agent checked above")
-                    .write_handoff("manual");
-                match result {
-                    Ok(report) => self.push_message(
-                        MessageKind::System,
-                        "/handoff",
-                        format_handoff_report(&report),
-                    ),
-                    Err(error) => self.push_message(
-                        MessageKind::Warning,
-                        "/handoff",
-                        format!("handoff failed: {error}"),
-                    ),
-                }
+                self.write_handoff_with_status("manual")?;
             }
             SlashCommand::Plan => {
                 let agent = self.agent.as_ref().expect("agent checked above");
@@ -666,23 +688,13 @@ impl TuiUi {
                 self.messages.clear();
                 self.permission_message = None;
                 self.active_tool_message = None;
+                self.active_handoff_message = None;
                 self.scroll_top = 0;
                 self.stick_to_bottom = true;
             }
             SlashCommand::Exit => {
                 if self.agent.is_some() {
-                    let handoff_result = self
-                        .agent
-                        .as_mut()
-                        .expect("agent checked above")
-                        .write_handoff("user_exit");
-                    if let Err(error) = handoff_result {
-                        self.push_message(
-                            MessageKind::Warning,
-                            "/handoff",
-                            format!("handoff failed: {error}"),
-                        );
-                    }
+                    self.write_handoff_with_status("user_exit")?;
                     self.agent
                         .as_ref()
                         .expect("agent checked above")
@@ -880,6 +892,75 @@ impl TuiUi {
         self.scroll_to_bottom();
     }
 
+    fn write_handoff_with_status(&mut self, trigger: &str) -> Result<()> {
+        if self.agent.is_none() {
+            return Ok(());
+        }
+        self.run_status = RunStatus::Handoff(trigger.to_string());
+        self.active_handoff_message = Some(self.messages.len());
+        self.push_message_with_status(
+            MessageKind::Tool,
+            format!("handoff {trigger}"),
+            "writing .micos/plans/active.md",
+            Some(MessageStatus::Running),
+        );
+        self.scroll_to_bottom();
+        self.render()?;
+
+        let start = Instant::now();
+        let result = self
+            .agent
+            .as_mut()
+            .expect("agent checked above")
+            .write_handoff(trigger);
+        let elapsed = start.elapsed();
+        self.run_status = RunStatus::Idle;
+        self.finish_handoff_message(trigger, result, elapsed);
+        self.scroll_to_bottom();
+        self.render()
+    }
+
+    fn finish_handoff_message(
+        &mut self,
+        trigger: &str,
+        result: std::result::Result<HandoffReport, anyhow::Error>,
+        elapsed: Duration,
+    ) {
+        let title = format!("handoff {trigger}");
+        let (kind, body, status) = match result {
+            Ok(report) => (
+                MessageKind::Tool,
+                format!(
+                    "{} in {}\n{}",
+                    "written",
+                    format_duration(elapsed),
+                    format_handoff_report(&report)
+                ),
+                Some(MessageStatus::Success),
+            ),
+            Err(error) => (
+                MessageKind::Warning,
+                format!("failed in {}\n{error}", format_duration(elapsed)),
+                Some(MessageStatus::Failed),
+            ),
+        };
+        if let Some(index) = self
+            .active_handoff_message
+            .take()
+            .filter(|index| *index < self.messages.len() && self.messages[*index].title == title)
+        {
+            self.messages[index] = TuiMessage {
+                kind,
+                title,
+                body,
+                status,
+                transient: false,
+            };
+        } else {
+            self.push_message_with_status(kind, title, body, status);
+        }
+    }
+
     fn remove_permission_message(&mut self) {
         if let Some(index) = self.permission_message.take() {
             if index < self.messages.len() && self.messages[index].transient {
@@ -1068,10 +1149,12 @@ mod tests {
             composer
                 .matches()
                 .into_iter()
-                .map(|command| command.name)
+                .map(|item| item.label())
                 .collect::<Vec<_>>(),
-            vec!["status"]
+            vec!["/status"]
         );
+        assert_eq!(composer.handle_key(key(KeyCode::Tab)), ComposerAction::None);
+        assert_eq!(composer.buffer(), "/status");
         assert_eq!(
             composer.handle_key(key(KeyCode::Enter)),
             command(SlashCommand::Status)
@@ -1080,13 +1163,18 @@ mod tests {
     }
 
     #[test]
-    fn popup_selection_wraps_and_tab_accepts_current_item() {
+    fn popup_selection_wraps_and_tab_completes_current_item() {
         let mut composer = ComposerState::new();
         composer.handle_key(key(KeyCode::Char('/')));
         composer.handle_key(key(KeyCode::Up));
         assert_eq!(composer.selected(), SLASH_COMMANDS.len() - 1);
+        assert_eq!(composer.handle_key(key(KeyCode::Tab)), ComposerAction::None);
         assert_eq!(
-            composer.handle_key(key(KeyCode::Tab)),
+            composer.buffer(),
+            format!("/{}", SLASH_COMMANDS.last().unwrap().name)
+        );
+        assert_eq!(
+            composer.handle_key(key(KeyCode::Enter)),
             command(SLASH_COMMANDS.last().unwrap().command)
         );
     }
@@ -1100,6 +1188,11 @@ mod tests {
         }
 
         assert_eq!(composer.selected(), POPUP_LIMIT);
+        assert_eq!(composer.handle_key(key(KeyCode::Tab)), ComposerAction::None);
+        assert_eq!(
+            composer.buffer(),
+            format!("/{}", SLASH_COMMANDS[POPUP_LIMIT].name)
+        );
         assert_eq!(
             composer.handle_key(key(KeyCode::Enter)),
             command(SLASH_COMMANDS[POPUP_LIMIT].command)
@@ -1113,12 +1206,90 @@ mod tests {
             composer.handle_key(key(KeyCode::Char(ch)));
         }
 
-        assert!(!composer.popup_open());
         assert_eq!(
             composer.handle_key(key(KeyCode::Enter)),
             ComposerAction::Command(SlashInvocation {
                 command: SlashCommand::Resume,
                 args: "source-session".into()
+            })
+        );
+    }
+
+    #[test]
+    fn composer_accepts_resume_session_choice() {
+        let mut composer = ComposerState::new();
+        composer.set_resume_choices(vec![
+            crate::ui::SessionChoice {
+                id: "newer-session".into(),
+                path: std::path::PathBuf::from(".micos/sessions/newer-session.jsonl"),
+                modified: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+            },
+            crate::ui::SessionChoice {
+                id: "older-session".into(),
+                path: std::path::PathBuf::from(".micos/sessions/older-session.jsonl"),
+                modified: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            },
+        ]);
+        for ch in "/resume".chars() {
+            composer.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        assert!(composer.popup_open());
+        assert_eq!(
+            composer
+                .matches()
+                .into_iter()
+                .map(|item| item.label())
+                .collect::<Vec<_>>(),
+            vec!["newer-session", "older-session"]
+        );
+        assert_eq!(composer.handle_key(key(KeyCode::Tab)), ComposerAction::None);
+        assert_eq!(composer.buffer(), "/resume newer-session");
+        assert_eq!(
+            composer.handle_key(key(KeyCode::Enter)),
+            ComposerAction::Command(SlashInvocation {
+                command: SlashCommand::Resume,
+                args: "newer-session".into()
+            })
+        );
+    }
+
+    #[test]
+    fn composer_completes_permission_mode_in_two_steps() {
+        let mut composer = ComposerState::new();
+        for ch in "/per".chars() {
+            composer.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        assert_eq!(
+            composer
+                .matches()
+                .into_iter()
+                .map(|item| item.label())
+                .collect::<Vec<_>>(),
+            vec!["/permission"]
+        );
+        assert_eq!(composer.handle_key(key(KeyCode::Tab)), ComposerAction::None);
+        assert_eq!(composer.buffer(), "/permission ");
+        assert!(composer.popup_open());
+        assert_eq!(
+            composer
+                .matches()
+                .into_iter()
+                .map(|item| item.label())
+                .collect::<Vec<_>>(),
+            vec!["safe", "ask", "auto"]
+        );
+
+        composer.handle_key(key(KeyCode::Down));
+        composer.handle_key(key(KeyCode::Down));
+        assert_eq!(composer.handle_key(key(KeyCode::Tab)), ComposerAction::None);
+        assert_eq!(composer.buffer(), "/permission auto");
+        assert_eq!(
+            composer.handle_key(key(KeyCode::Enter)),
+            ComposerAction::Command(SlashInvocation {
+                command: SlashCommand::Permission,
+                args: "auto".into()
             })
         );
     }

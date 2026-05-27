@@ -39,6 +39,7 @@ pub(super) fn validate_compact_summary(
     summary: &str,
     latest_user_text: Option<&str>,
 ) -> CompactValidation {
+    let summary = normalize_compact_headings(summary);
     let summary = summary.trim();
     if summary.is_empty() {
         return CompactValidation::failed("empty_summary");
@@ -71,6 +72,10 @@ pub(super) fn validate_compact_summary(
         status: "passed".into(),
         message: "passed".into(),
     }
+}
+
+pub(super) fn normalize_compact_summary(summary: &str) -> String {
+    normalize_compact_headings(summary).trim().to_string()
 }
 
 pub(super) fn compression_ratio_percent(before_tokens: usize, after_tokens: usize) -> usize {
@@ -188,6 +193,62 @@ fn contains_verification_status(text: &str) -> bool {
         })
 }
 
+fn normalize_compact_headings(summary: &str) -> String {
+    summary
+        .lines()
+        .map(|line| match compact_heading_for_line(line) {
+            Some((heading, rest)) if rest.is_empty() => format!("## {heading}"),
+            Some((heading, rest)) => format!("## {heading}\n{rest}"),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compact_heading_for_line(line: &str) -> Option<(&'static str, String)> {
+    let candidate = heading_candidate(line);
+    for heading in COMPACT_SUMMARY_FORMAT {
+        let heading_key = normalize_heading_line(heading);
+        let candidate_key = normalize_heading_line(&candidate);
+        if candidate_key == heading_key {
+            return Some((*heading, String::new()));
+        }
+        let Some((prefix, rest)) = candidate.split_once(':') else {
+            continue;
+        };
+        if normalize_heading_line(prefix) == heading_key {
+            return Some((*heading, rest.trim().to_string()));
+        }
+    }
+    None
+}
+
+fn heading_candidate(line: &str) -> String {
+    let trimmed = line.trim();
+    let trimmed = trimmed.trim_start_matches('#').trim();
+    let trimmed = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim();
+    let trimmed = trimmed
+        .split_once('.')
+        .filter(|(prefix, _)| prefix.chars().all(|ch| ch.is_ascii_digit()))
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(trimmed);
+    let trimmed = trimmed.trim_matches('*').trim_matches('_').trim();
+    trimmed.to_string()
+}
+
+fn normalize_heading_line(line: &str) -> String {
+    let trimmed = line.trim().trim_end_matches(':').trim();
+    trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 impl CompactValidation {
     fn failed(message: impl Into<String>) -> Self {
         let message = message.into();
@@ -257,5 +318,20 @@ mod tests {
             .message,
             "missing_verification_status"
         );
+    }
+
+    #[test]
+    fn compact_summary_validation_accepts_common_heading_variants() {
+        let summary = "Primary Request and Intent: Handle latest user request compile errors.\n\n### Key Technical Concepts\nCompact governance.\n\n**Files and Code Sections**\nsrc/agent.rs.\n\n4. Errors and Fixes\nNone.\n\n- Decisions Made\nRetain tail.\n\n## Pending Tasks\nRun tests.\n\nCurrent Work\nValidation.\n\nNext Step\nRun verification.";
+
+        let normalized = normalize_compact_summary(summary);
+
+        assert!(
+            validate_compact_summary(summary, Some("latest user request compile errors")).passed
+        );
+        assert!(normalized.contains("## Primary Request and Intent"));
+        assert!(normalized.contains("Handle latest user request compile errors."));
+        assert!(normalized.contains("## Files and Code Sections"));
+        assert!(normalized.contains("## Next Step"));
     }
 }

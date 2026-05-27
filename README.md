@@ -100,7 +100,14 @@ cargo run -- chat --model deepseek-chat --base-url https://api.deepseek.com/chat
 
 - `safe`：允许读工具；拒绝写文件；shell 只允许保守的只读命令。
 - `ask`：允许读工具；写文件和 shell 命令执行前询问。
-- `auto`：允许内置工具在当前工作目录范围内执行。
+- `auto`：允许内置工具在当前工作目录范围内执行；`write_file` 只会默认写入识别为项目的 cwd 内普通文件。
+
+`auto` 下的默认写入规则仍有保护边界：
+
+- cwd 必须看起来是项目目录或项目子目录，例如上级路径包含 `.git`、`Cargo.toml`、`package.json`、`pyproject.toml`、`go.mod` 等项目标记。
+- `write_file` 不能写出 cwd，也不能穿过 cwd 内的 symlink 写到外部。
+- `.git`、`.ssh`、`.gnupg`、`.config`、`.codex`、`.claude`、`.env*`、明显的 secret/token/private key 文件会被拒绝；`.micos/**` 作为 harness 状态目录允许写入。
+- `target`、`node_modules`、`dist`、`build`、`.next`、`.cache` 这类生成目录在默认策略下需要询问。
 
 退出 REPL：
 
@@ -112,6 +119,7 @@ REPL 支持常用 slash commands：
 
 - `/help`：显示命令列表。
 - `/status`：显示 model、API kind、base URL、permission、context window、cwd、session id 和日志路径。
+- `/permission [safe|ask|auto]`：查看或切换当前权限模式，并写入 `.micos/config.toml`。
 - `/sessions`：列出 `.micos/sessions` 最近会话，包含可用于 resume 的 session id。
 - `/transcript`：显示当前 transcript 路径和最近事件摘要。
 - `/summary`：显示当前 session 最近一次 compact summary 正文。
@@ -127,7 +135,7 @@ REPL 支持常用 slash commands：
 - `/clear`：清屏。
 - `/exit`：退出。
 
-模型输出会以流式方式显示。工具调用会先显示工具卡片；`ask` 权限模式下，`write_file` 和未知风险的 `shell` 会在执行前确认。批准时可以选择仅本次、本 session 记住，或写入项目配置。
+模型输出会以流式方式显示。工具调用会先显示工具卡片；`ask` 权限模式下，`write_file` 和未知风险的 `shell` 会在执行前确认。批准时可以选择仅本次、本 session 记住，或写入项目配置。TUI 的 slash popup 中，`Tab` 只补全当前选项，`Enter` 才执行命令。
 
 ## 内置工具
 
@@ -214,6 +222,8 @@ cargo run -- chat --resume <session-id-or-path>
 /resume <session-id-or-path>
 ```
 
+在 TUI 中输入 `/resume` 后会弹出最近 session 候选列表，按最后修改时间从新到旧排序。上下键可以浏览全部候选，回车选择后会执行对应的 resume；继续输入空格和前缀可过滤候选。
+
 resume 会读取 `.micos/sessions/*.jsonl`，重建当前运行时的 model-visible transcript。若旧 session 有成功 compact，则优先恢复 `compacted summary + retained tail`；否则从 `user_input`、`assistant_text`、`tool_call` 和 `tool_output` 事件重建 transcript。`context_snapshot`、`permission_decision`、trace/report 和 stop 事件不会进入 model-visible context。
 
 resume 不会重放工具，也不会修改旧 session JSONL；它会在当前新 session 中写入 `session_resumed`，字段包含 `timestamp`、`source_session_id`、`source_path`、`restored_messages`、`used_summary`、`restored_tail_messages`、`estimated_tokens`。
@@ -263,6 +273,8 @@ REPL/TUI 支持：
 
 - `/handoff`：手动刷新 `.micos/plans/active.md`，并显示路径、触发原因、文件/命令数量、验证状态和 token 估算。
 - `/plan`：显示当前 active plan 正文；若文件为空则显示没有记录。
+
+TUI 中 handoff 会以类似工具调用的消息展示 running/success/failed 状态。输入 `/exit` 或触发 Ctrl-C 退出时，会先等待 handoff 写入完成，再停止当前 session 并退出。
 
 session JSONL 会在写 handoff 后记录 `handoff_written`，字段包含 `timestamp`、`path`、`trigger`、`files_touched`、`commands_run`、`verification_status`、`known_failures`、`tokens_estimate`。
 

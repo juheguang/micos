@@ -2,7 +2,9 @@ mod approval;
 mod compact;
 mod model_output;
 
-use crate::config::{save_permission_rule, ModelSettings, SessionConfig, ThinkingMode};
+use crate::config::{
+    save_permission_rule, ModelSettings, PermissionMode, SessionConfig, ThinkingMode,
+};
 use crate::context::{
     compacted_summary_message, estimate_text_tokens, ContextBuilder, ContextStats,
 };
@@ -23,7 +25,7 @@ use crate::ui::{AgentEvent, ApprovalDecision, UiSink};
 use anyhow::Result;
 use approval::suggest_approval_rule;
 use compact::{
-    compression_ratio_percent, validate_compact_summary, CompactPlan,
+    compression_ratio_percent, normalize_compact_summary, validate_compact_summary, CompactPlan,
     COMPACT_SUMMARY_FORMAT_VERSION,
 };
 use model_output::function_call_output;
@@ -92,6 +94,19 @@ impl<C, R, T, P> AgentRuntime<C, R, T, P> {
             project_memory: None,
             active_plan: None,
         }
+    }
+}
+
+impl<C, R, T, P> AgentRuntime<C, R, T, P>
+where
+    R: SessionStore,
+{
+    pub fn apply_permission_mode(&mut self, permission: PermissionMode) -> Result<()> {
+        self.config.permission = permission;
+        self.session.append(&SessionEvent::PermissionModeChanged {
+            timestamp: now(),
+            permission,
+        })
     }
 }
 
@@ -248,7 +263,7 @@ where
                 return Err(error);
             }
         };
-        let summary = response.assistant_text.join("\n").trim().to_string();
+        let summary = normalize_compact_summary(&response.assistant_text.join("\n"));
         let validation =
             validate_compact_summary(&summary, compact_plan.latest_user_text.as_deref());
         if !validation.passed {
@@ -523,9 +538,13 @@ where
             .metadata(name, &arguments)
             .unwrap_or_else(|| crate::tools::ToolMetadata::unknown("unknown", &arguments));
         let start = Instant::now();
-        let decision =
-            self.permission_policy
-                .decide(self.config.permission, &metadata, name, &arguments);
+        let decision = self.permission_policy.decide(
+            self.config.permission,
+            &metadata,
+            name,
+            &arguments,
+            &self.config.cwd,
+        );
         if let Err(error) = self.record_permission_decision(
             call_id,
             name,

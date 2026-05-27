@@ -4,7 +4,7 @@ mod policy;
 mod types;
 
 pub use builtin::{BuiltinTool, BuiltinToolRegistry};
-pub use path::{resolve_under_cwd, truncate_text};
+pub use path::{path_has_symlink_component, resolve_under_cwd, truncate_text};
 pub use policy::{
     classify_shell_command, is_safe_shell_command, parse_permission_rules, split_shell_command,
     DecisionReason, PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine, RuleBehavior,
@@ -48,12 +48,19 @@ mod tests {
     #[test]
     fn permission_policy_covers_tools_and_modes() {
         let policy = PolicyEngine::default();
+        let cwd = std::env::temp_dir();
         let read_meta = BuiltinTool::ReadFile.metadata(&json!({"path":"x"}));
         let write_meta = BuiltinTool::WriteFile.metadata(&json!({"path":"x"}));
         let shell_meta = BuiltinTool::Shell.metadata(&json!({"command":"rm -rf x"}));
         assert_eq!(
             policy
-                .decide(PermissionMode::Safe, &read_meta, "read_file", &json!({}))
+                .decide(
+                    PermissionMode::Safe,
+                    &read_meta,
+                    "read_file",
+                    &json!({}),
+                    &cwd
+                )
                 .decision,
             PermissionDecision::Allow
         );
@@ -63,7 +70,8 @@ mod tests {
                     PermissionMode::Safe,
                     &write_meta,
                     "write_file",
-                    &json!({"path":"x"})
+                    &json!({"path":"x"}),
+                    &cwd
                 )
                 .decision,
             PermissionDecision::Deny
@@ -74,7 +82,8 @@ mod tests {
                     PermissionMode::Ask,
                     &write_meta,
                     "write_file",
-                    &json!({"path":"x"})
+                    &json!({"path":"x"}),
+                    &cwd
                 )
                 .decision,
             PermissionDecision::Ask
@@ -85,7 +94,8 @@ mod tests {
                     PermissionMode::Auto,
                     &shell_meta,
                     "shell",
-                    &json!({"command":"rm -rf x"})
+                    &json!({"command":"rm -rf x"}),
+                    &cwd
                 )
                 .decision,
             PermissionDecision::Deny

@@ -237,11 +237,11 @@ pub const COMPACT_SUMMARY_FORMAT: &[&str] = &[
 pub fn compact_instructions(base_instructions: &str) -> String {
     let headings = COMPACT_SUMMARY_FORMAT
         .iter()
-        .map(|heading| format!("- {heading}"))
+        .map(|heading| format!("## {heading}\n..."))
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
     format!(
-        "{base_instructions}\n\n## Compact task\nSummarize the model-visible conversation so future turns can continue with minimal loss. Preserve the user's original request, the latest user request verbatim or near-verbatim, explicit constraints and prohibitions, files read or changed, commands run, test and verification status, errors and fixes, decisions made, current work, and the next concrete step. Use exactly these Markdown headings in this order:\n{headings}\n\nBe concise and factual. Do not invent test results or completed work."
+        "{base_instructions}\n\n## Compact task\nSummarize the model-visible conversation so future turns can continue with minimal loss. Preserve the user's original request, the latest user request verbatim or near-verbatim, explicit constraints and prohibitions, files read or changed, commands run, test and verification status, errors and fixes, decisions made, current work, and the next concrete step. Output only the summary. Use exactly these Markdown H2 headings, with the leading `##`, in this order:\n\n{headings}\n\nBe concise and factual. Do not invent test results or completed work."
     )
 }
 
@@ -358,10 +358,11 @@ mod tests {
     fn compact_prompt_uses_fixed_summary_format() {
         let prompt = compact_instructions("base");
         for heading in COMPACT_SUMMARY_FORMAT {
-            assert!(prompt.contains(heading));
+            assert!(prompt.contains(&format!("## {heading}")));
         }
         assert!(prompt.contains("Do not invent test results"));
         assert!(prompt.contains("explicit constraints and prohibitions"));
         assert!(prompt.contains("test and verification status"));
+        assert!(prompt.contains("with the leading `##`"));
     }
 }

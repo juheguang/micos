@@ -343,6 +343,20 @@ pub fn save_model_settings(cwd: &Path, settings: &ModelSettings) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("write config file {}", path.display()))
 }
 
+pub fn save_permission_mode(cwd: &Path, permission: PermissionMode) -> Result<()> {
+    let dir = cwd.join(".micos");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create config directory {}", dir.display()))?;
+    let path = dir.join("config.toml");
+    let mut table = read_config_table(&path)?;
+    table.insert(
+        "permission".into(),
+        toml::Value::String(permission.to_string()),
+    );
+    let text = toml::to_string_pretty(&toml::Value::Table(table)).context("serialize config")?;
+    std::fs::write(&path, text).with_context(|| format!("write config file {}", path.display()))
+}
+
 pub fn save_permission_rule(cwd: &Path, behavior: RuleBehavior, rule_text: &str) -> Result<()> {
     let dir = cwd.join(".micos");
     std::fs::create_dir_all(&dir)
@@ -686,6 +700,27 @@ deny = ["shell(rm *)", "shell(curl *)"]
         assert!(text.contains("model = \"deepseek-v4-pro\""));
         assert!(text.contains("thinking = \"disabled\""));
         assert!(text.contains("reasoning_effort = \"max\""));
+    }
+
+    #[test]
+    fn saves_permission_mode_without_dropping_other_config() {
+        let cwd =
+            std::env::temp_dir().join(format!("micos-permission-mode-{}", uuid::Uuid::new_v4()));
+        let config_dir = cwd.join(".micos");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "model = \"m1\"\npermission = \"ask\"\n[permissions]\ndeny = [\"shell(rm *)\"]\n",
+        )
+        .unwrap();
+
+        save_permission_mode(&cwd, PermissionMode::Auto).unwrap();
+
+        let text = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        assert!(text.contains("permission = \"auto\""));
+        assert!(text.contains("model = \"m1\""));
+        assert!(text.contains("[permissions]"));
+        assert!(text.contains("deny = [\"shell(rm *)\"]"));
     }
 
     #[test]

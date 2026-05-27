@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -20,6 +20,34 @@ pub fn resolve_under_cwd(cwd: &Path, raw_path: &str) -> Result<PathBuf> {
             cwd.display()
         )
     }
+}
+
+pub fn path_has_symlink_component(cwd: &Path, path: &Path) -> Result<bool> {
+    let cwd = normalize_path(cwd)?;
+    let path = normalize_path(path)?;
+    if !path.starts_with(&cwd) {
+        bail!("path {} escapes cwd {}", path.display(), cwd.display());
+    }
+
+    let Ok(relative) = path.strip_prefix(&cwd) else {
+        bail!("path {} escapes cwd {}", path.display(), cwd.display());
+    };
+    let mut current = cwd;
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect path {}", current.display()));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn normalize_path(path: &Path) -> Result<PathBuf> {
