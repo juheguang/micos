@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
+
+pub fn default_context_window_tokens_for_model(model: &str, base_url: &str) -> usize {
+    if base_url.contains("api.deepseek.com") && model.starts_with("deepseek-v4-") {
+        DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
+    } else {
+        DEFAULT_CONTEXT_WINDOW_TOKENS
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextCategory {
@@ -152,6 +161,24 @@ mod tests {
         assert_eq!(estimate_text_tokens("abc"), 1);
         assert_eq!(estimate_text_tokens("abcd"), 1);
         assert_eq!(estimate_text_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn deepseek_v4_defaults_to_one_million_context_tokens() {
+        assert_eq!(
+            default_context_window_tokens_for_model(
+                "deepseek-v4-flash",
+                "https://api.deepseek.com/chat/completions"
+            ),
+            DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            default_context_window_tokens_for_model(
+                "deepseek-chat",
+                "https://api.deepseek.com/chat/completions"
+            ),
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
     }
 
     #[test]

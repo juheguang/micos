@@ -146,6 +146,8 @@ deny = ["shell(rm *)", "shell(curl *)"]
 - `tool(pattern)` 表示 scoped rule，例如 `deny = ["shell(rm *)"]` 会保留 `shell` schema，但匹配调用会在运行时被拒绝。
 - `*` 是简单通配符。`shell` 规则会把 `&&`、`||`、`;`、`|`、`|&`、`&` 和换行分隔出的子命令逐段检查。
 
+`context_window_tokens` 默认是 `200000`。当 `base_url` 是 DeepSeek 官方 API 且 model 为 `deepseek-v4-*` 时，默认窗口自动使用 `1000000`；显式配置仍然优先。
+
 每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小和分类占用。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/context` 和 `/trace` 查看当前 session 的上下文和权限 trace。
 
 当工具需要批准时，交互选项为：

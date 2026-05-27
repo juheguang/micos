@@ -1,4 +1,4 @@
-use crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS;
+use crate::context::default_context_window_tokens_for_model;
 use crate::tools::{parse_permission_rules, PermissionRule, RuleBehavior, RuleSource};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -236,7 +236,7 @@ impl SessionConfig {
             .context_window_tokens
             .or(env.context_window_tokens)
             .or(file.context_window_tokens)
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+            .unwrap_or_else(|| default_context_window_tokens_for_model(&model, &base_url));
         if context_window_tokens == 0 {
             bail!("context_window_tokens must be greater than 0");
         }
@@ -486,7 +486,10 @@ mod tests {
         assert_eq!(cfg.reasoning_effort, None);
         assert_eq!(cfg.permission, PermissionMode::Ask);
         assert_eq!(cfg.max_steps, DEFAULT_MAX_STEPS);
-        assert_eq!(cfg.context_window_tokens, DEFAULT_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(
+            cfg.context_window_tokens,
+            crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
     }
 
     #[test]
@@ -553,6 +556,27 @@ mod tests {
         assert_eq!(cfg.model, "deepseek-chat");
         assert_eq!(cfg.base_url, "https://api.deepseek.com/chat/completions");
         assert!(cfg.api_kind.is_chat_completions());
+        assert_eq!(
+            cfg.context_window_tokens,
+            crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_model_uses_one_million_context_default() {
+        let cfg = SessionConfig::resolve(
+            PathBuf::from("/tmp/micos"),
+            FileConfig {
+                model: Some("deepseek-v4-flash".into()),
+                base_url: Some(DEEPSEEK_CHAT_COMPLETIONS_BASE_URL.into()),
+                ..FileConfig::default()
+            },
+            EnvConfig::default(),
+            ConfigOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.context_window_tokens, 1_000_000);
     }
 
     #[test]
