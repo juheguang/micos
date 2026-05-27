@@ -112,6 +112,7 @@ REPL 支持常用 slash commands：
 - `/status`：显示 model、API kind、base URL、permission、context window、cwd、session id 和日志路径。
 - `/sessions`：列出 `.micos/sessions` 最近会话。
 - `/transcript`：显示当前 transcript 路径和最近事件摘要。
+- `/summary`：显示当前 session 最近一次 compact summary 正文。
 - `/trace`：显示最近工具调用、权限决策、拒绝原因和 stop reason。
 - `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
@@ -183,9 +184,12 @@ compact 成功后，运行时 transcript 会被替换为一条 summary message�
 compact 会在 session JSONL 中记录：
 
 - compact 前后的 `context_snapshot`
+- `context_summary`，字段包含 `timestamp`、`summary`、`summary_tokens`、`messages_replaced`、`trigger`
 - `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`
 
-如果当前 model-visible transcript 为空，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
+`/summary` 会从当前 session JSONL 中反向查找最近一条 `context_summary`，并显示完整摘要。`/transcript` 只显示一行 `context_summary` 摘要，不展开正文。
+
+如果当前 model-visible transcript 为空，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_summary` 或 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
 
 ## Model-visible 工具输出
 

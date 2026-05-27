@@ -80,6 +80,13 @@ pub enum SessionEvent {
         summary_tokens: usize,
         messages_replaced: usize,
     },
+    ContextSummary {
+        timestamp: String,
+        summary: String,
+        summary_tokens: usize,
+        messages_replaced: usize,
+        trigger: String,
+    },
     ConfigChanged {
         timestamp: String,
         model: String,
@@ -243,5 +250,23 @@ mod tests {
         assert_eq!(value["after_tokens"], 40);
         assert_eq!(value["summary_tokens"], 20);
         assert_eq!(value["messages_replaced"], 3);
+    }
+
+    #[test]
+    fn context_summary_event_serializes_with_expected_fields() {
+        let event = SessionEvent::ContextSummary {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            summary: "## Primary Request and Intent\nContinue.".into(),
+            summary_tokens: 12,
+            messages_replaced: 4,
+            trigger: "manual".into(),
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "context_summary");
+        assert_eq!(value["summary"], "## Primary Request and Intent\nContinue.");
+        assert_eq!(value["summary_tokens"], 12);
+        assert_eq!(value["messages_replaced"], 4);
+        assert_eq!(value["trigger"], "manual");
     }
 }

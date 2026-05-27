@@ -14,6 +14,7 @@ pub enum SlashCommand {
     Status,
     Sessions,
     Transcript,
+    Summary,
     Trace,
     Context,
     Compact,
@@ -49,6 +50,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "transcript",
         description: "show current transcript and recent events",
         command: SlashCommand::Transcript,
+    },
+    SlashCommandInfo {
+        name: "summary",
+        description: "show latest compact summary",
+        command: SlashCommand::Summary,
     },
     SlashCommandInfo {
         name: "trace",
@@ -209,6 +215,29 @@ pub fn format_transcript(path: &Path) -> Result<String> {
     Ok(output.join("\n"))
 }
 
+pub fn format_summary(path: &Path) -> Result<String> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read summary {}", path.display()))?;
+    for line in text.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("context_summary") {
+            continue;
+        }
+        let summary = value
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if summary.is_empty() {
+            continue;
+        }
+        return Ok(summary.to_string());
+    }
+    Ok("No compact summary recorded.".into())
+}
+
 pub fn format_trace(path: &Path) -> Result<String> {
     let text =
         fs::read_to_string(path).with_context(|| format!("read trace {}", path.display()))?;
@@ -324,6 +353,11 @@ fn summarize_json_line(line: &str) -> String {
             "{event_type}: {}",
             trim_one_line(value.get("text").and_then(Value::as_str).unwrap_or(""), 120)
         ),
+        "context_summary" => format!(
+            "context_summary: {}",
+            summary_heading(value.get("summary").and_then(Value::as_str).unwrap_or(""))
+                .unwrap_or("empty")
+        ),
         "tool_call" | "tool_started" => format!(
             "{event_type}: {}",
             value
@@ -347,6 +381,10 @@ fn summarize_json_line(line: &str) -> String {
         ),
         _ => event_type.to_string(),
     }
+}
+
+fn summary_heading(summary: &str) -> Option<&str> {
+    summary.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn summarize_trace_line(line: &str) -> Option<String> {
@@ -469,6 +507,10 @@ mod tests {
             InputCommand::Slash(SlashCommand::Compact)
         );
         assert_eq!(
+            parse_input("/summary"),
+            InputCommand::Slash(SlashCommand::Summary)
+        );
+        assert_eq!(
             parse_input("/missing"),
             InputCommand::UnknownSlash("/missing".into())
         );
@@ -487,6 +529,7 @@ mod tests {
                 "status",
                 "sessions",
                 "transcript",
+                "summary",
                 "trace",
                 "context",
                 "compact",
@@ -496,6 +539,7 @@ mod tests {
             ]
         );
         assert_eq!(slash_command_exact("/status"), Some(SlashCommand::Status));
+        assert_eq!(slash_command_exact("/summary"), Some(SlashCommand::Summary));
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
         assert_eq!(
@@ -580,6 +624,55 @@ mod tests {
         assert!(output.contains("stop: tool_denied"));
         assert!(!output.contains("call_1"));
         assert!(!output.contains("user_input"));
+    }
+
+    #[test]
+    fn formats_latest_compact_summary() {
+        let path = std::env::temp_dir().join(format!("micos-summary-{}.jsonl", Uuid::new_v4()));
+        fs::write(
+            &path,
+            r###"{"type":"context_summary","timestamp":"t1","summary":"## First\nold","summary_tokens":2,"messages_replaced":1,"trigger":"manual"}
+{"type":"context_compacted","timestamp":"t1","before_tokens":10,"after_tokens":5,"summary_tokens":2,"messages_replaced":1}
+{"type":"context_summary","timestamp":"t2","summary":"## Primary Request and Intent\nnew\n\n## Next Step\ncontinue","summary_tokens":8,"messages_replaced":3,"trigger":"manual"}
+"###,
+        )
+        .unwrap();
+
+        let output = format_summary(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(output.contains("## Primary Request and Intent"));
+        assert!(output.contains("## Next Step"));
+        assert!(!output.contains("## First"));
+    }
+
+    #[test]
+    fn formats_missing_compact_summary() {
+        let path = std::env::temp_dir().join(format!("micos-no-summary-{}.jsonl", Uuid::new_v4()));
+        fs::write(&path, r#"{"type":"user_input","text":"hello"}"#).unwrap();
+
+        let output = format_summary(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(output, "No compact summary recorded.");
+    }
+
+    #[test]
+    fn transcript_summarizes_context_summary_without_expanding_body() {
+        let path =
+            std::env::temp_dir().join(format!("micos-summary-transcript-{}.jsonl", Uuid::new_v4()));
+        fs::write(
+            &path,
+            r###"{"type":"context_summary","timestamp":"t1","summary":"## Primary Request and Intent\nline that should not appear","summary_tokens":8,"messages_replaced":3,"trigger":"manual"}
+"###,
+        )
+        .unwrap();
+
+        let output = format_transcript(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(output.contains("context_summary: ## Primary Request and Intent"));
+        assert!(!output.contains("line that should not appear"));
     }
 
     #[test]

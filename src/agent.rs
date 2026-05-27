@@ -147,6 +147,13 @@ where
         }
 
         let summary_tokens = estimate_text_tokens(&summary);
+        self.session.append(&SessionEvent::ContextSummary {
+            timestamp: now(),
+            summary: summary.clone(),
+            summary_tokens,
+            messages_replaced,
+            trigger: "manual".into(),
+        })?;
         self.transcript = vec![compacted_summary_message(&summary)];
         let after_context = self.build_model_context();
         self.record_context_snapshot(&after_context.stats)?;
@@ -932,7 +939,13 @@ mod tests {
         assert!(requests[2].input[0].to_string().contains("## Next Step"));
 
         let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"context_summary\""));
+        assert!(log.contains("## Primary Request and Intent"));
         assert!(log.contains("\"type\":\"context_compacted\""));
+        assert!(
+            log.find("\"type\":\"context_summary\"").unwrap()
+                < log.find("\"type\":\"context_compacted\"").unwrap()
+        );
         assert!(log.contains("\"messages_replaced\":2"));
         assert!(log.contains("\"summary_tokens\""));
     }
@@ -949,6 +962,26 @@ mod tests {
         assert_eq!(report.summary_tokens, 0);
         assert_eq!(agent.client.requests.lock().unwrap().len(), 0);
         let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("\"type\":\"context_summary\""));
+        assert!(!log.contains("\"type\":\"context_compacted\""));
+    }
+
+    #[tokio::test]
+    async fn compact_failure_does_not_write_context_summary() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![Ok(final_response("first answer")), Err(anyhow!("api down"))],
+        );
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("start".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let error = agent.compact_context().await.unwrap_err();
+        assert!(error.to_string().contains("api down"));
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("\"type\":\"context_summary\""));
         assert!(!log.contains("\"type\":\"context_compacted\""));
     }
 

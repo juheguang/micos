@@ -1,6 +1,6 @@
 use super::{
     format_compact_report, format_context, format_help, format_sessions, format_status,
-    format_trace, format_transcript, AgentEvent, ApprovalDecision, UiSink,
+    format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision, UiSink,
 };
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
@@ -101,6 +101,11 @@ impl ConsoleUi {
 
     pub fn print_transcript(&mut self, path: &Path) -> Result<()> {
         println!("{}", format_transcript(path)?);
+        Ok(())
+    }
+
+    pub fn print_summary(&mut self, path: &Path) -> Result<()> {
+        println!("{}", format_summary(path)?);
         Ok(())
     }
 

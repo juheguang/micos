@@ -219,6 +219,7 @@ async fn handle_console_slash<C: ModelClient>(
         }
         SlashCommand::Sessions => ui.print_sessions(&agent.config().cwd)?,
         SlashCommand::Transcript => ui.print_transcript(agent.session_path())?,
+        SlashCommand::Summary => ui.print_summary(agent.session_path())?,
         SlashCommand::Trace => ui.print_trace(agent.session_path())?,
         SlashCommand::Context => {
             let stats = agent.context_stats();

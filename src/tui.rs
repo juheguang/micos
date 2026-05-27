@@ -5,7 +5,8 @@ use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
     format_compact_report, format_context, format_help, format_sessions, format_status,
-    format_trace, format_transcript, AgentEvent, ApprovalDecision, SlashCommand, UiSink,
+    format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision, SlashCommand,
+    UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -510,6 +511,14 @@ impl TuiUi {
                     MessageKind::System,
                     "/transcript",
                     format_transcript(agent.session_path())?,
+                );
+            }
+            SlashCommand::Summary => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/summary",
+                    format_summary(agent.session_path())?,
                 );
             }
             SlashCommand::Trace => {
