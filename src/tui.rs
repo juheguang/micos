@@ -7,8 +7,8 @@ use crate::tools::ToolSummary;
 use crate::ui::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
     format_memory, format_memory_index, format_prompt, format_resume_report, format_sessions,
-    format_status, format_summary, format_trace, format_transcript, recent_session_choices,
-    AgentEvent, ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
+    format_status, format_summary, format_trace, format_transcript, format_verification_report,
+    recent_session_choices, AgentEvent, ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -612,6 +612,56 @@ impl TuiUi {
                 );
             }
             SlashCommand::Compact => self.start_compact(),
+            SlashCommand::Verify => {
+                let title = if invocation.args.is_empty() {
+                    "/verify".to_string()
+                } else {
+                    format!("/verify {}", invocation.args)
+                };
+                let message_index = self.messages.len();
+                self.push_message_with_status(
+                    MessageKind::Tool,
+                    title.clone(),
+                    "running verification checks",
+                    Some(MessageStatus::Running),
+                );
+                self.scroll_to_bottom();
+                self.render()?;
+                let mut agent = self.agent.take().expect("agent checked above");
+                let name = invocation.args.trim();
+                let name = (!name.is_empty()).then_some(name);
+                let result = agent.run_verification_with_ui(name, self).await;
+                self.agent = Some(agent);
+                let (kind, body, status) = match result {
+                    Ok(report) => (
+                        MessageKind::Tool,
+                        format_verification_report(&report),
+                        Some(if report.checks.iter().all(|check| check.success) {
+                            MessageStatus::Success
+                        } else {
+                            MessageStatus::Failed
+                        }),
+                    ),
+                    Err(error) => (
+                        MessageKind::Warning,
+                        format!("verify failed: {error}"),
+                        Some(MessageStatus::Failed),
+                    ),
+                };
+                if message_index < self.messages.len()
+                    && self.messages[message_index].title == title
+                {
+                    self.messages[message_index] = TuiMessage {
+                        kind,
+                        title,
+                        body,
+                        status,
+                        transient: false,
+                    };
+                } else {
+                    self.push_message_with_status(kind, title, body, status);
+                }
+            }
             SlashCommand::Resume => {
                 if invocation.args.is_empty() {
                     self.push_message(
@@ -1500,6 +1550,9 @@ mod tests {
                 output: "contents".into(),
                 error: None,
                 denied: false,
+                truncated: false,
+                original_bytes: 8,
+                preview_bytes: 8,
             },
             Duration::from_millis(250),
         );

@@ -6,6 +6,7 @@ use crate::plan::{ActivePlan, HandoffReport};
 use crate::prompt::PromptBuild;
 use crate::session::SESSION_DIR;
 use crate::session_replay::SessionResumeReport;
+use crate::verify::VerificationRunReport;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -26,6 +27,7 @@ pub enum SlashCommand {
     Prompt,
     Context,
     Compact,
+    Verify,
     Resume,
     Memory,
     Handoff,
@@ -109,6 +111,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "compact",
         description: "summarize and replace current model-visible context",
         command: SlashCommand::Compact,
+    },
+    SlashCommandInfo {
+        name: "verify",
+        description: "run configured verification checks",
+        command: SlashCommand::Verify,
     },
     SlashCommandInfo {
         name: "resume",
@@ -477,6 +484,38 @@ pub fn format_resume_report(report: &SessionResumeReport) -> String {
     .join("\n")
 }
 
+pub fn format_verification_report(report: &VerificationRunReport) -> String {
+    if report.checks.is_empty() {
+        return "no verification checks ran".into();
+    }
+    let passed = report.checks.iter().filter(|check| check.success).count();
+    let mut lines = vec![format!(
+        "verification: {passed}/{} passed",
+        report.checks.len()
+    )];
+    for check in &report.checks {
+        lines.push(format!(
+            "{}: {} exit={} elapsed={}ms{}",
+            check.name,
+            if check.success { "passed" } else { "failed" },
+            check
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            check.elapsed_ms,
+            if check.truncated {
+                " truncated=true"
+            } else {
+                ""
+            }
+        ));
+        if !check.output_preview.trim().is_empty() {
+            lines.push(format!("  {}", trim_one_line(&check.output_preview, 180)));
+        }
+    }
+    lines.join("\n")
+}
+
 pub fn format_memory(memory: &ProjectMemory) -> String {
     let mut output = vec![
         "project memory".to_string(),
@@ -662,7 +701,7 @@ fn summarize_trace_line(line: &str) -> Option<String> {
                 .unwrap_or_default()
         )),
         "tool_finished" => Some(format!(
-            "tool_finished: {} success={} elapsed={}ms",
+            "tool_finished: {} success={} elapsed={}ms truncated={} bytes={}/{}",
             value
                 .get("name")
                 .and_then(Value::as_str)
@@ -671,7 +710,51 @@ fn summarize_trace_line(line: &str) -> Option<String> {
                 .get("success")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0)
+            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value
+                .get("preview_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            value
+                .get("original_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        )),
+        "verification_started" => Some(format!(
+            "verification_started: {} command={}",
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            trim_one_line(
+                value.get("command").and_then(Value::as_str).unwrap_or(""),
+                120
+            )
+        )),
+        "verification_finished" => Some(format!(
+            "verification_finished: {} success={} exit={} elapsed={}ms truncated={}",
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0),
+            value
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         )),
         "permission_denied" => Some(format!(
             "permission_denied: {} reason={}",
@@ -738,6 +821,11 @@ mod tests {
             parse_input("/permission auto"),
             invocation(SlashCommand::Permission, "auto")
         );
+        assert_eq!(parse_input("/verify"), invocation(SlashCommand::Verify, ""));
+        assert_eq!(
+            parse_input("/verify test"),
+            invocation(SlashCommand::Verify, "test")
+        );
         assert_eq!(
             parse_input("/resume 019e6367-bb0e-7ec0-9243-1ac2f75295c4"),
             invocation(SlashCommand::Resume, "019e6367-bb0e-7ec0-9243-1ac2f75295c4")
@@ -776,6 +864,7 @@ mod tests {
                 "prompt",
                 "context",
                 "compact",
+                "verify",
                 "resume",
                 "memory",
                 "handoff",
@@ -793,6 +882,7 @@ mod tests {
         assert_eq!(slash_command_exact("/summary"), Some(SlashCommand::Summary));
         assert_eq!(slash_command_exact("/prompt"), Some(SlashCommand::Prompt));
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
+        assert_eq!(slash_command_exact("/verify"), Some(SlashCommand::Verify));
         assert_eq!(slash_command_exact("/handoff"), Some(SlashCommand::Handoff));
         assert_eq!(slash_command_exact("/plan"), Some(SlashCommand::Plan));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));

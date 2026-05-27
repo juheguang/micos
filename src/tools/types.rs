@@ -51,6 +51,9 @@ pub struct ToolResult {
     pub output: String,
     pub error: Option<String>,
     pub denied: bool,
+    pub truncated: bool,
+    pub original_bytes: usize,
+    pub preview_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,11 +138,33 @@ impl From<PolicyDecision> for ToolResult {
 
 impl ToolResult {
     pub fn ok(output: impl Into<String>) -> Self {
+        let output = output.into();
+        let bytes = output.len();
+        Self {
+            success: true,
+            output,
+            error: None,
+            denied: false,
+            truncated: false,
+            original_bytes: bytes,
+            preview_bytes: bytes,
+        }
+    }
+
+    pub fn ok_with_preview(
+        output: impl Into<String>,
+        truncated: bool,
+        original_bytes: usize,
+        preview_bytes: usize,
+    ) -> Self {
         Self {
             success: true,
             output: output.into(),
             error: None,
             denied: false,
+            truncated,
+            original_bytes,
+            preview_bytes,
         }
     }
 
@@ -149,6 +174,9 @@ impl ToolResult {
             output: String::new(),
             error: Some(error.into()),
             denied: false,
+            truncated: false,
+            original_bytes: 0,
+            preview_bytes: 0,
         }
     }
 
@@ -158,6 +186,9 @@ impl ToolResult {
             output: String::new(),
             error: Some(error.into()),
             denied: true,
+            truncated: false,
+            original_bytes: 0,
+            preview_bytes: 0,
         }
     }
 }

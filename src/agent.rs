@@ -25,6 +25,10 @@ use crate::tools::{
 #[cfg(test)]
 use crate::ui::NullUi;
 use crate::ui::{AgentEvent, ApprovalDecision, UiSink};
+use crate::verify::{
+    load_verification_checks, select_verification_checks, shell_exit_code, VerificationCheckReport,
+    VerificationRunReport,
+};
 use anyhow::Result;
 use approval::suggest_approval_rule;
 use compact::{
@@ -360,6 +364,65 @@ where
         self.compact_context().await
     }
 
+    pub async fn run_verification_with_ui<S: UiSink + Send>(
+        &mut self,
+        check_name: Option<&str>,
+        ui: &mut S,
+    ) -> Result<VerificationRunReport> {
+        let checks = load_verification_checks(&self.config.cwd)?;
+        let checks = select_verification_checks(&checks, check_name)?;
+        if checks.is_empty() {
+            anyhow::bail!("no verification checks configured");
+        }
+
+        let mut reports = Vec::new();
+        for (index, check) in checks.into_iter().enumerate() {
+            self.session.append(&SessionEvent::VerificationStarted {
+                timestamp: now(),
+                name: check.name.clone(),
+                command: check.command.clone(),
+            })?;
+            let start = Instant::now();
+            let result = self
+                .execute_tool(
+                    &format!("verify_{}_{}", sanitize_call_id(&check.name), index),
+                    "shell",
+                    json!({ "command": check.command }),
+                    ui,
+                )
+                .await;
+            let elapsed = elapsed_millis_u64(start.elapsed());
+            let exit_code = shell_exit_code(&result.output);
+            let success = result.success && !result.denied && exit_code.unwrap_or(0) == 0;
+            let output_preview = result
+                .error
+                .clone()
+                .filter(|error| !error.is_empty())
+                .unwrap_or_else(|| result.output.clone());
+            self.session.append(&SessionEvent::VerificationFinished {
+                timestamp: now(),
+                name: check.name.clone(),
+                command: check.command.clone(),
+                success,
+                exit_code,
+                elapsed_ms: elapsed,
+                output_preview: output_preview.clone(),
+                truncated: result.truncated,
+            })?;
+            reports.push(VerificationCheckReport {
+                name: check.name,
+                command: check.command,
+                success,
+                exit_code,
+                elapsed_ms: elapsed,
+                output_preview,
+                truncated: result.truncated,
+            });
+        }
+
+        Ok(VerificationRunReport { checks: reports })
+    }
+
     pub async fn stop(&self, reason: StopReason) -> Result<()> {
         self.session.append(&SessionEvent::Stop {
             timestamp: now(),
@@ -495,6 +558,9 @@ where
                     success: result.success,
                     output: result.output.clone(),
                     error: result.error.clone(),
+                    truncated: result.truncated,
+                    original_bytes: result.original_bytes,
+                    preview_bytes: result.preview_bytes,
                 })?;
                 self.session.append(&SessionEvent::ToolFinished {
                     timestamp: now(),
@@ -504,6 +570,9 @@ where
                     output: result.output.clone(),
                     error: result.error.clone(),
                     elapsed_ms: elapsed_millis_u64(elapsed),
+                    truncated: result.truncated,
+                    original_bytes: result.original_bytes,
+                    preview_bytes: result.preview_bytes,
                 })?;
                 if result.denied {
                     self.session.append(&SessionEvent::PermissionDenied {
@@ -806,6 +875,24 @@ where
 
 fn elapsed_millis_u64(elapsed: std::time::Duration) -> u64 {
     elapsed.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn sanitize_call_id(text: &str) -> String {
+    let sanitized = text
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "check".into()
+    } else {
+        sanitized
+    }
 }
 
 fn millis_u64(elapsed_ms: u128) -> u64 {
@@ -1118,6 +1205,32 @@ mod tests {
         )
         .unwrap();
         assert!(plan.contains("non-final stop: tool_denied"));
+    }
+
+    #[tokio::test]
+    async fn verification_runs_configured_checks_and_records_events() {
+        let config = temp_config(PermissionMode::Safe, 3);
+        std::fs::create_dir_all(config.cwd.join(".micos")).unwrap();
+        std::fs::write(
+            config.cwd.join(crate::verify::VERIFY_CONFIG_PATH),
+            "[[checks]]\nname=\"pwd\"\ncommand=\"pwd\"\n\n[[checks]]\nname=\"missing\"\ncommand=\"ls missing-file\"\n",
+        )
+        .unwrap();
+        let mut agent = test_agent_with_config(config, Vec::new());
+        let path = agent.session.path().clone();
+        let mut ui = NullUi;
+
+        let report = agent.run_verification_with_ui(None, &mut ui).await.unwrap();
+
+        assert_eq!(report.checks.len(), 2);
+        assert!(report.checks[0].success);
+        assert!(!report.checks[1].success);
+        assert_eq!(report.checks[1].exit_code, Some(1));
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"verification_started\""));
+        assert!(log.contains("\"type\":\"verification_finished\""));
+        assert!(log.contains("\"name\":\"missing\""));
+        assert!(log.contains("\"success\":false"));
     }
 
     #[tokio::test]

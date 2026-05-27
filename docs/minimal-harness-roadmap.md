@@ -77,6 +77,8 @@ Acceptance:
 
 ## 0.4.4 Tool and Verification Release
 
+Status: implemented.
+
 Goal: make coding work safer and easier to validate.
 
 Scope:
@@ -199,7 +201,7 @@ These areas matter, but they should wait until 0.4.3 through 0.4.6 are stable:
 
 Start here for the next coding session:
 
-1. Run `cargo test` and `scripts/smoke-no-tui.sh` before starting feature work.
-2. Do a short manual TUI smoke for `/permission`, `/resume`, `/compact`, and `/exit` when touching UI paths.
-3. Start 0.4.4 with tool output governance and `/verify`.
-4. Keep compact repair retry limited to one attempt unless a future release adds explicit user controls.
+1. Run `cargo test`, `scripts/smoke-no-tui.sh`, and `scripts/smoke-verify.sh` before starting feature work.
+2. Do a short manual TUI smoke for `/permission`, `/resume`, `/compact`, `/verify`, and `/exit` when touching UI paths.
+3. Start 0.4.5 with memory promotion and context lifecycle work.
+4. Keep verification commands routed through the same permission and trace path as shell tools.

@@ -13,14 +13,28 @@ pub(super) fn function_call_output(call_id: &str, result: &ToolResult) -> Value 
 
 fn project_tool_result_for_model(result: &ToolResult) -> Value {
     let output = truncate_model_visible_output(&result.output, MODEL_VISIBLE_TOOL_OUTPUT_LIMIT);
+    let original_bytes = if result.truncated {
+        result.original_bytes
+    } else {
+        output.original_bytes
+    };
+    let truncated = result.truncated || output.truncated;
+    let preview_bytes = if output.truncated {
+        output.preview_bytes
+    } else if result.truncated {
+        result.preview_bytes
+    } else {
+        output.preview_bytes
+    };
+    let omitted_bytes = original_bytes.saturating_sub(preview_bytes);
     json!({
         "success": result.success,
         "output": output.preview,
         "error": result.error,
-        "truncated": output.truncated,
-        "original_bytes": output.original_bytes,
-        "preview_bytes": output.preview_bytes,
-        "omitted_bytes": output.omitted_bytes,
+        "truncated": truncated,
+        "original_bytes": original_bytes,
+        "preview_bytes": preview_bytes,
+        "omitted_bytes": omitted_bytes,
     })
 }
 

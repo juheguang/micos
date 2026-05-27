@@ -1,7 +1,7 @@
 use super::{
-    classify_shell_command, path_has_symlink_component, resolve_under_cwd, truncate_text,
-    PermissionDecision, ShellSafety, Tool, ToolContext, ToolMetadata, ToolRegistry, ToolResult,
-    ToolSummary,
+    classify_shell_command, path_has_symlink_component, resolve_under_cwd,
+    truncate_text_with_metadata, PermissionDecision, ShellSafety, Tool, ToolContext, ToolMetadata,
+    ToolRegistry, ToolResult, ToolSummary,
 };
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
@@ -208,9 +208,9 @@ impl BuiltinTool {
     ) -> std::result::Result<ToolResult, ToolExecError> {
         match self {
             BuiltinTool::ListFiles => list_files(input, &ctx.cwd).await.map(ToolResult::ok),
-            BuiltinTool::ReadFile => read_file(input, &ctx.cwd).await.map(ToolResult::ok),
+            BuiltinTool::ReadFile => read_file(input, &ctx.cwd).await,
             BuiltinTool::WriteFile => write_file(input, &ctx).await.map(ToolResult::ok),
-            BuiltinTool::Shell => shell(input, &ctx).await.map(ToolResult::ok),
+            BuiltinTool::Shell => shell(input, &ctx).await,
         }
     }
 }
@@ -278,14 +278,20 @@ async fn list_files(input: Value, cwd: &Path) -> std::result::Result<String, Too
         .map_err(ToolExecError::Other)
 }
 
-async fn read_file(input: Value, cwd: &Path) -> std::result::Result<String, ToolExecError> {
+async fn read_file(input: Value, cwd: &Path) -> std::result::Result<ToolResult, ToolExecError> {
     let input: ReadInput = serde_json::from_value(input).context("parse read_file input")?;
     let path = resolve_under_cwd(cwd, &input.path)?;
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("read file {}", path.display()))?;
     let text = String::from_utf8(bytes).context("file is not valid UTF-8")?;
-    Ok(truncate_text(&text, READ_LIMIT))
+    let preview = truncate_text_with_metadata(&text, READ_LIMIT);
+    Ok(ToolResult::ok_with_preview(
+        preview.text,
+        preview.truncated,
+        preview.original_bytes,
+        preview.preview_bytes,
+    ))
 }
 
 async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<String, ToolExecError> {
@@ -311,7 +317,7 @@ async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<Stri
     ))
 }
 
-async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<String, ToolExecError> {
+async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResult, ToolExecError> {
     let input: ShellInput = serde_json::from_value(input).context("parse shell input")?;
 
     let timeout_ms = input
@@ -366,7 +372,13 @@ async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<String, T
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
-    Ok(truncate_text(&combined, SHELL_OUTPUT_LIMIT))
+    let preview = truncate_text_with_metadata(&combined, SHELL_OUTPUT_LIMIT);
+    Ok(ToolResult::ok_with_preview(
+        preview.text,
+        preview.truncated,
+        preview.original_bytes,
+        preview.preview_bytes,
+    ))
 }
 
 impl fmt::Display for BuiltinTool {

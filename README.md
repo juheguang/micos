@@ -127,6 +127,7 @@ REPL 支持常用 slash commands：
 - `/prompt`：显示当前 system prompt 的 section、来源和估算 token。
 - `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
+- `/verify [name]`：运行 `.micos/verify.toml` 中配置的验证命令；未配置且项目含 `Cargo.toml` 时默认运行 `cargo test`。
 - `/resume <session-id-or-path>`：从旧 session JSONL 恢复当前运行时 model-visible context。
 - `/memory`：显示项目本地 memory index 和 topic 列表。
 - `/handoff`：把当前 session 的可续接状态写入 `.micos/plans/active.md`。
@@ -181,6 +182,29 @@ deny = ["shell(rm *)", "shell(curl *)"]
 
 每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小、分类占用和 prompt section 摘要。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/prompt`、`/context` 和 `/trace` 查看当前 session 的 prompt、上下文和权限 trace。
 
+## Verification
+
+项目可在 `.micos/verify.toml` 中配置验证命令：
+
+```toml
+[[checks]]
+name = "test"
+command = "cargo test"
+
+[[checks]]
+name = "fmt"
+command = "cargo fmt --check"
+```
+
+`/verify` 会运行全部 checks，`/verify test` 只运行指定 check。验证命令通过现有 `shell` 工具执行，因此仍受当前 permission mode 和 permission rules 约束。若 `.micos/verify.toml` 不存在但项目根目录有 `Cargo.toml`，默认 check 是 `cargo test`。
+
+验证运行会写入 session JSONL：
+
+- `verification_started`：字段包含 `timestamp`、`name`、`command`
+- `verification_finished`：字段包含 `timestamp`、`name`、`command`、`success`、`exit_code`、`elapsed_ms`、`output_preview`、`truncated`
+
+`/trace` 会显示最近 verification 结果；handoff 会优先使用最近一次 `verification_finished` 作为 verification status。
+
 ## 手动 Compact
 
 `/compact` 会对当前 model-visible transcript 发起一次无工具模型调用，生成固定结构摘要：
@@ -215,6 +239,12 @@ scripts/smoke-no-tui.sh
 ```
 
 该脚本启动本地 fake Responses API，覆盖 `/status`、`/context`、`/permission`、`/compact`、`/summary` 和 `/exit`，不依赖真实网络或真实 API key。
+
+验证 smoke：
+
+```bash
+scripts/smoke-verify.sh
+```
 
 ## Resume
 
@@ -288,13 +318,13 @@ session JSONL 会在写 handoff 后记录 `handoff_written`，字段包含 `time
 
 ## Model-visible 工具输出
 
-工具原始输出仍会完整写入 session JSONL 的 `tool_output` 和 `tool_finished` 事件，供审计和排查使用。为了避免大输出污染后续模型上下文，传回模型的 `function_call_output` 会使用 bounded preview：
+工具执行结果会写入 session JSONL 的 `tool_output` 和 `tool_finished` 事件，供审计和排查使用。`read_file` 和 `shell` 会按内置上限生成 preview，并记录 `truncated`、`original_bytes`、`preview_bytes`。为了避免大输出污染后续模型上下文，传回模型的 `function_call_output` 也会使用 bounded preview：
 
 - 小输出完整传回模型。
 - 超过 12 KiB 的输出只传回 preview。
 - preview JSON 中包含 `truncated`、`original_bytes`、`preview_bytes`、`omitted_bytes`。
 
-这层治理只影响模型可见上下文，不改变工具本身的执行结果和本地日志。
+这层治理让 session trace 和模型可见上下文都能看出输出是否被截断。
 
 当工具需要批准时，交互选项为：
 

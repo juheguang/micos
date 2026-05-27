@@ -10,3 +10,4 @@ pub mod session_replay;
 pub mod tools;
 pub mod tui;
 pub mod ui;
+pub mod verify;

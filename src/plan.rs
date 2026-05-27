@@ -161,6 +161,17 @@ impl HandoffDraft {
                         trim_one_line(&reason, 180)
                     ));
                 }
+                Some("verification_finished") => {
+                    let command = json_string(event, "command").unwrap_or_else(|| "verify".into());
+                    let success = event
+                        .get("success")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    latest_verification = Some((command.clone(), success));
+                    if !success {
+                        known_failures.push(format!("verification failed: {command}"));
+                    }
+                }
                 Some("error") => {
                     let message = json_string(event, "message").unwrap_or_else(|| "unknown".into());
                     known_failures.push(format!("error: {}", trim_one_line(&message, 180)));
@@ -423,6 +434,9 @@ mod tests {
                 success: true,
                 output: "ok".into(),
                 error: None,
+                truncated: false,
+                original_bytes: 2,
+                preview_bytes: 2,
             },
             SessionEvent::Stop {
                 timestamp: "t".into(),

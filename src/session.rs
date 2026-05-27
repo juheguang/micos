@@ -158,6 +158,12 @@ pub enum SessionEvent {
         success: bool,
         output: String,
         error: Option<String>,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        original_bytes: usize,
+        #[serde(default)]
+        preview_bytes: usize,
     },
     AssistantDelta {
         timestamp: String,
@@ -195,6 +201,27 @@ pub enum SessionEvent {
         output: String,
         error: Option<String>,
         elapsed_ms: u64,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        original_bytes: usize,
+        #[serde(default)]
+        preview_bytes: usize,
+    },
+    VerificationStarted {
+        timestamp: String,
+        name: String,
+        command: String,
+    },
+    VerificationFinished {
+        timestamp: String,
+        name: String,
+        command: String,
+        success: bool,
+        exit_code: Option<i32>,
+        elapsed_ms: u64,
+        output_preview: String,
+        truncated: bool,
     },
     PermissionDenied {
         timestamp: String,
@@ -355,6 +382,34 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "permission_mode_changed");
         assert_eq!(value["permission"], "auto");
+    }
+
+    #[test]
+    fn verification_events_serialize_with_expected_fields() {
+        let started = SessionEvent::VerificationStarted {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            name: "test".into(),
+            command: "cargo test".into(),
+        };
+        let finished = SessionEvent::VerificationFinished {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            name: "test".into(),
+            command: "cargo test".into(),
+            success: true,
+            exit_code: Some(0),
+            elapsed_ms: 42,
+            output_preview: "ok".into(),
+            truncated: false,
+        };
+
+        let started = serde_json::to_value(started).unwrap();
+        let finished = serde_json::to_value(finished).unwrap();
+        assert_eq!(started["type"], "verification_started");
+        assert_eq!(started["command"], "cargo test");
+        assert_eq!(finished["type"], "verification_finished");
+        assert_eq!(finished["success"], true);
+        assert_eq!(finished["exit_code"], 0);
+        assert_eq!(finished["elapsed_ms"], 42);
     }
 
     #[test]

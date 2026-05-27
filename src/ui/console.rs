@@ -1,8 +1,8 @@
 use super::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
     format_memory, format_memory_index, format_prompt, format_resume_report, format_sessions,
-    format_status, format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision,
-    UiSink,
+    format_status, format_summary, format_trace, format_transcript, format_verification_report,
+    AgentEvent, ApprovalDecision, UiSink,
 };
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
@@ -10,6 +10,7 @@ use crate::context::ContextStats;
 use crate::prompt::PromptBuild;
 use crate::session::StopReason;
 use crate::tools::{ToolResult, ToolSummary};
+use crate::verify::VerificationRunReport;
 use anyhow::{Context, Result};
 use console::{style, Term};
 use crossterm::{
@@ -132,6 +133,10 @@ impl ConsoleUi {
 
     pub fn print_compact_report(&mut self, report: &ContextCompactReport) {
         println!("{}", format_compact_report(report));
+    }
+
+    pub fn print_verification_report(&mut self, report: &VerificationRunReport) {
+        println!("{}", format_verification_report(report));
     }
 
     pub fn print_resume_report(&mut self, report: &crate::session_replay::SessionResumeReport) {
@@ -337,10 +342,18 @@ enum Paint {
 }
 
 fn summarize_result(result: &ToolResult) -> String {
-    if let Some(error) = &result.error {
-        return trim_one_line(error, 240);
+    let mut summary = if let Some(error) = &result.error {
+        trim_one_line(error, 240)
+    } else {
+        trim_one_line(&result.output, 240)
+    };
+    if result.truncated {
+        summary.push_str(&format!(
+            " truncated=true bytes={}/{}",
+            result.preview_bytes, result.original_bytes
+        ));
     }
-    trim_one_line(&result.output, 240)
+    summary
 }
 
 fn trim_one_line(text: &str, max_chars: usize) -> String {

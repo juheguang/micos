@@ -4,7 +4,10 @@ mod policy;
 mod types;
 
 pub use builtin::{BuiltinTool, BuiltinToolRegistry};
-pub use path::{path_has_symlink_component, resolve_under_cwd, truncate_text};
+pub use path::{
+    path_has_symlink_component, resolve_under_cwd, truncate_text, truncate_text_with_metadata,
+    TruncatedText,
+};
 pub use policy::{
     classify_shell_command, is_safe_shell_command, parse_permission_rules, split_shell_command,
     DecisionReason, PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine, RuleBehavior,
@@ -128,5 +131,9 @@ mod tests {
     fn truncation_is_deterministic() {
         let text = "abcdef";
         assert_eq!(truncate_text(text, 3), "abc\n[truncated: 3 bytes omitted]");
+        let preview = truncate_text_with_metadata(text, 3);
+        assert!(preview.truncated);
+        assert_eq!(preview.original_bytes, 6);
+        assert_eq!(preview.preview_bytes, 3);
     }
 }

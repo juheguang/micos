@@ -528,12 +528,19 @@ pub(super) fn finish_tool_message(
 }
 
 fn tool_finished_body(result: &ToolResult, elapsed: Duration) -> String {
-    format!(
+    let mut body = format!(
         "{} in {}\n{}",
         tool_result_label(result),
         format_duration(elapsed),
         summarize_result(result)
-    )
+    );
+    if result.truncated {
+        body.push_str(&format!(
+            "\ntruncated=true bytes={}/{}",
+            result.preview_bytes, result.original_bytes
+        ));
+    }
+    body
 }
 
 fn status_for_tool_result(result: &ToolResult) -> MessageStatus {

@@ -288,6 +288,14 @@ async fn handle_console_slash<C: ModelClient>(
             Ok(report) => ui.print_compact_report(&report),
             Err(error) => eprintln!("compact failed: {error}"),
         },
+        SlashCommand::Verify => {
+            let name = invocation.args.trim();
+            let name = (!name.is_empty()).then_some(name);
+            match agent.run_verification_with_ui(name, ui).await {
+                Ok(report) => ui.print_verification_report(&report),
+                Err(error) => eprintln!("verify failed: {error}"),
+            }
+        }
         SlashCommand::Resume => {
             if invocation.args.is_empty() {
                 eprintln!("usage: /resume <session-id-or-path>");

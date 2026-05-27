@@ -301,6 +301,9 @@ mod tests {
                 success: true,
                 output: "done".into(),
                 error: None,
+                truncated: false,
+                original_bytes: 4,
+                preview_bytes: 4,
             },
             SessionEvent::Stop {
                 timestamp: "t".into(),
@@ -342,6 +345,9 @@ mod tests {
                 output: "ok".into(),
                 error: None,
                 elapsed_ms: 3,
+                truncated: false,
+                original_bytes: 2,
+                preview_bytes: 2,
             },
             SessionEvent::UserInput {
                 timestamp: "t".into(),
@@ -407,6 +413,9 @@ mod tests {
                 success: true,
                 output: "x".repeat(REPLAY_TOOL_OUTPUT_LIMIT + 4),
                 error: None,
+                truncated: false,
+                original_bytes: REPLAY_TOOL_OUTPUT_LIMIT + 4,
+                preview_bytes: REPLAY_TOOL_OUTPUT_LIMIT + 4,
             },
         ]);
 

@@ -69,17 +69,41 @@ fn normalize_path(path: &Path) -> Result<PathBuf> {
 }
 
 pub fn truncate_text(text: &str, max_bytes: usize) -> String {
+    truncate_text_with_metadata(text, max_bytes).text
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TruncatedText {
+    pub text: String,
+    pub truncated: bool,
+    pub original_bytes: usize,
+    pub preview_bytes: usize,
+}
+
+pub fn truncate_text_with_metadata(text: &str, max_bytes: usize) -> TruncatedText {
+    let original_bytes = text.len();
     if text.len() <= max_bytes {
-        return text.to_string();
+        return TruncatedText {
+            text: text.to_string(),
+            truncated: false,
+            original_bytes,
+            preview_bytes: original_bytes,
+        };
     }
 
     let mut end = max_bytes;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!(
+    let text = format!(
         "{}\n[truncated: {} bytes omitted]",
         &text[..end],
         text.len() - end
-    )
+    );
+    TruncatedText {
+        text,
+        truncated: true,
+        original_bytes,
+        preview_bytes: end,
+    }
 }
