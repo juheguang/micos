@@ -3,6 +3,7 @@ use crate::config::SessionConfig;
 use crate::context::ContextStats;
 use crate::prompt::PromptBuild;
 use crate::session::SESSION_DIR;
+use crate::session_replay::SessionResumeReport;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -20,6 +21,7 @@ pub enum SlashCommand {
     Prompt,
     Context,
     Compact,
+    Resume,
     Model,
     Clear,
     Exit,
@@ -79,6 +81,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         command: SlashCommand::Compact,
     },
     SlashCommandInfo {
+        name: "resume",
+        description: "restore model-visible context from a session",
+        command: SlashCommand::Resume,
+    },
+    SlashCommandInfo {
         name: "model",
         description: "choose model and thinking settings",
         command: SlashCommand::Model,
@@ -97,10 +104,16 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputCommand {
-    Slash(SlashCommand),
+    Slash(SlashInvocation),
     UnknownSlash(String),
     UserText(String),
     Empty,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashInvocation {
+    pub command: SlashCommand,
+    pub args: String,
 }
 
 pub fn parse_input(input: &str) -> InputCommand {
@@ -111,8 +124,8 @@ pub fn parse_input(input: &str) -> InputCommand {
     if !trimmed.starts_with('/') {
         return InputCommand::UserText(trimmed.to_string());
     }
-    match slash_command_exact(trimmed) {
-        Some(command) => InputCommand::Slash(command),
+    match slash_invocation(trimmed) {
+        Some(invocation) => InputCommand::Slash(invocation),
         None => InputCommand::UnknownSlash(trimmed.to_string()),
     }
 }
@@ -128,10 +141,27 @@ pub fn slash_command_exact(input: &str) -> Option<SlashCommand> {
         .map(|command| command.command)
 }
 
+pub fn slash_invocation(input: &str) -> Option<SlashInvocation> {
+    let body = input.strip_prefix('/')?;
+    let mut parts = body.splitn(2, char::is_whitespace);
+    let name = parts.next()?;
+    let args = parts.next().unwrap_or_default().trim().to_string();
+    let command = if name == "quit" {
+        SlashCommand::Exit
+    } else {
+        SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == name)
+            .map(|command| command.command)?
+    };
+    Some(SlashInvocation { command, args })
+}
+
 pub fn slash_command_matches(input: &str) -> Vec<SlashCommandInfo> {
     let Some(prefix) = input.strip_prefix('/') else {
         return Vec::new();
     };
+    let prefix = prefix.split_whitespace().next().unwrap_or(prefix);
     SLASH_COMMANDS
         .iter()
         .copied()
@@ -197,7 +227,13 @@ pub fn format_sessions(cwd: &Path) -> Result<String> {
     Ok(entries
         .into_iter()
         .take(10)
-        .map(|(path, modified)| format!("{}  {}", humantime(modified), path.display()))
+        .map(|(path, modified)| {
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("unknown");
+            format!("{}  {}  {}", humantime(modified), id, path.display())
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -333,6 +369,36 @@ pub fn format_compact_report(report: &ContextCompactReport) -> String {
         format!("compression ratio: {}%", report.compression_ratio_percent),
         format!("summary tokens: {}", format_tokens(report.summary_tokens)),
         format!("validation: {}", report.validation_status),
+    ]
+    .join("\n")
+}
+
+pub fn format_resume_report(report: &SessionResumeReport) -> String {
+    [
+        "session resumed".to_string(),
+        format!(
+            "source session: {}",
+            report
+                .source_session_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ),
+        format!("source log: {}", report.source_path.display()),
+        format!(
+            "restore mode: {}",
+            if report.used_summary {
+                "compact_summary_tail"
+            } else {
+                "event_replay"
+            }
+        ),
+        format!("restored messages: {}", report.restored_messages),
+        format!("used summary: {}", report.used_summary),
+        format!("tail messages: {}", report.restored_tail_messages),
+        format!(
+            "estimated tokens: {}",
+            format_tokens(report.estimated_tokens)
+        ),
     ]
     .join("\n")
 }
@@ -524,21 +590,29 @@ fn humantime(time: std::time::SystemTime) -> String {
 mod tests {
     use super::*;
 
+    fn invocation(command: SlashCommand, args: &str) -> InputCommand {
+        InputCommand::Slash(SlashInvocation {
+            command,
+            args: args.into(),
+        })
+    }
+
     #[test]
     fn parses_slash_commands_and_user_text() {
         assert_eq!(parse_input(""), InputCommand::Empty);
         assert_eq!(parse_input("hello"), InputCommand::UserText("hello".into()));
-        assert_eq!(
-            parse_input("/help"),
-            InputCommand::Slash(SlashCommand::Help)
-        );
+        assert_eq!(parse_input("/help"), invocation(SlashCommand::Help, ""));
         assert_eq!(
             parse_input("/compact"),
-            InputCommand::Slash(SlashCommand::Compact)
+            invocation(SlashCommand::Compact, "")
         );
         assert_eq!(
             parse_input("/summary"),
-            InputCommand::Slash(SlashCommand::Summary)
+            invocation(SlashCommand::Summary, "")
+        );
+        assert_eq!(
+            parse_input("/resume 019e6367-bb0e-7ec0-9243-1ac2f75295c4"),
+            invocation(SlashCommand::Resume, "019e6367-bb0e-7ec0-9243-1ac2f75295c4")
         );
         assert_eq!(
             parse_input("/missing"),
@@ -564,6 +638,7 @@ mod tests {
                 "prompt",
                 "context",
                 "compact",
+                "resume",
                 "model",
                 "clear",
                 "exit"
@@ -574,12 +649,20 @@ mod tests {
         assert_eq!(slash_command_exact("/prompt"), Some(SlashCommand::Prompt));
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
+        assert_eq!(slash_command_exact("/resume target"), None);
         assert_eq!(
             slash_command_matches("/sta")
                 .into_iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
             vec!["status"]
+        );
+        assert_eq!(
+            slash_command_matches("/resume target")
+                .into_iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            vec!["resume"]
         );
         assert!(slash_command_matches("/missing").is_empty());
     }
@@ -655,6 +738,25 @@ mod tests {
         assert!(output.contains("runtime"));
         assert!(output.contains("project_append"));
         assert!(output.contains("config.append_system_prompt"));
+    }
+
+    #[test]
+    fn formats_resume_report() {
+        let report = SessionResumeReport {
+            source_session_id: Some(Uuid::nil()),
+            source_path: std::path::PathBuf::from(".micos/sessions/source.jsonl"),
+            restored_messages: 3,
+            used_summary: true,
+            restored_tail_messages: 2,
+            estimated_tokens: 1200,
+        };
+
+        let output = format_resume_report(&report);
+
+        assert!(output.contains("session resumed"));
+        assert!(output.contains("restore mode: compact_summary_tail"));
+        assert!(output.contains("restored messages: 3"));
+        assert!(output.contains("estimated tokens: 1.2k"));
     }
 
     #[test]

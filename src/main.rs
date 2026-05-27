@@ -7,7 +7,7 @@ use micos::config::{
 use micos::model::{ModelClient, OpenAiModelClient};
 use micos::session::{Session, StopReason};
 use micos::tui;
-use micos::ui::{parse_input, ConsoleUi, InputCommand, SlashCommand};
+use micos::ui::{parse_input, ConsoleUi, InputCommand, SlashCommand, SlashInvocation};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::{self, BufRead, IsTerminal};
@@ -47,6 +47,9 @@ struct ChatArgs {
 
     #[arg(long)]
     cwd: Option<PathBuf>,
+
+    #[arg(long)]
+    resume: Option<String>,
 
     #[arg(long)]
     no_tui: bool,
@@ -129,26 +132,34 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let session = Session::new(&config).context("create session")?;
     let api_key = resolve_api_key()?;
     let client = OpenAiModelClient::new(api_key, config.api_kind, config.base_url.clone());
-    let agent = Agent::new(config, client, session);
+    let mut agent = Agent::new(config, client, session);
+    let initial_resume_report = if let Some(target) = args.resume.as_deref() {
+        Some(agent.resume_session(target)?)
+    } else {
+        None
+    };
 
     if should_use_tui(
         args.no_tui,
         io::stdin().is_terminal(),
         io::stdout().is_terminal(),
     ) {
-        return tui::run_tui_chat(agent).await;
+        return tui::run_tui_chat(agent, initial_resume_report).await;
     }
 
-    let mut agent = agent;
-    run_console_chat(&mut agent, io::stdin().is_terminal()).await
+    run_console_chat(&mut agent, io::stdin().is_terminal(), initial_resume_report).await
 }
 
 async fn run_console_chat<C: ModelClient>(
     agent: &mut Agent<C>,
     interactive: bool,
+    initial_resume_report: Option<micos::session_replay::SessionResumeReport>,
 ) -> anyhow::Result<()> {
     let mut ui = ConsoleUi::new();
     ui.banner(agent.config(), agent.session_id(), agent.session_path());
+    if let Some(report) = initial_resume_report {
+        ui.print_resume_report(&report);
+    }
 
     if !interactive {
         let stdin = io::stdin();
@@ -199,7 +210,7 @@ async fn handle_console_line<C: ModelClient>(
                 StopReason::UserExit | StopReason::UserInterrupt
             ))
         }
-        InputCommand::Slash(command) => handle_console_slash(command, agent, ui).await,
+        InputCommand::Slash(invocation) => handle_console_slash(invocation, agent, ui).await,
         InputCommand::UnknownSlash(command) => {
             eprintln!("Unknown command: {command}. Type /help.");
             Ok(true)
@@ -208,11 +219,11 @@ async fn handle_console_line<C: ModelClient>(
 }
 
 async fn handle_console_slash<C: ModelClient>(
-    command: SlashCommand,
+    invocation: SlashInvocation,
     agent: &mut Agent<C>,
     ui: &mut ConsoleUi,
 ) -> anyhow::Result<bool> {
-    match command {
+    match invocation.command {
         SlashCommand::Help => ui.print_help(),
         SlashCommand::Status => {
             ui.print_status(agent.config(), agent.session_id(), agent.session_path())
@@ -233,6 +244,16 @@ async fn handle_console_slash<C: ModelClient>(
             Ok(report) => ui.print_compact_report(&report),
             Err(error) => eprintln!("compact failed: {error}"),
         },
+        SlashCommand::Resume => {
+            if invocation.args.is_empty() {
+                eprintln!("usage: /resume <session-id-or-path>");
+            } else {
+                match agent.resume_session(&invocation.args) {
+                    Ok(report) => ui.print_resume_report(&report),
+                    Err(error) => eprintln!("resume failed: {error}"),
+                }
+            }
+        }
         SlashCommand::Model => {
             eprintln!("The /model picker is only available in TUI mode. Restart without --no-tui.")
         }

@@ -9,6 +9,7 @@ use crate::context::{
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::prompt::{compact_instructions, PromptBuild, PromptBuilder, PromptRuntimeContext};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
+use crate::session_replay::{replay_session, resolve_session_target, SessionResumeReport};
 use crate::tools::{
     BuiltinToolRegistry, DecisionReason, ModePermissionPolicy, PermissionDecision,
     PermissionPolicy, PermissionRule, PolicyDecision, PolicyEngine, RuleBehavior, RuleSource,
@@ -114,6 +115,25 @@ where
             &self.config,
             &PromptRuntimeContext::from_config(&self.config),
         )
+    }
+
+    pub fn resume_session(&mut self, target: &str) -> Result<SessionResumeReport> {
+        let source_path = resolve_session_target(&self.config.cwd, target)?;
+        let replay = replay_session(&source_path)?;
+        self.transcript = replay.transcript.clone();
+        let context = self.build_model_context();
+        let mut report = SessionResumeReport::from_replay(&replay);
+        report.estimated_tokens = context.stats.total_tokens_estimate;
+        self.session.append(&SessionEvent::SessionResumed {
+            timestamp: now(),
+            source_session_id: report.source_session_id,
+            source_path: report.source_path.clone(),
+            restored_messages: report.restored_messages,
+            used_summary: report.used_summary,
+            restored_tail_messages: report.restored_tail_messages,
+            estimated_tokens: report.estimated_tokens,
+        })?;
+        Ok(report)
     }
 
     pub async fn compact_context(&mut self) -> Result<ContextCompactReport> {
@@ -917,6 +937,74 @@ mod tests {
         assert!(log.contains("\"summary_format_version\":1"));
         assert!(log.contains("\"validation_status\":\"passed\""));
         assert!(log.contains("\"summary_tokens\""));
+    }
+
+    #[tokio::test]
+    async fn resume_restores_summary_tail_for_next_model_request() {
+        let source_config = temp_config(PermissionMode::Safe, 3);
+        let source = Session::new(&source_config).unwrap();
+        source
+            .append(&SessionEvent::UserInput {
+                timestamp: now(),
+                text: "older request".into(),
+            })
+            .unwrap();
+        source
+            .append(&SessionEvent::AssistantText {
+                timestamp: now(),
+                text: "older answer".into(),
+            })
+            .unwrap();
+        source
+            .append(&SessionEvent::UserInput {
+                timestamp: now(),
+                text: "latest request".into(),
+            })
+            .unwrap();
+        source
+            .append(&SessionEvent::AssistantText {
+                timestamp: now(),
+                text: "latest answer".into(),
+            })
+            .unwrap();
+        source
+            .append(&SessionEvent::ContextSummary {
+                timestamp: now(),
+                summary: "## Primary Request and Intent\nResume latest request.\n\n## Next Step\nContinue verification.".into(),
+                summary_tokens: 12,
+                messages_replaced: 2,
+                retained_messages: 2,
+                summary_format_version: 1,
+                trigger: "manual".into(),
+            })
+            .unwrap();
+
+        let mut config = temp_config(PermissionMode::Safe, 3);
+        config.cwd = source_config.cwd.clone();
+        let mut agent = test_agent_with_config(config, vec![Ok(final_response("done"))]);
+        let current_path = agent.session.path().clone();
+
+        let report = agent
+            .resume_session(source.path().to_str().unwrap())
+            .unwrap();
+        assert!(report.used_summary);
+        assert_eq!(report.restored_messages, 3);
+        assert_eq!(report.restored_tail_messages, 2);
+
+        let reason = agent.run_turn("continue".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests[0].input.len(), 4);
+        assert!(requests[0].input[0]
+            .to_string()
+            .contains("This is a compacted summary"));
+        assert!(requests[0].input[1].to_string().contains("latest request"));
+        assert!(requests[0].input[2].to_string().contains("latest answer"));
+        assert!(requests[0].input[3].to_string().contains("continue"));
+
+        let log = std::fs::read_to_string(current_path).unwrap();
+        assert!(log.contains("\"type\":\"session_resumed\""));
+        assert!(log.contains("\"used_summary\":true"));
     }
 
     #[tokio::test]

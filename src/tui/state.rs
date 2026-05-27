@@ -2,7 +2,8 @@ use crate::config::{
     ModelSettings, ReasoningEffort, ThinkingMode, DEEPSEEK_CHAT_COMPLETIONS_BASE_URL,
 };
 use crate::ui::{
-    slash_command_exact, slash_command_matches, ApprovalDecision, SlashCommand, SlashCommandInfo,
+    parse_input, slash_command_matches, ApprovalDecision, InputCommand, SlashCommandInfo,
+    SlashInvocation,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::mpsc as std_mpsc;
@@ -258,9 +259,9 @@ impl ComposerState {
             self.clear();
             return ComposerAction::None;
         }
-        if let Some(command) = slash_command_exact(trimmed) {
+        if let InputCommand::Slash(invocation) = parse_input(trimmed) {
             self.clear();
-            return ComposerAction::Command(command);
+            return ComposerAction::Command(invocation);
         }
         if trimmed.starts_with('/') {
             return ComposerAction::None;
@@ -275,7 +276,10 @@ impl ComposerState {
         let Some(command) = matches.get(self.selected.min(matches.len().saturating_sub(1))) else {
             return ComposerAction::None;
         };
-        let action = ComposerAction::Command(command.command);
+        let action = ComposerAction::Command(SlashInvocation {
+            command: command.command,
+            args: String::new(),
+        });
         self.clear();
         action
     }
@@ -289,7 +293,11 @@ impl ComposerState {
     }
 
     fn refresh_popup(&mut self) {
-        self.popup_open = self.buffer.starts_with('/') && !self.popup_dismissed;
+        let slash_without_args = self
+            .buffer
+            .strip_prefix('/')
+            .is_some_and(|body| !body.chars().any(char::is_whitespace));
+        self.popup_open = slash_without_args && !self.popup_dismissed;
         let len = self.matches().len();
         if len == 0 || self.selected >= len {
             self.selected = 0;
@@ -348,7 +356,7 @@ impl ComposerState {
 pub(super) enum ComposerAction {
     None,
     Submit(String),
-    Command(SlashCommand),
+    Command(SlashInvocation),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

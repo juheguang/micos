@@ -99,26 +99,27 @@ base prompt
 - compact report 已增加 retained messages、compression ratio、summary validation status。
 - summary 缺固定 section、缺最近用户请求、缺验证状态时不替换 transcript。
 
-### 0.4.0 Project Memory
+### 0.4.0 Resume Foundation
+
+- 新增 `micos chat --resume <session-id-or-path>`。
+- 新增 `/resume <session-id-or-path>`。
+- 从 `.micos/sessions/*.jsonl` 恢复 compact boundary 后的 model-visible transcript。
+- 若没有 compact，则从原始 user、assistant、tool call 和 tool output 事件恢复 transcript。
+- resume report 显示恢复了多少 messages、是否使用 summary、tail 数量和估算 token。
+
+### 0.4.1 Project Memory
 
 - 新增 `.micos/memory/MEMORY.md`，作为项目级 memory index。
 - 新增 `.micos/memory/topics/*.md`，承载详细主题笔记。
 - 启动时只加载 memory index，topic 文件按需读取。
 - 新增 `/memory` 查看 memory index、topic 列表和 stale/source metadata。
 
-### 0.4.1 Active Plan / Handoff
+### 0.4.2 Active Plan / Handoff
 
 - 新增 `.micos/plans/active.md`。
 - 在 `/exit`、compact、失败 stop、用户 interrupt 前写 handoff。
 - handoff 固定记录 current state、next step、files touched、commands run、verification status、known failures。
 - 新 session 自动注入 latest handoff。
-
-### 0.4.2 Resume
-
-- 新增 `/resume` 和启动参数级 resume。
-- 从 `.micos/sessions/*.jsonl` 恢复 compact boundary 后的 model-visible transcript。
-- 恢复 latest summary、recent tail、context snapshots 和 session metadata。
-- resume report 显示恢复了多少 messages、summary、tail 和 memory 文件。
 
 ### 0.4.3 Memory Promotion
 

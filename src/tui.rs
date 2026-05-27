@@ -4,9 +4,9 @@ use crate::model::OpenAiModelClient;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
-    format_compact_report, format_context, format_help, format_prompt, format_sessions,
-    format_status, format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision,
-    SlashCommand, UiSink,
+    format_compact_report, format_context, format_help, format_prompt, format_resume_report,
+    format_sessions, format_status, format_summary, format_trace, format_transcript, AgentEvent,
+    ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -35,12 +35,22 @@ const POPUP_LIMIT: usize = 6;
 const SCROLL_STEP: isize = 5;
 const TICK_RATE: Duration = Duration::from_millis(120);
 
-pub async fn run_tui_chat(agent: Agent<OpenAiModelClient>) -> Result<()> {
+pub async fn run_tui_chat(
+    agent: Agent<OpenAiModelClient>,
+    initial_resume_report: Option<crate::session_replay::SessionResumeReport>,
+) -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend).context("create terminal")?;
     let mut ui = TuiUi::new(terminal, agent);
     ui.banner();
+    if let Some(report) = initial_resume_report {
+        ui.push_message(
+            MessageKind::System,
+            "/resume",
+            format_resume_report(&report),
+        );
+    }
     ui.run().await
 }
 
@@ -469,8 +479,8 @@ impl TuiUi {
             ComposerAction::Submit(input) => {
                 self.start_agent_turn(input);
             }
-            ComposerAction::Command(command) => {
-                if !self.handle_slash(command).await? {
+            ComposerAction::Command(invocation) => {
+                if !self.handle_slash(invocation).await? {
                     return Ok(false);
                 }
             }
@@ -478,7 +488,8 @@ impl TuiUi {
         Ok(true)
     }
 
-    async fn handle_slash(&mut self, command: SlashCommand) -> Result<bool> {
+    async fn handle_slash(&mut self, invocation: SlashInvocation) -> Result<bool> {
+        let command = invocation.command;
         if self.agent.is_none() && !matches!(command, SlashCommand::Help | SlashCommand::Clear) {
             self.push_message(
                 MessageKind::Warning,
@@ -546,6 +557,29 @@ impl TuiUi {
                 );
             }
             SlashCommand::Compact => self.start_compact(),
+            SlashCommand::Resume => {
+                if invocation.args.is_empty() {
+                    self.push_message(
+                        MessageKind::Warning,
+                        "/resume",
+                        "usage: /resume <session-id-or-path>",
+                    );
+                } else {
+                    let agent = self.agent.as_mut().expect("agent checked above");
+                    match agent.resume_session(&invocation.args) {
+                        Ok(report) => self.push_message(
+                            MessageKind::System,
+                            "/resume",
+                            format_resume_report(&report),
+                        ),
+                        Err(error) => self.push_message(
+                            MessageKind::Warning,
+                            "/resume",
+                            format!("resume failed: {error}"),
+                        ),
+                    }
+                }
+            }
             SlashCommand::Model => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.model_panel = Some(ModelPanelState::from_settings(
@@ -881,6 +915,13 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn command(command: SlashCommand) -> ComposerAction {
+        ComposerAction::Command(SlashInvocation {
+            command,
+            args: String::new(),
+        })
+    }
+
     #[test]
     fn composer_edits_text_and_cursor() {
         let mut composer = ComposerState::new();
@@ -942,7 +983,7 @@ mod tests {
         );
         assert_eq!(
             composer.handle_key(key(KeyCode::Enter)),
-            ComposerAction::Command(SlashCommand::Status)
+            command(SlashCommand::Status)
         );
         assert_eq!(composer.buffer(), "");
     }
@@ -955,7 +996,7 @@ mod tests {
         assert_eq!(composer.selected(), SLASH_COMMANDS.len() - 1);
         assert_eq!(
             composer.handle_key(key(KeyCode::Tab)),
-            ComposerAction::Command(SLASH_COMMANDS.last().unwrap().command)
+            command(SLASH_COMMANDS.last().unwrap().command)
         );
     }
 
@@ -970,7 +1011,24 @@ mod tests {
         assert_eq!(composer.selected(), POPUP_LIMIT);
         assert_eq!(
             composer.handle_key(key(KeyCode::Enter)),
-            ComposerAction::Command(SLASH_COMMANDS[POPUP_LIMIT].command)
+            command(SLASH_COMMANDS[POPUP_LIMIT].command)
+        );
+    }
+
+    #[test]
+    fn composer_submits_slash_command_with_args() {
+        let mut composer = ComposerState::new();
+        for ch in "/resume source-session".chars() {
+            composer.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        assert!(!composer.popup_open());
+        assert_eq!(
+            composer.handle_key(key(KeyCode::Enter)),
+            ComposerAction::Command(SlashInvocation {
+                command: SlashCommand::Resume,
+                args: "source-session".into()
+            })
         );
     }
 

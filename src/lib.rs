@@ -4,6 +4,7 @@ pub mod context;
 pub mod model;
 pub mod prompt;
 pub mod session;
+pub mod session_replay;
 pub mod tools;
 pub mod tui;
 pub mod ui;

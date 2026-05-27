@@ -112,13 +112,14 @@ REPL 支持常用 slash commands：
 
 - `/help`：显示命令列表。
 - `/status`：显示 model、API kind、base URL、permission、context window、cwd、session id 和日志路径。
-- `/sessions`：列出 `.micos/sessions` 最近会话。
+- `/sessions`：列出 `.micos/sessions` 最近会话，包含可用于 resume 的 session id。
 - `/transcript`：显示当前 transcript 路径和最近事件摘要。
 - `/summary`：显示当前 session 最近一次 compact summary 正文。
 - `/trace`：显示最近工具调用、权限决策、拒绝原因和 stop reason。
 - `/prompt`：显示当前 system prompt 的 section、来源和估算 token。
 - `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
+- `/resume <session-id-or-path>`：从旧 session JSONL 恢复当前运行时 model-visible context。
 - `/model`：在 TUI 模式中选择模型和思考设置。
 - `/clear`：清屏。
 - `/exit`：退出。
@@ -195,6 +196,24 @@ compact 会在 session JSONL 中记录：
 `/summary` 会从当前 session JSONL 中反向查找最近一条 `context_summary`，并显示完整摘要。`/transcript` 只显示一行 `context_summary` 摘要，不展开正文。
 
 如果当前 model-visible transcript 为空，或太短以至于 recent tail 会保留全部内容，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_summary` 或 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
+
+## Resume
+
+可以在启动时恢复旧 session：
+
+```bash
+cargo run -- chat --resume <session-id-or-path>
+```
+
+也可以在 REPL/TUI 中执行：
+
+```text
+/resume <session-id-or-path>
+```
+
+resume 会读取 `.micos/sessions/*.jsonl`，重建当前运行时的 model-visible transcript。若旧 session 有成功 compact，则优先恢复 `compacted summary + retained tail`；否则从 `user_input`、`assistant_text`、`tool_call` 和 `tool_output` 事件重建 transcript。`context_snapshot`、`permission_decision`、trace/report 和 stop 事件不会进入 model-visible context。
+
+resume 不会重放工具，也不会修改旧 session JSONL；它会在当前新 session 中写入 `session_resumed`，字段包含 `timestamp`、`source_session_id`、`source_path`、`restored_messages`、`used_summary`、`restored_tail_messages`、`estimated_tokens`。
 
 ## Model-visible 工具输出
 

@@ -66,6 +66,15 @@ pub enum SessionEvent {
         permission: PermissionMode,
         cwd: PathBuf,
     },
+    SessionResumed {
+        timestamp: String,
+        source_session_id: Option<Uuid>,
+        source_path: PathBuf,
+        restored_messages: usize,
+        used_summary: bool,
+        restored_tail_messages: usize,
+        estimated_tokens: usize,
+    },
     ContextSnapshot {
         timestamp: String,
         model: String,
@@ -269,6 +278,29 @@ mod tests {
         assert_eq!(value["retained_messages"], 2);
         assert_eq!(value["compression_ratio_percent"], 60);
         assert_eq!(value["validation_status"], "passed");
+    }
+
+    #[test]
+    fn session_resumed_event_serializes_with_expected_fields() {
+        let source_session_id = Uuid::new_v4();
+        let event = SessionEvent::SessionResumed {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            source_session_id: Some(source_session_id),
+            source_path: PathBuf::from(".micos/sessions/source.jsonl"),
+            restored_messages: 9,
+            used_summary: true,
+            restored_tail_messages: 8,
+            estimated_tokens: 123,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "session_resumed");
+        assert_eq!(value["source_session_id"], source_session_id.to_string());
+        assert_eq!(value["source_path"], ".micos/sessions/source.jsonl");
+        assert_eq!(value["restored_messages"], 9);
+        assert_eq!(value["used_summary"], true);
+        assert_eq!(value["restored_tail_messages"], 8);
+        assert_eq!(value["estimated_tokens"], 123);
     }
 
     #[test]
