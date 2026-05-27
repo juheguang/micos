@@ -1,4 +1,5 @@
 use crate::config::SessionConfig;
+use crate::context::ContextStats;
 use crate::session::SESSION_DIR;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -13,6 +14,7 @@ pub enum SlashCommand {
     Sessions,
     Transcript,
     Trace,
+    Context,
     Model,
     Clear,
     Exit,
@@ -50,6 +52,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "trace",
         description: "show recent tool and permission trace",
         command: SlashCommand::Trace,
+    },
+    SlashCommandInfo {
+        name: "context",
+        description: "show estimated context usage",
+        command: SlashCommand::Context,
     },
     SlashCommandInfo {
         name: "model",
@@ -137,6 +144,10 @@ pub fn format_status(config: &SessionConfig, session_id: Uuid, session_path: &Pa
                 .map_or("unset".into(), |v| v.to_string())
         ),
         format!("permission: {}", config.permission),
+        format!(
+            "context window: {} tokens",
+            format_tokens(config.context_window_tokens)
+        ),
         format!("cwd: {}", config.cwd.display()),
         format!("log: {}", session_path.display()),
     ]
@@ -213,6 +224,35 @@ pub fn format_trace(path: &Path) -> Result<String> {
     Ok(output.join("\n"))
 }
 
+pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &ContextStats) -> String {
+    let mut output = vec![
+        format!("context: {}", session_path.display()),
+        format!("model: {}", config.model),
+        format!(
+            "estimated tokens: {} / {} ({}%)",
+            format_tokens(stats.total_tokens_estimate),
+            format_tokens(stats.max_tokens),
+            stats.usage_percent
+        ),
+        "categories:".into(),
+    ];
+    for category in &stats.categories {
+        if category.tokens == 0 {
+            continue;
+        }
+        output.push(format!(
+            "  {:<19} {}",
+            category.name,
+            format_tokens(category.tokens)
+        ));
+    }
+    output.push(format!(
+        "largest risk: {}",
+        largest_context_risk(stats).unwrap_or("none")
+    ));
+    output.join("\n")
+}
+
 fn trim_one_line(text: &str, max_chars: usize) -> String {
     let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() > max_chars {
@@ -224,6 +264,25 @@ fn trim_one_line(text: &str, max_chars: usize) -> String {
 
 fn json_summary(value: &Value, max_chars: usize) -> String {
     trim_one_line(&value.to_string(), max_chars)
+}
+
+fn format_tokens(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn largest_context_risk(stats: &ContextStats) -> Option<&str> {
+    stats
+        .categories
+        .iter()
+        .filter(|category| category.name != "free_space" && category.tokens > 0)
+        .max_by_key(|category| category.tokens)
+        .map(|category| category.name.as_str())
 }
 
 fn summarize_json_line(line: &str) -> String {
@@ -400,6 +459,7 @@ mod tests {
                 "sessions",
                 "transcript",
                 "trace",
+                "context",
                 "model",
                 "clear",
                 "exit"
@@ -415,6 +475,51 @@ mod tests {
             vec!["status"]
         );
         assert!(slash_command_matches("/missing").is_empty());
+    }
+
+    #[test]
+    fn formats_context_stats() {
+        let cwd = std::env::temp_dir();
+        let config = SessionConfig {
+            api_kind: crate::config::ApiKind::Responses,
+            model: "mock".into(),
+            base_url: crate::config::DEFAULT_RESPONSES_BASE_URL.into(),
+            thinking: None,
+            reasoning_effort: None,
+            permission: crate::config::PermissionMode::Safe,
+            permission_rules: Vec::new(),
+            max_steps: 3,
+            context_window_tokens: 1_000,
+            cwd,
+        };
+        let path = std::env::temp_dir().join(format!("micos-context-{}.jsonl", Uuid::new_v4()));
+        let stats = ContextStats {
+            total_tokens_estimate: 123,
+            max_tokens: 1_000,
+            usage_percent: 12,
+            categories: vec![
+                crate::context::ContextCategory {
+                    name: "instructions".into(),
+                    tokens: 10,
+                },
+                crate::context::ContextCategory {
+                    name: "tool_outputs".into(),
+                    tokens: 80,
+                },
+                crate::context::ContextCategory {
+                    name: "free_space".into(),
+                    tokens: 877,
+                },
+            ],
+        };
+
+        let output = format_context(&config, &path, &stats);
+
+        assert!(output.contains("context:"));
+        assert!(output.contains("model: mock"));
+        assert!(output.contains("estimated tokens: 123 / 1.0k (12%)"));
+        assert!(output.contains("tool_outputs"));
+        assert!(output.contains("largest risk: tool_outputs"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::config::{ApiKind, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode};
+use crate::context::ContextCategory;
 use crate::tools::{DecisionReason, PermissionDecision, RuleSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,14 @@ pub enum SessionEvent {
         reasoning_effort: Option<ReasoningEffort>,
         permission: PermissionMode,
         cwd: PathBuf,
+    },
+    ContextSnapshot {
+        timestamp: String,
+        model: String,
+        estimated_tokens: usize,
+        max_tokens: usize,
+        usage_percent: usize,
+        categories: Vec<ContextCategory>,
     },
     ConfigChanged {
         timestamp: String,

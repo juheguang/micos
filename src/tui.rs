@@ -4,8 +4,8 @@ use crate::model::OpenAiModelClient;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
-    format_help, format_sessions, format_status, format_trace, format_transcript, AgentEvent,
-    ApprovalDecision, SlashCommand, UiSink,
+    format_context, format_help, format_sessions, format_status, format_trace, format_transcript,
+    AgentEvent, ApprovalDecision, SlashCommand, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -454,6 +454,14 @@ impl TuiUi {
                     format_trace(agent.session_path())?,
                 );
             }
+            SlashCommand::Context => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/context",
+                    format_context(agent.config(), agent.session_path(), &agent.context_stats()),
+                );
+            }
             SlashCommand::Model => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.model_panel = Some(ModelPanelState::from_settings(
@@ -896,6 +904,7 @@ mod tests {
             permission: crate::config::PermissionMode::Ask,
             permission_rules: Vec::new(),
             max_steps: 20,
+            context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);
@@ -930,6 +939,7 @@ mod tests {
             permission: crate::config::PermissionMode::Ask,
             permission_rules: Vec::new(),
             max_steps: 20,
+            context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);

@@ -97,10 +97,11 @@ cargo run -- chat --model deepseek-chat --base-url https://api.deepseek.com/chat
 REPL 支持常用 slash commands：
 
 - `/help`：显示命令列表。
-- `/status`：显示 model、API kind、base URL、permission、cwd、session id 和日志路径。
+- `/status`：显示 model、API kind、base URL、permission、context window、cwd、session id 和日志路径。
 - `/sessions`：列出 `.micos/sessions` 最近会话。
 - `/transcript`：显示当前 transcript 路径和最近事件摘要。
 - `/trace`：显示最近工具调用、权限决策、拒绝原因和 stop reason。
+- `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
 - `/clear`：清屏。
 - `/exit`：退出。
 
@@ -131,6 +132,7 @@ thinking = "enabled"
 reasoning_effort = "max"
 permission = "ask"
 max_steps = 20
+context_window_tokens = 200000
 
 [permissions]
 allow = ["list_files", "read_file", "shell(git status*)", "shell(git diff*)"]
@@ -144,7 +146,7 @@ deny = ["shell(rm *)", "shell(curl *)"]
 - `tool(pattern)` 表示 scoped rule，例如 `deny = ["shell(rm *)"]` 会保留 `shell` schema，但匹配调用会在运行时被拒绝。
 - `*` 是简单通配符。`shell` 规则会把 `&&`、`||`、`;`、`|`、`|&`、`&` 和换行分隔出的子命令逐段检查。
 
-每次工具权限判断都会写入 session JSONL 的 `permission_decision` 事件。REPL 中可用 `/trace` 查看当前 session 的最近工具与权限 trace。
+每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小和分类占用。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/context` 和 `/trace` 查看当前 session 的上下文和权限 trace。
 
 当工具需要批准时，交互选项为：
 

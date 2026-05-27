@@ -1,8 +1,9 @@
 use super::{
-    format_help, format_sessions, format_status, format_trace, format_transcript, AgentEvent,
-    ApprovalDecision, UiSink,
+    format_context, format_help, format_sessions, format_status, format_trace, format_transcript,
+    AgentEvent, ApprovalDecision, UiSink,
 };
 use crate::config::SessionConfig;
+use crate::context::ContextStats;
 use crate::session::StopReason;
 use crate::tools::{ToolResult, ToolSummary};
 use anyhow::{Context, Result};
@@ -105,6 +106,15 @@ impl ConsoleUi {
     pub fn print_trace(&mut self, path: &Path) -> Result<()> {
         println!("{}", format_trace(path)?);
         Ok(())
+    }
+
+    pub fn print_context(
+        &mut self,
+        config: &SessionConfig,
+        session_path: &Path,
+        stats: &ContextStats,
+    ) {
+        println!("{}", format_context(config, session_path, stats));
     }
 
     pub fn clear(&mut self) -> Result<()> {

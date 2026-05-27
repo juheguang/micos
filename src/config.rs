@@ -1,3 +1,4 @@
+use crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS;
 use crate::tools::{parse_permission_rules, PermissionRule, RuleBehavior, RuleSource};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -138,6 +139,7 @@ pub struct SessionConfig {
     pub permission: PermissionMode,
     pub permission_rules: Vec<PermissionRule>,
     pub max_steps: usize,
+    pub context_window_tokens: usize,
     pub cwd: PathBuf,
 }
 
@@ -157,6 +159,7 @@ pub struct ConfigOverrides {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub permission: Option<PermissionMode>,
     pub max_steps: Option<usize>,
+    pub context_window_tokens: Option<usize>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -169,6 +172,7 @@ pub struct FileConfig {
     pub permission: Option<PermissionMode>,
     pub permissions: Option<FilePermissionsConfig>,
     pub max_steps: Option<usize>,
+    pub context_window_tokens: Option<usize>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -190,6 +194,7 @@ pub struct EnvConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub permission: Option<PermissionMode>,
     pub max_steps: Option<usize>,
+    pub context_window_tokens: Option<usize>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -227,6 +232,15 @@ impl SessionConfig {
 
         let permission_rules = resolve_permission_rules(file.permissions.as_ref())?;
 
+        let context_window_tokens = cli
+            .context_window_tokens
+            .or(env.context_window_tokens)
+            .or(file.context_window_tokens)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        if context_window_tokens == 0 {
+            bail!("context_window_tokens must be greater than 0");
+        }
+
         Ok(Self {
             api_kind,
             model,
@@ -247,6 +261,7 @@ impl SessionConfig {
                 .or(env.max_steps)
                 .or(file.max_steps)
                 .unwrap_or(DEFAULT_MAX_STEPS),
+            context_window_tokens,
             cwd,
         })
     }
@@ -391,6 +406,10 @@ impl EnvConfig {
             Err(_) => None,
         };
         let cwd = std::env::var("MICOS_CWD").ok().map(PathBuf::from);
+        let context_window_tokens = match std::env::var("MICOS_CONTEXT_WINDOW_TOKENS") {
+            Ok(value) => Some(value.parse().context("parse MICOS_CONTEXT_WINDOW_TOKENS")?),
+            Err(_) => None,
+        };
 
         Ok(Self {
             model: std::env::var("MICOS_MODEL").ok(),
@@ -399,6 +418,7 @@ impl EnvConfig {
             reasoning_effort,
             permission,
             max_steps,
+            context_window_tokens,
             cwd,
         })
     }
@@ -466,6 +486,7 @@ mod tests {
         assert_eq!(cfg.reasoning_effort, None);
         assert_eq!(cfg.permission, PermissionMode::Ask);
         assert_eq!(cfg.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(cfg.context_window_tokens, DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
 
     #[test]
@@ -480,6 +501,7 @@ mod tests {
                 permission: Some(PermissionMode::Safe),
                 permissions: None,
                 max_steps: Some(3),
+                context_window_tokens: Some(123_000),
                 cwd: None,
             },
             EnvConfig {
@@ -489,6 +511,7 @@ mod tests {
                 reasoning_effort: Some(ReasoningEffort::Max),
                 permission: Some(PermissionMode::Auto),
                 max_steps: Some(4),
+                context_window_tokens: Some(124_000),
                 cwd: None,
             },
             ConfigOverrides {
@@ -498,6 +521,7 @@ mod tests {
                 reasoning_effort: Some(ReasoningEffort::Medium),
                 permission: Some(PermissionMode::Ask),
                 max_steps: Some(5),
+                context_window_tokens: Some(125_000),
                 cwd: None,
             },
         )
@@ -510,6 +534,7 @@ mod tests {
         assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Medium));
         assert_eq!(cfg.permission, PermissionMode::Ask);
         assert_eq!(cfg.max_steps, 5);
+        assert_eq!(cfg.context_window_tokens, 125_000);
     }
 
     #[test]
@@ -537,8 +562,9 @@ mod tests {
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/chat/completions"
 thinking = "enabled"
-reasoning_effort = "max"
-"#,
+	reasoning_effort = "max"
+	context_window_tokens = 123000
+	"#,
         )
         .unwrap();
 
@@ -549,6 +575,7 @@ reasoning_effort = "max"
         );
         assert_eq!(cfg.thinking, Some(ThinkingMode::Enabled));
         assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(cfg.context_window_tokens, Some(123_000));
     }
 
     #[test]
@@ -577,6 +604,24 @@ deny = ["shell(rm *)", "shell(curl *)"]
         assert_eq!(cfg.permission_rules.len(), 6);
         assert_eq!(cfg.permission_rules[0].source, RuleSource::Config);
         assert_eq!(cfg.permission_rules[0].behavior, RuleBehavior::Allow);
+    }
+
+    #[test]
+    fn context_window_tokens_must_be_positive() {
+        let error = SessionConfig::resolve(
+            PathBuf::from("/tmp/micos"),
+            FileConfig {
+                context_window_tokens: Some(0),
+                ..FileConfig::default()
+            },
+            EnvConfig::default(),
+            ConfigOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("context_window_tokens must be greater than 0"));
     }
 
     #[test]

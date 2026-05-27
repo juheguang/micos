@@ -1,4 +1,5 @@
 use crate::config::{save_permission_rule, ModelSettings, SessionConfig, ThinkingMode};
+use crate::context::{ContextBuilder, ContextStats};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::tools::{
@@ -77,6 +78,10 @@ where
         self.session.path().as_path()
     }
 
+    pub fn context_stats(&self) -> ContextStats {
+        self.build_model_context().stats
+    }
+
     pub async fn stop(&self, reason: StopReason) -> Result<()> {
         self.session.append(&SessionEvent::Stop {
             timestamp: now(),
@@ -116,13 +121,13 @@ where
             } else {
                 self.config.reasoning_effort.map(|value| value.to_string())
             };
+            let model_context = self.build_model_context();
+            self.record_context_snapshot(&model_context.stats)?;
             let request = ModelRequest {
                 model: self.config.model.clone(),
-                input: self.transcript.clone(),
-                tools: self
-                    .tools
-                    .schemas_for_policy(&self.permission_policy, self.config.permission),
-                instructions: system_instructions(),
+                input: model_context.input,
+                tools: model_context.tools,
+                instructions: model_context.instructions,
                 parallel_tool_calls: false,
                 thinking: self.config.thinking.map(|value| value.to_string()),
                 reasoning_effort,
@@ -430,6 +435,28 @@ where
         })
     }
 
+    fn build_model_context(&self) -> crate::context::ModelContext {
+        let tools = self
+            .tools
+            .schemas_for_policy(&self.permission_policy, self.config.permission);
+        ContextBuilder::new(self.config.context_window_tokens).build(
+            self.transcript.clone(),
+            system_instructions(),
+            tools,
+        )
+    }
+
+    fn record_context_snapshot(&self, stats: &ContextStats) -> Result<()> {
+        self.session.append(&SessionEvent::ContextSnapshot {
+            timestamp: now(),
+            model: self.config.model.clone(),
+            estimated_tokens: stats.total_tokens_estimate,
+            max_tokens: stats.max_tokens,
+            usage_percent: stats.usage_percent,
+            categories: stats.categories.clone(),
+        })
+    }
+
     fn add_approval_rule(
         &mut self,
         source: RuleSource,
@@ -680,6 +707,7 @@ mod tests {
             permission,
             permission_rules: Vec::new(),
             max_steps,
+            context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             cwd,
         }
     }
@@ -739,6 +767,9 @@ mod tests {
         assert_eq!(reason, StopReason::FinalAnswer);
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\"type\":\"tool_call\""));
+        assert!(log.contains("\"type\":\"context_snapshot\""));
+        assert!(log.contains("\"estimated_tokens\""));
+        assert!(log.contains("\"name\":\"tool_outputs\""));
         assert!(log.contains("\"type\":\"permission_decision\""));
         assert!(log.contains("\"decision\":\"allow\""));
         assert!(log.contains("\"reason\":\"tool\""));
