@@ -1,10 +1,12 @@
 use super::{
-    format_compact_report, format_context, format_help, format_sessions, format_status,
-    format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision, UiSink,
+    format_compact_report, format_context, format_help, format_prompt, format_sessions,
+    format_status, format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision,
+    UiSink,
 };
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
+use crate::prompt::PromptBuild;
 use crate::session::StopReason;
 use crate::tools::{ToolResult, ToolSummary};
 use anyhow::{Context, Result};
@@ -121,6 +123,10 @@ impl ConsoleUi {
         stats: &ContextStats,
     ) {
         println!("{}", format_context(config, session_path, stats));
+    }
+
+    pub fn print_prompt(&mut self, prompt: &PromptBuild) {
+        println!("{}", format_prompt(prompt));
     }
 
     pub fn print_compact_report(&mut self, report: &ContextCompactReport) {

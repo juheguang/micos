@@ -221,6 +221,10 @@ async fn handle_console_slash<C: ModelClient>(
         SlashCommand::Transcript => ui.print_transcript(agent.session_path())?,
         SlashCommand::Summary => ui.print_summary(agent.session_path())?,
         SlashCommand::Trace => ui.print_trace(agent.session_path())?,
+        SlashCommand::Prompt => {
+            let prompt = agent.prompt_build();
+            ui.print_prompt(&prompt);
+        }
         SlashCommand::Context => {
             let stats = agent.context_stats();
             ui.print_context(agent.config(), agent.session_path(), &stats);

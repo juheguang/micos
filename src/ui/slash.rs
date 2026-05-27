@@ -1,6 +1,7 @@
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
+use crate::prompt::PromptBuild;
 use crate::session::SESSION_DIR;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -16,6 +17,7 @@ pub enum SlashCommand {
     Transcript,
     Summary,
     Trace,
+    Prompt,
     Context,
     Compact,
     Model,
@@ -60,6 +62,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "trace",
         description: "show recent tool and permission trace",
         command: SlashCommand::Trace,
+    },
+    SlashCommandInfo {
+        name: "prompt",
+        description: "show prompt sections and estimated tokens",
+        command: SlashCommand::Prompt,
     },
     SlashCommandInfo {
         name: "context",
@@ -277,7 +284,7 @@ pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &Conte
             continue;
         }
         output.push(format!(
-            "  {:<19} {}",
+            "  {:<28} {}",
             category.name,
             format_tokens(category.tokens)
         ));
@@ -289,6 +296,26 @@ pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &Conte
     output.join("\n")
 }
 
+pub fn format_prompt(prompt: &PromptBuild) -> String {
+    let mut output = vec![
+        "prompt: current model instructions".to_string(),
+        format!(
+            "estimated tokens: {}",
+            format_tokens(crate::context::estimate_text_tokens(&prompt.instructions))
+        ),
+        "sections:".into(),
+    ];
+    for section in &prompt.sections {
+        output.push(format!(
+            "  {:<22} {:<28} {:>7}",
+            section.id,
+            section.source,
+            format_tokens(section.tokens_estimate)
+        ));
+    }
+    output.join("\n")
+}
+
 pub fn format_compact_report(report: &ContextCompactReport) -> String {
     if !report.compacted {
         return "nothing to compact".to_string();
@@ -297,12 +324,15 @@ pub fn format_compact_report(report: &ContextCompactReport) -> String {
     [
         "context compacted".to_string(),
         format!("messages replaced: {}", report.messages_replaced),
+        format!("messages retained: {}", report.retained_messages),
         format!(
             "tokens: {} -> {}",
             format_tokens(report.before_tokens),
             format_tokens(report.after_tokens)
         ),
+        format!("compression ratio: {}%", report.compression_ratio_percent),
         format!("summary tokens: {}", format_tokens(report.summary_tokens)),
+        format!("validation: {}", report.validation_status),
     ]
     .join("\n")
 }
@@ -531,6 +561,7 @@ mod tests {
                 "transcript",
                 "summary",
                 "trace",
+                "prompt",
                 "context",
                 "compact",
                 "model",
@@ -540,6 +571,7 @@ mod tests {
         );
         assert_eq!(slash_command_exact("/status"), Some(SlashCommand::Status));
         assert_eq!(slash_command_exact("/summary"), Some(SlashCommand::Summary));
+        assert_eq!(slash_command_exact("/prompt"), Some(SlashCommand::Prompt));
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
         assert_eq!(
@@ -596,6 +628,33 @@ mod tests {
         assert!(output.contains("estimated tokens: 123 / 1.0k (12%)"));
         assert!(output.contains("tool_outputs"));
         assert!(output.contains("largest risk: tool_outputs"));
+    }
+
+    #[test]
+    fn formats_prompt_sections() {
+        let config = SessionConfig {
+            api_kind: crate::config::ApiKind::Responses,
+            model: "mock".into(),
+            base_url: crate::config::DEFAULT_RESPONSES_BASE_URL.into(),
+            thinking: None,
+            reasoning_effort: None,
+            permission: crate::config::PermissionMode::Safe,
+            permission_rules: Vec::new(),
+            max_steps: 3,
+            context_window_tokens: 1_000,
+            append_system_prompt: Some("Prefer concise replies.".into()),
+            cwd: std::env::temp_dir(),
+        };
+        let runtime = crate::prompt::PromptRuntimeContext::from_config(&config);
+        let prompt = crate::prompt::PromptBuilder::build(&config, &runtime);
+
+        let output = format_prompt(&prompt);
+
+        assert!(output.contains("prompt: current model instructions"));
+        assert!(output.contains("identity"));
+        assert!(output.contains("runtime"));
+        assert!(output.contains("project_append"));
+        assert!(output.contains("config.append_system_prompt"));
     }
 
     #[test]

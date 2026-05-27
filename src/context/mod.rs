@@ -1,3 +1,4 @@
+use crate::prompt::{PromptBuild, PromptSectionSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,6 +31,7 @@ pub struct ContextStats {
 pub struct ModelContext {
     pub input: Vec<Value>,
     pub instructions: String,
+    pub prompt_sections: Vec<PromptSectionSnapshot>,
     pub tools: Vec<Value>,
     pub stats: ContextStats,
 }
@@ -44,16 +46,23 @@ impl ContextBuilder {
         Self { max_tokens }
     }
 
-    pub fn build(
-        &self,
-        input: Vec<Value>,
-        instructions: String,
-        tools: Vec<Value>,
-    ) -> ModelContext {
-        let stats = estimate_context_stats(&input, &instructions, &tools, self.max_tokens);
+    pub fn build(&self, input: Vec<Value>, prompt: PromptBuild, tools: Vec<Value>) -> ModelContext {
+        let prompt_sections = prompt
+            .sections
+            .iter()
+            .map(|section| section.snapshot())
+            .collect::<Vec<_>>();
+        let stats = estimate_context_stats_with_prompt_sections(
+            &input,
+            &prompt.instructions,
+            &prompt_sections,
+            &tools,
+            self.max_tokens,
+        );
         ModelContext {
             input,
-            instructions,
+            instructions: prompt.instructions,
+            prompt_sections,
             tools,
             stats,
         }
@@ -66,10 +75,21 @@ pub fn estimate_context_stats(
     tools: &[Value],
     max_tokens: usize,
 ) -> ContextStats {
-    let mut categories = vec![
-        ContextCategory::new("instructions", estimate_text_tokens(instructions)),
-        ContextCategory::new("tool_schemas", estimate_json_values_tokens(tools, 2)),
-    ];
+    estimate_context_stats_with_prompt_sections(input, instructions, &[], tools, max_tokens)
+}
+
+pub fn estimate_context_stats_with_prompt_sections(
+    input: &[Value],
+    instructions: &str,
+    prompt_sections: &[PromptSectionSnapshot],
+    tools: &[Value],
+    max_tokens: usize,
+) -> ContextStats {
+    let mut categories = prompt_categories(instructions, prompt_sections);
+    categories.push(ContextCategory::new(
+        "tool_schemas",
+        estimate_json_values_tokens(tools, 2),
+    ));
     let mut user_messages = 0usize;
     let mut assistant_messages = 0usize;
     let mut compacted_summary = 0usize;
@@ -121,6 +141,28 @@ pub fn estimate_context_stats(
         usage_percent: usage_percent.min(100),
         categories,
     }
+}
+
+fn prompt_categories(
+    instructions: &str,
+    prompt_sections: &[PromptSectionSnapshot],
+) -> Vec<ContextCategory> {
+    if prompt_sections.is_empty() {
+        return vec![ContextCategory::new(
+            "instructions",
+            estimate_text_tokens(instructions),
+        )];
+    }
+
+    prompt_sections
+        .iter()
+        .map(|section| {
+            ContextCategory::new(
+                format!("prompt.{}", section.id),
+                estimate_text_tokens(&format!("## {}\n", section.title)) + section.tokens_estimate,
+            )
+        })
+        .collect()
 }
 
 pub fn estimate_text_tokens(text: &str) -> usize {
@@ -240,5 +282,37 @@ mod tests {
             stats.total_tokens_estimate + category("free_space"),
             stats.max_tokens
         );
+    }
+
+    #[test]
+    fn splits_prompt_sections_when_available() {
+        let input = vec![];
+        let tools = vec![];
+        let sections = vec![
+            PromptSectionSnapshot {
+                id: "identity".into(),
+                title: "Identity".into(),
+                source: "base".into(),
+                tokens_estimate: 10,
+            },
+            PromptSectionSnapshot {
+                id: "runtime".into(),
+                title: "Runtime context".into(),
+                source: "runtime".into(),
+                tokens_estimate: 8,
+            },
+        ];
+
+        let stats =
+            estimate_context_stats_with_prompt_sections(&input, "ignored", &sections, &tools, 100);
+        let names = stats
+            .categories
+            .iter()
+            .map(|category| category.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"prompt.identity"));
+        assert!(names.contains(&"prompt.runtime"));
+        assert!(!names.contains(&"instructions"));
     }
 }

@@ -1,5 +1,6 @@
 use crate::config::{ApiKind, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode};
 use crate::context::ContextCategory;
+use crate::prompt::PromptSectionSnapshot;
 use crate::tools::{DecisionReason, PermissionDecision, RuleSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,8 @@ pub enum SessionEvent {
         max_tokens: usize,
         usage_percent: usize,
         categories: Vec<ContextCategory>,
+        #[serde(default)]
+        prompt_sections: Vec<PromptSectionSnapshot>,
     },
     ContextCompacted {
         timestamp: String,
@@ -79,12 +82,22 @@ pub enum SessionEvent {
         after_tokens: usize,
         summary_tokens: usize,
         messages_replaced: usize,
+        #[serde(default)]
+        retained_messages: usize,
+        #[serde(default)]
+        compression_ratio_percent: usize,
+        #[serde(default)]
+        validation_status: String,
     },
     ContextSummary {
         timestamp: String,
         summary: String,
         summary_tokens: usize,
         messages_replaced: usize,
+        #[serde(default)]
+        retained_messages: usize,
+        #[serde(default)]
+        summary_format_version: usize,
         trigger: String,
     },
     ConfigChanged {
@@ -242,6 +255,9 @@ mod tests {
             after_tokens: 40,
             summary_tokens: 20,
             messages_replaced: 3,
+            retained_messages: 2,
+            compression_ratio_percent: 60,
+            validation_status: "passed".into(),
         };
 
         let value = serde_json::to_value(event).unwrap();
@@ -250,6 +266,9 @@ mod tests {
         assert_eq!(value["after_tokens"], 40);
         assert_eq!(value["summary_tokens"], 20);
         assert_eq!(value["messages_replaced"], 3);
+        assert_eq!(value["retained_messages"], 2);
+        assert_eq!(value["compression_ratio_percent"], 60);
+        assert_eq!(value["validation_status"], "passed");
     }
 
     #[test]
@@ -259,6 +278,8 @@ mod tests {
             summary: "## Primary Request and Intent\nContinue.".into(),
             summary_tokens: 12,
             messages_replaced: 4,
+            retained_messages: 2,
+            summary_format_version: 1,
             trigger: "manual".into(),
         };
 
@@ -267,6 +288,34 @@ mod tests {
         assert_eq!(value["summary"], "## Primary Request and Intent\nContinue.");
         assert_eq!(value["summary_tokens"], 12);
         assert_eq!(value["messages_replaced"], 4);
+        assert_eq!(value["retained_messages"], 2);
+        assert_eq!(value["summary_format_version"], 1);
         assert_eq!(value["trigger"], "manual");
+    }
+
+    #[test]
+    fn context_snapshot_event_serializes_prompt_sections() {
+        let event = SessionEvent::ContextSnapshot {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            model: "mock".into(),
+            estimated_tokens: 20,
+            max_tokens: 100,
+            usage_percent: 20,
+            categories: vec![ContextCategory {
+                name: "prompt.identity".into(),
+                tokens: 10,
+            }],
+            prompt_sections: vec![PromptSectionSnapshot {
+                id: "identity".into(),
+                title: "Identity".into(),
+                source: "base".into(),
+                tokens_estimate: 8,
+            }],
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "context_snapshot");
+        assert_eq!(value["prompt_sections"][0]["id"], "identity");
+        assert_eq!(value["prompt_sections"][0]["source"], "base");
     }
 }

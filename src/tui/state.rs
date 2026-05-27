@@ -1,4 +1,3 @@
-use super::POPUP_LIMIT;
 use crate::config::{
     ModelSettings, ReasoningEffort, ThinkingMode, DEEPSEEK_CHAT_COMPLETIONS_BASE_URL,
 };
@@ -233,7 +232,7 @@ impl ComposerState {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.matches().len().min(POPUP_LIMIT);
+        let len = self.matches().len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -291,7 +290,7 @@ impl ComposerState {
 
     fn refresh_popup(&mut self) {
         self.popup_open = self.buffer.starts_with('/') && !self.popup_dismissed;
-        let len = self.matches().len().min(POPUP_LIMIT);
+        let len = self.matches().len();
         if len == 0 || self.selected >= len {
             self.selected = 0;
         }

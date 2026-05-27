@@ -4,9 +4,9 @@ use crate::model::OpenAiModelClient;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
-    format_compact_report, format_context, format_help, format_sessions, format_status,
-    format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision, SlashCommand,
-    UiSink,
+    format_compact_report, format_context, format_help, format_prompt, format_sessions,
+    format_status, format_summary, format_trace, format_transcript, AgentEvent, ApprovalDecision,
+    SlashCommand, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -529,6 +529,14 @@ impl TuiUi {
                     format_trace(agent.session_path())?,
                 );
             }
+            SlashCommand::Prompt => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                self.push_message(
+                    MessageKind::System,
+                    "/prompt",
+                    format_prompt(&agent.prompt_build()),
+                );
+            }
             SlashCommand::Context => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.push_message(
@@ -944,10 +952,25 @@ mod tests {
         let mut composer = ComposerState::new();
         composer.handle_key(key(KeyCode::Char('/')));
         composer.handle_key(key(KeyCode::Up));
-        assert_eq!(composer.selected(), POPUP_LIMIT - 1);
+        assert_eq!(composer.selected(), SLASH_COMMANDS.len() - 1);
         assert_eq!(
             composer.handle_key(key(KeyCode::Tab)),
-            ComposerAction::Command(SLASH_COMMANDS[POPUP_LIMIT - 1].command)
+            ComposerAction::Command(SLASH_COMMANDS.last().unwrap().command)
+        );
+    }
+
+    #[test]
+    fn popup_selection_can_move_past_visible_limit() {
+        let mut composer = ComposerState::new();
+        composer.handle_key(key(KeyCode::Char('/')));
+        for _ in 0..POPUP_LIMIT {
+            composer.handle_key(key(KeyCode::Down));
+        }
+
+        assert_eq!(composer.selected(), POPUP_LIMIT);
+        assert_eq!(
+            composer.handle_key(key(KeyCode::Enter)),
+            ComposerAction::Command(SLASH_COMMANDS[POPUP_LIMIT].command)
         );
     }
 

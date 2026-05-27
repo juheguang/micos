@@ -209,12 +209,17 @@ fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState
         return;
     }
 
+    let selected = composer.selected().min(matches.len().saturating_sub(1));
+    let visible_rows = POPUP_LIMIT.min(matches.len());
+    let start = popup_window_start(selected, visible_rows, matches.len());
     let lines = matches
         .into_iter()
-        .take(POPUP_LIMIT)
+        .skip(start)
+        .take(visible_rows)
         .enumerate()
         .map(|(index, command)| {
-            let style = if index == composer.selected() {
+            let command_index = start + index;
+            let style = if command_index == selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
                 Style::default()
@@ -229,6 +234,13 @@ fn draw_popup(frame: &mut Frame<'_>, footer_area: Rect, composer: &ComposerState
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn popup_window_start(selected: usize, visible_rows: usize, total: usize) -> usize {
+    if total <= visible_rows {
+        return 0;
+    }
+    selected.saturating_add(1).saturating_sub(visible_rows)
 }
 
 fn draw_approval_picker(frame: &mut Frame<'_>, footer_area: Rect, selected: usize) {

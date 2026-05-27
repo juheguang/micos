@@ -54,6 +54,8 @@ MICOS_API_KEY=service-key
 
 `micos` 会为每次模型请求注入一份精简的基础 system prompt，覆盖 identity、task discipline、tool use、permissions、context governance、verification 和 reporting style。它借鉴 coding agent 常见约束：改代码前先读相关文件、工具由 harness 执行、权限拒绝要尊重、验证结果不能伪造、长任务中保持当前目标、保护用户已有改动、避免擅自执行破坏性 git 命令，并保持最终汇报紧凑。
 
+Prompt 由 registry 组装，最终仍作为单个 `instructions` 字符串发给模型，但运行时会保留 section metadata。`/prompt` 可以查看当前请求的 prompt section、来源和估算 token。基础 section 之后会追加一个 runtime context section，包含 cwd、model、API kind、permission mode、context window 和当前日期。
+
 项目可以在 `.micos/config.toml` 中追加额外约束：
 
 ```toml
@@ -114,6 +116,7 @@ REPL 支持常用 slash commands：
 - `/transcript`：显示当前 transcript 路径和最近事件摘要。
 - `/summary`：显示当前 session 最近一次 compact summary 正文。
 - `/trace`：显示最近工具调用、权限决策、拒绝原因和 stop reason。
+- `/prompt`：显示当前 system prompt 的 section、来源和估算 token。
 - `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
 - `/model`：在 TUI 模式中选择模型和思考设置。
@@ -164,7 +167,7 @@ deny = ["shell(rm *)", "shell(curl *)"]
 
 `context_window_tokens` 默认是 `200000`。当 `base_url` 是 DeepSeek 官方 API 且 model 为 `deepseek-v4-*` 时，默认窗口自动使用 `1000000`；显式配置仍然优先。
 
-每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小和分类占用。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/context` 和 `/trace` 查看当前 session 的上下文和权限 trace。
+每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小、分类占用和 prompt section 摘要。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/prompt`、`/context` 和 `/trace` 查看当前 session 的 prompt、上下文和权限 trace。
 
 ## 手动 Compact
 
@@ -179,17 +182,19 @@ deny = ["shell(rm *)", "shell(curl *)"]
 - Current Work
 - Next Step
 
-compact 成功后，运行时 transcript 会被替换为一条 summary message，后续模型请求会把它当作早期上下文。原始事件仍完整保存在 `.micos/sessions/*.jsonl` 中。
+compact 成功后，运行时 transcript 会变成 `summary message + recent tail`：早期 model-visible context 由 summary 承接，最近 8 条 transcript items 继续保留原文，且会向前扩展以避免 `function_call` / `function_call_output` 被切断。原始事件仍完整保存在 `.micos/sessions/*.jsonl` 中。
+
+compact summary 会先做基础校验：必须非空、包含固定 headings、保留最近用户请求片段，并说明 test/verification 状态。校验失败时不会替换当前 transcript。
 
 compact 会在 session JSONL 中记录：
 
 - compact 前后的 `context_snapshot`
-- `context_summary`，字段包含 `timestamp`、`summary`、`summary_tokens`、`messages_replaced`、`trigger`
-- `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`
+- `context_summary`，字段包含 `timestamp`、`summary`、`summary_tokens`、`messages_replaced`、`retained_messages`、`summary_format_version`、`trigger`
+- `context_compacted`，字段包含 `timestamp`、`before_tokens`、`after_tokens`、`summary_tokens`、`messages_replaced`、`retained_messages`、`compression_ratio_percent`、`validation_status`
 
 `/summary` 会从当前 session JSONL 中反向查找最近一条 `context_summary`，并显示完整摘要。`/transcript` 只显示一行 `context_summary` 摘要，不展开正文。
 
-如果当前 model-visible transcript 为空，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_summary` 或 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
+如果当前 model-visible transcript 为空，或太短以至于 recent tail 会保留全部内容，`/compact` 会返回 `nothing to compact`，不会调用模型，也不会写入 `context_summary` 或 `context_compacted`。如果 compact 模型调用失败，当前 transcript 不会被替换。
 
 ## Model-visible 工具输出
 

@@ -1,9 +1,13 @@
+mod approval;
+mod compact;
+mod model_output;
+
 use crate::config::{save_permission_rule, ModelSettings, SessionConfig, ThinkingMode};
 use crate::context::{
     compacted_summary_message, estimate_text_tokens, ContextBuilder, ContextStats,
 };
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
-use crate::prompt::{compact_instructions, PromptBuilder};
+use crate::prompt::{compact_instructions, PromptBuild, PromptBuilder, PromptRuntimeContext};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::tools::{
     BuiltinToolRegistry, DecisionReason, ModePermissionPolicy, PermissionDecision,
@@ -14,6 +18,14 @@ use crate::tools::{
 use crate::ui::NullUi;
 use crate::ui::{AgentEvent, ApprovalDecision, UiSink};
 use anyhow::Result;
+use approval::suggest_approval_rule;
+use compact::{
+    compression_ratio_percent, validate_compact_summary, CompactPlan,
+    COMPACT_SUMMARY_FORMAT_VERSION,
+};
+use model_output::function_call_output;
+#[cfg(test)]
+use model_output::MODEL_VISIBLE_TOOL_OUTPUT_LIMIT;
 use serde_json::{json, Value};
 use std::time::Instant;
 use uuid::Uuid;
@@ -27,9 +39,10 @@ pub struct ContextCompactReport {
     pub after_tokens: usize,
     pub summary_tokens: usize,
     pub messages_replaced: usize,
+    pub retained_messages: usize,
+    pub compression_ratio_percent: usize,
+    pub validation_status: String,
 }
-
-const MODEL_VISIBLE_TOOL_OUTPUT_LIMIT: usize = 12 * 1024;
 
 pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermissionPolicy> {
     config: SessionConfig,
@@ -96,6 +109,13 @@ where
         self.build_model_context().stats
     }
 
+    pub fn prompt_build(&self) -> PromptBuild {
+        PromptBuilder::build(
+            &self.config,
+            &PromptRuntimeContext::from_config(&self.config),
+        )
+    }
+
     pub async fn compact_context(&mut self) -> Result<ContextCompactReport> {
         if self.transcript.is_empty() {
             let stats = self.build_model_context().stats;
@@ -105,16 +125,32 @@ where
                 after_tokens: stats.total_tokens_estimate,
                 summary_tokens: 0,
                 messages_replaced: 0,
+                retained_messages: 0,
+                compression_ratio_percent: 0,
+                validation_status: "skipped_empty_transcript".into(),
             });
         }
 
         let before_context = self.build_model_context();
-        self.record_context_snapshot(&before_context.stats)?;
-        let messages_replaced = self.transcript.len();
+        let compact_plan = CompactPlan::from_transcript(&self.transcript);
+        if compact_plan.messages_replaced == 0 {
+            return Ok(ContextCompactReport {
+                compacted: false,
+                before_tokens: before_context.stats.total_tokens_estimate,
+                after_tokens: before_context.stats.total_tokens_estimate,
+                summary_tokens: 0,
+                messages_replaced: 0,
+                retained_messages: compact_plan.retained_messages,
+                compression_ratio_percent: 0,
+                validation_status: "skipped_small_transcript".into(),
+            });
+        }
+        self.record_context_snapshot(&before_context)?;
+        let messages_replaced = compact_plan.messages_replaced;
 
         let request = ModelRequest {
             model: self.config.model.clone(),
-            input: before_context.input,
+            input: compact_plan.summary_input.clone(),
             tools: Vec::new(),
             instructions: compact_instructions(&before_context.instructions),
             parallel_tool_calls: false,
@@ -137,8 +173,11 @@ where
             }
         };
         let summary = response.assistant_text.join("\n").trim().to_string();
-        if summary.is_empty() {
-            let error = anyhow::anyhow!("compact produced an empty summary");
+        let validation =
+            validate_compact_summary(&summary, compact_plan.latest_user_text.as_deref());
+        if !validation.passed {
+            let error =
+                anyhow::anyhow!("compact summary validation failed: {}", validation.message);
             self.session.append(&SessionEvent::Error {
                 timestamp: now(),
                 message: error.to_string(),
@@ -152,17 +191,28 @@ where
             summary: summary.clone(),
             summary_tokens,
             messages_replaced,
+            retained_messages: compact_plan.retained_messages,
+            summary_format_version: COMPACT_SUMMARY_FORMAT_VERSION,
             trigger: "manual".into(),
         })?;
-        self.transcript = vec![compacted_summary_message(&summary)];
+        self.transcript = std::iter::once(compacted_summary_message(&summary))
+            .chain(compact_plan.retained_tail)
+            .collect();
         let after_context = self.build_model_context();
-        self.record_context_snapshot(&after_context.stats)?;
+        self.record_context_snapshot(&after_context)?;
+        let compression_ratio_percent = compression_ratio_percent(
+            before_context.stats.total_tokens_estimate,
+            after_context.stats.total_tokens_estimate,
+        );
         self.session.append(&SessionEvent::ContextCompacted {
             timestamp: now(),
             before_tokens: before_context.stats.total_tokens_estimate,
             after_tokens: after_context.stats.total_tokens_estimate,
             summary_tokens,
             messages_replaced,
+            retained_messages: compact_plan.retained_messages,
+            compression_ratio_percent,
+            validation_status: validation.status.clone(),
         })?;
 
         Ok(ContextCompactReport {
@@ -171,6 +221,9 @@ where
             after_tokens: after_context.stats.total_tokens_estimate,
             summary_tokens,
             messages_replaced,
+            retained_messages: compact_plan.retained_messages,
+            compression_ratio_percent,
+            validation_status: validation.status,
         })
     }
 
@@ -221,7 +274,7 @@ where
                 self.config.reasoning_effort.map(|value| value.to_string())
             };
             let model_context = self.build_model_context();
-            self.record_context_snapshot(&model_context.stats)?;
+            self.record_context_snapshot(&model_context)?;
             let request = ModelRequest {
                 model: self.config.model.clone(),
                 input: model_context.input,
@@ -540,19 +593,20 @@ where
             .schemas_for_policy(&self.permission_policy, self.config.permission);
         ContextBuilder::new(self.config.context_window_tokens).build(
             self.transcript.clone(),
-            PromptBuilder::build(&self.config),
+            self.prompt_build(),
             tools,
         )
     }
 
-    fn record_context_snapshot(&self, stats: &ContextStats) -> Result<()> {
+    fn record_context_snapshot(&self, context: &crate::context::ModelContext) -> Result<()> {
         self.session.append(&SessionEvent::ContextSnapshot {
             timestamp: now(),
             model: self.config.model.clone(),
-            estimated_tokens: stats.total_tokens_estimate,
-            max_tokens: stats.max_tokens,
-            usage_percent: stats.usage_percent,
-            categories: stats.categories.clone(),
+            estimated_tokens: context.stats.total_tokens_estimate,
+            max_tokens: context.stats.max_tokens,
+            usage_percent: context.stats.usage_percent,
+            categories: context.stats.categories.clone(),
+            prompt_sections: context.prompt_sections.clone(),
         })
     }
 
@@ -627,107 +681,6 @@ where
     fn approve_tool(&mut self, name: &str, summary: &str) -> Result<ApprovalDecision> {
         self.inner.approve_tool(name, summary)
     }
-}
-
-fn function_call_output(call_id: &str, result: &ToolResult) -> Value {
-    json!({
-        "type": "function_call_output",
-        "call_id": call_id,
-        "output": serde_json::to_string(&project_tool_result_for_model(result)).unwrap()
-    })
-}
-
-fn project_tool_result_for_model(result: &ToolResult) -> Value {
-    let output = truncate_model_visible_output(&result.output, MODEL_VISIBLE_TOOL_OUTPUT_LIMIT);
-    json!({
-        "success": result.success,
-        "output": output.preview,
-        "error": result.error,
-        "truncated": output.truncated,
-        "original_bytes": output.original_bytes,
-        "preview_bytes": output.preview_bytes,
-        "omitted_bytes": output.omitted_bytes,
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ModelVisibleOutput {
-    preview: String,
-    truncated: bool,
-    original_bytes: usize,
-    preview_bytes: usize,
-    omitted_bytes: usize,
-}
-
-fn truncate_model_visible_output(text: &str, limit: usize) -> ModelVisibleOutput {
-    if text.len() <= limit {
-        return ModelVisibleOutput {
-            preview: text.to_string(),
-            truncated: false,
-            original_bytes: text.len(),
-            preview_bytes: text.len(),
-            omitted_bytes: 0,
-        };
-    }
-
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let preview = text[..end].to_string();
-    ModelVisibleOutput {
-        preview,
-        truncated: true,
-        original_bytes: text.len(),
-        preview_bytes: end,
-        omitted_bytes: text.len() - end,
-    }
-}
-
-fn suggest_approval_rule(tool: &str, arguments: &Value) -> String {
-    match tool {
-        "write_file" => suggest_write_file_rule(arguments),
-        "shell" => suggest_shell_rule(arguments),
-        _ => tool.to_string(),
-    }
-}
-
-fn suggest_write_file_rule(arguments: &Value) -> String {
-    let path = arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .trim_start_matches("./");
-    if path.is_empty() || path.contains(['(', ')']) {
-        return "write_file".into();
-    }
-    let first = path.split('/').next().unwrap_or(path);
-    if matches!(first, "src" | "tests" | "docs" | "assets") && path.contains('/') {
-        format!("write_file({first}/*)")
-    } else {
-        format!("write_file({path})")
-    }
-}
-
-fn suggest_shell_rule(arguments: &Value) -> String {
-    let command = arguments
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if command.is_empty() || command.contains(['(', ')']) {
-        return "shell".into();
-    }
-    if command.starts_with("git status") {
-        return "shell(git status*)".into();
-    }
-    if command.starts_with("git diff") {
-        return "shell(git diff*)".into();
-    }
-    format!("shell({command})")
 }
 
 #[cfg(test)]
@@ -897,6 +850,8 @@ mod tests {
         assert!(requests[0]
             .instructions
             .contains("Read relevant files before changing code"));
+        assert!(requests[0].instructions.contains("## Runtime context"));
+        assert!(requests[0].instructions.contains("permission mode: safe"));
         assert!(requests[0]
             .instructions
             .contains("## Project additional instructions"));
@@ -906,37 +861,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_replaces_visible_transcript_with_summary() {
-        let summary = "## Primary Request and Intent\nContinue the task.\n\n## Key Technical Concepts\nPrompt governance.\n\n## Files and Code Sections\nsrc/agent.rs.\n\n## Errors and Fixes\nNone.\n\n## Decisions Made\nUse manual compact.\n\n## Pending Tasks\nRun tests.\n\n## Current Work\nImplementing compact.\n\n## Next Step\nVerify.";
+    async fn compact_replaces_prefix_with_summary_and_retains_tail() {
+        let summary = "## Primary Request and Intent\nContinue the task after latest request turn 5.\n\n## Key Technical Concepts\nPrompt governance.\n\n## Files and Code Sections\nsrc/agent.rs.\n\n## Errors and Fixes\nNone.\n\n## Decisions Made\nUse manual compact.\n\n## Pending Tasks\nRun tests.\n\n## Current Work\nImplementing compact.\n\n## Next Step\nVerify with cargo test.";
         let mut agent = test_agent(
             PermissionMode::Safe,
             3,
             vec![
-                Ok(final_response("first answer")),
+                Ok(final_response("answer 0")),
+                Ok(final_response("answer 1")),
+                Ok(final_response("answer 2")),
+                Ok(final_response("answer 3")),
+                Ok(final_response("answer 4")),
+                Ok(final_response("answer 5")),
                 Ok(final_response(summary)),
                 Ok(final_response("done")),
             ],
         );
         let path = agent.session.path().clone();
 
-        let reason = agent.run_turn("start".into()).await.unwrap();
-        assert_eq!(reason, StopReason::FinalAnswer);
+        for index in 0..=5 {
+            let reason = agent.run_turn(format!("turn {index}")).await.unwrap();
+            assert_eq!(reason, StopReason::FinalAnswer);
+        }
         let report = agent.compact_context().await.unwrap();
         assert!(report.compacted);
-        assert_eq!(report.messages_replaced, 2);
+        assert_eq!(report.messages_replaced, 4);
+        assert_eq!(report.retained_messages, 8);
+        assert_eq!(report.validation_status, "passed");
         assert!(report.before_tokens > report.summary_tokens);
         assert!(report.after_tokens > report.summary_tokens);
 
         let reason = agent.run_turn("continue".into()).await.unwrap();
         assert_eq!(reason, StopReason::FinalAnswer);
         let requests = agent.client.requests.lock().unwrap();
-        assert!(requests[1].tools.is_empty());
-        assert!(requests[1].instructions.contains("## Compact task"));
-        assert_eq!(requests[2].input.len(), 2);
-        assert!(requests[2].input[0]
+        assert!(requests[6].tools.is_empty());
+        assert!(requests[6].instructions.contains("## Compact task"));
+        assert_eq!(requests[7].input.len(), 10);
+        assert!(requests[7].input[0]
             .to_string()
             .contains("This is a compacted summary of earlier model-visible context"));
-        assert!(requests[2].input[0].to_string().contains("## Next Step"));
+        assert!(requests[7].input[0].to_string().contains("## Next Step"));
+        assert!(requests[7].input[1].to_string().contains("turn 2"));
+        assert!(requests[7].input[8].to_string().contains("answer 5"));
 
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\"type\":\"context_summary\""));
@@ -946,7 +912,10 @@ mod tests {
             log.find("\"type\":\"context_summary\"").unwrap()
                 < log.find("\"type\":\"context_compacted\"").unwrap()
         );
-        assert!(log.contains("\"messages_replaced\":2"));
+        assert!(log.contains("\"messages_replaced\":4"));
+        assert!(log.contains("\"retained_messages\":8"));
+        assert!(log.contains("\"summary_format_version\":1"));
+        assert!(log.contains("\"validation_status\":\"passed\""));
         assert!(log.contains("\"summary_tokens\""));
     }
 
@@ -967,22 +936,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_failure_does_not_write_context_summary() {
-        let mut agent = test_agent(
-            PermissionMode::Safe,
-            3,
-            vec![Ok(final_response("first answer")), Err(anyhow!("api down"))],
-        );
+    async fn compact_small_transcript_does_not_call_model_or_write_compacted_event() {
+        let mut agent = test_agent(PermissionMode::Safe, 3, vec![Ok(final_response("answer"))]);
         let path = agent.session.path().clone();
 
         let reason = agent.run_turn("start".into()).await.unwrap();
         assert_eq!(reason, StopReason::FinalAnswer);
+        let report = agent.compact_context().await.unwrap();
+
+        assert!(!report.compacted);
+        assert_eq!(report.validation_status, "skipped_small_transcript");
+        assert_eq!(agent.client.requests.lock().unwrap().len(), 1);
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("\"type\":\"context_summary\""));
+        assert!(!log.contains("\"type\":\"context_compacted\""));
+    }
+
+    #[tokio::test]
+    async fn compact_failure_does_not_write_context_summary() {
+        let mut responses = (0..5)
+            .map(|index| Ok(final_response(&format!("answer {index}"))))
+            .collect::<Vec<_>>();
+        responses.push(Err(anyhow!("api down")));
+        let mut agent = test_agent(PermissionMode::Safe, 3, responses);
+        let path = agent.session.path().clone();
+
+        for index in 0..5 {
+            let reason = agent.run_turn(format!("turn {index}")).await.unwrap();
+            assert_eq!(reason, StopReason::FinalAnswer);
+        }
         let error = agent.compact_context().await.unwrap_err();
         assert!(error.to_string().contains("api down"));
 
         let log = std::fs::read_to_string(path).unwrap();
         assert!(!log.contains("\"type\":\"context_summary\""));
         assert!(!log.contains("\"type\":\"context_compacted\""));
+    }
+
+    #[tokio::test]
+    async fn compact_validation_failure_keeps_original_transcript() {
+        let mut responses = (0..5)
+            .map(|index| Ok(final_response(&format!("answer {index}"))))
+            .collect::<Vec<_>>();
+        responses.push(Ok(final_response(
+            "## Primary Request and Intent\nMissing required sections.",
+        )));
+        responses.push(Ok(final_response("done")));
+        let mut agent = test_agent(PermissionMode::Safe, 3, responses);
+        let path = agent.session.path().clone();
+
+        for index in 0..5 {
+            let reason = agent.run_turn(format!("turn {index}")).await.unwrap();
+            assert_eq!(reason, StopReason::FinalAnswer);
+        }
+        let error = agent.compact_context().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("compact summary validation failed"));
+        let reason = agent.run_turn("after failure".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests[6].input.len(), 11);
+        assert!(requests[6].input[0].to_string().contains("turn 0"));
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("\"type\":\"context_summary\""));
+        assert!(!log.contains("\"type\":\"context_compacted\""));
+        assert!(log.contains("compact summary validation failed"));
     }
 
     #[tokio::test]
@@ -1003,6 +1023,9 @@ mod tests {
         assert!(log.contains("\"type\":\"tool_call\""));
         assert!(log.contains("\"type\":\"context_snapshot\""));
         assert!(log.contains("\"estimated_tokens\""));
+        assert!(log.contains("\"prompt_sections\""));
+        assert!(log.contains("\"id\":\"identity\""));
+        assert!(log.contains("\"name\":\"prompt.identity\""));
         assert!(log.contains("\"name\":\"tool_outputs\""));
         assert!(log.contains("\"type\":\"permission_decision\""));
         assert!(log.contains("\"decision\":\"allow\""));
@@ -1088,61 +1111,6 @@ mod tests {
         assert!(log.contains("\"reason\":\"rule\""));
         assert!(log.contains("\"rule_source\":\"config\""));
         assert!(log.contains("\"elapsed_ms\""));
-    }
-
-    #[test]
-    fn suggests_permission_rules_for_common_tools() {
-        assert_eq!(
-            suggest_approval_rule("write_file", &json!({"path":"src/agent.rs"})),
-            "write_file(src/*)"
-        );
-        assert_eq!(
-            suggest_approval_rule("write_file", &json!({"path":"README.md"})),
-            "write_file(README.md)"
-        );
-        assert_eq!(
-            suggest_approval_rule("shell", &json!({"command":"git diff -- src/agent.rs"})),
-            "shell(git diff*)"
-        );
-        assert_eq!(
-            suggest_approval_rule("shell", &json!({"command":"cargo test"})),
-            "shell(cargo test)"
-        );
-    }
-
-    #[test]
-    fn model_visible_tool_output_projection_keeps_small_output() {
-        let result = ToolResult::ok("small output");
-        let value = project_tool_result_for_model(&result);
-
-        assert_eq!(value["success"], true);
-        assert_eq!(value["output"], "small output");
-        assert_eq!(value["truncated"], false);
-        assert_eq!(value["original_bytes"], 12);
-        assert_eq!(value["preview_bytes"], 12);
-        assert_eq!(value["omitted_bytes"], 0);
-    }
-
-    #[test]
-    fn model_visible_tool_output_projection_truncates_large_output() {
-        let output = format!("{}你好", "x".repeat(MODEL_VISIBLE_TOOL_OUTPUT_LIMIT + 8));
-        let result = ToolResult::ok(output.clone());
-        let value = project_tool_result_for_model(&result);
-        let preview = value["output"].as_str().unwrap();
-
-        assert_eq!(value["success"], true);
-        assert_eq!(value["truncated"], true);
-        assert_eq!(value["original_bytes"], output.len());
-        assert!(preview.len() <= MODEL_VISIBLE_TOOL_OUTPUT_LIMIT);
-        assert_eq!(
-            value["preview_bytes"].as_u64().unwrap() as usize,
-            preview.len()
-        );
-        assert_eq!(
-            value["omitted_bytes"].as_u64().unwrap() as usize,
-            output.len() - preview.len()
-        );
-        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
     }
 
     struct LargeOutputRegistry {
