@@ -6,6 +6,7 @@ use crate::config::{save_permission_rule, ModelSettings, SessionConfig, Thinking
 use crate::context::{
     compacted_summary_message, estimate_text_tokens, ContextBuilder, ContextStats,
 };
+use crate::memory::ProjectMemory;
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::prompt::{compact_instructions, PromptBuild, PromptBuilder, PromptRuntimeContext};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
@@ -52,6 +53,7 @@ pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermiss
     tools: T,
     permission_policy: P,
     transcript: Vec<Value>,
+    project_memory: Option<ProjectMemory>,
 }
 
 impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
@@ -64,6 +66,7 @@ impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
             tools: BuiltinToolRegistry::default(),
             permission_policy: PolicyEngine::new(permission_rules),
             transcript: Vec::new(),
+            project_memory: None,
         }
     }
 }
@@ -83,6 +86,7 @@ impl<C, R, T, P> AgentRuntime<C, R, T, P> {
             tools,
             permission_policy,
             transcript: Vec::new(),
+            project_memory: None,
         }
     }
 }
@@ -106,15 +110,33 @@ where
         self.session.path().as_path()
     }
 
+    pub fn session(&self) -> &R {
+        &self.session
+    }
+
     pub fn context_stats(&self) -> ContextStats {
         self.build_model_context().stats
     }
 
     pub fn prompt_build(&self) -> PromptBuild {
-        PromptBuilder::build(
-            &self.config,
-            &PromptRuntimeContext::from_config(&self.config),
-        )
+        PromptBuilder::build(&self.config, &self.prompt_runtime_context())
+    }
+
+    pub fn project_memory(&self) -> Option<&ProjectMemory> {
+        self.project_memory.as_ref()
+    }
+
+    pub fn install_project_memory(&mut self, memory: ProjectMemory) -> Result<()> {
+        self.session.append(&SessionEvent::MemoryLoaded {
+            timestamp: now(),
+            root: memory.root.clone(),
+            index_path: memory.index_path.clone(),
+            index_tokens: memory.index_tokens,
+            topic_count: memory.topics.len(),
+            created_index: memory.created_index,
+        })?;
+        self.project_memory = Some(memory);
+        Ok(())
     }
 
     pub fn resume_session(&mut self, target: &str) -> Result<SessionResumeReport> {
@@ -618,6 +640,16 @@ where
         )
     }
 
+    fn prompt_runtime_context(&self) -> PromptRuntimeContext {
+        let runtime = PromptRuntimeContext::from_config(&self.config);
+        if let Some(memory) = self.project_memory.as_ref() {
+            if let Some(index) = memory.active_index_text() {
+                return runtime.with_project_memory(&memory.index_path, index);
+            }
+        }
+        runtime
+    }
+
     fn record_context_snapshot(&self, context: &crate::context::ModelContext) -> Result<()> {
         self.session.append(&SessionEvent::ContextSnapshot {
             timestamp: now(),
@@ -878,6 +910,34 @@ mod tests {
         assert!(requests[0]
             .instructions
             .contains("Prefer project-specific wording."));
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_includes_project_memory_when_loaded() {
+        let config = temp_config(PermissionMode::Safe, 3);
+        let memory_root = config.cwd.join(crate::memory::MEMORY_DIR);
+        std::fs::create_dir_all(memory_root.join(crate::memory::MEMORY_TOPICS_DIR)).unwrap();
+        std::fs::write(
+            memory_root.join(crate::memory::MEMORY_INDEX_FILE),
+            "# Project Facts\nUse cargo test before reporting success.",
+        )
+        .unwrap();
+        let memory = ProjectMemory::load_or_init(&config.cwd).unwrap();
+        let mut agent = test_agent_with_config(config, vec![Ok(final_response("done"))]);
+        let path = agent.session.path().clone();
+        agent.install_project_memory(memory).unwrap();
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let requests = agent.client.requests.lock().unwrap();
+        assert!(requests[0].instructions.contains("## Project memory"));
+        assert!(requests[0].instructions.contains("Use cargo test"));
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"type\":\"memory_loaded\""));
+        assert!(log.contains("\"index_tokens\""));
+        assert!(log.contains("\"topic_count\":0"));
     }
 
     #[tokio::test]

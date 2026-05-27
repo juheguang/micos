@@ -1,6 +1,7 @@
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
+use crate::memory::ProjectMemory;
 use crate::prompt::PromptBuild;
 use crate::session::SESSION_DIR;
 use crate::session_replay::SessionResumeReport;
@@ -22,6 +23,7 @@ pub enum SlashCommand {
     Context,
     Compact,
     Resume,
+    Memory,
     Model,
     Clear,
     Exit,
@@ -84,6 +86,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "resume",
         description: "restore model-visible context from a session",
         command: SlashCommand::Resume,
+    },
+    SlashCommandInfo {
+        name: "memory",
+        description: "show project memory index and topics",
+        command: SlashCommand::Memory,
     },
     SlashCommandInfo {
         name: "model",
@@ -403,6 +410,36 @@ pub fn format_resume_report(report: &SessionResumeReport) -> String {
     .join("\n")
 }
 
+pub fn format_memory(memory: &ProjectMemory) -> String {
+    let mut output = vec![
+        "project memory".to_string(),
+        format!("root: {}", memory.root.display()),
+        format!("index: {}", memory.index_path.display()),
+        format!("index tokens: {}", format_tokens(memory.index_tokens)),
+        format!("topics: {}", memory.topics.len()),
+    ];
+    if memory.topics.is_empty() {
+        output.push("topic list: none".into());
+    } else {
+        output.push("topic list:".into());
+        for topic in &memory.topics {
+            output.push(format!(
+                "  {:<24} {:<40} {} bytes",
+                topic.file_name, topic.title, topic.bytes
+            ));
+        }
+    }
+    output.push("usage: /memory index | /memory <topic-file.md>".into());
+    output.join("\n")
+}
+
+pub fn format_memory_index(memory: &ProjectMemory) -> String {
+    memory
+        .active_index_text()
+        .unwrap_or("Project memory index is empty.")
+        .to_string()
+}
+
 fn trim_one_line(text: &str, max_chars: usize) -> String {
     let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() > max_chars {
@@ -615,6 +652,10 @@ mod tests {
             invocation(SlashCommand::Resume, "019e6367-bb0e-7ec0-9243-1ac2f75295c4")
         );
         assert_eq!(
+            parse_input("/memory build.md"),
+            invocation(SlashCommand::Memory, "build.md")
+        );
+        assert_eq!(
             parse_input("/missing"),
             InputCommand::UnknownSlash("/missing".into())
         );
@@ -639,6 +680,7 @@ mod tests {
                 "context",
                 "compact",
                 "resume",
+                "memory",
                 "model",
                 "clear",
                 "exit"
@@ -757,6 +799,29 @@ mod tests {
         assert!(output.contains("restore mode: compact_summary_tail"));
         assert!(output.contains("restored messages: 3"));
         assert!(output.contains("estimated tokens: 1.2k"));
+    }
+
+    #[test]
+    fn formats_project_memory() {
+        let memory = ProjectMemory {
+            root: std::path::PathBuf::from(".micos/memory"),
+            index_path: std::path::PathBuf::from(".micos/memory/MEMORY.md"),
+            index_text: "# Facts\nUse cargo test.".into(),
+            index_tokens: 6,
+            topics: vec![crate::memory::MemoryTopic {
+                file_name: "build.md".into(),
+                path: std::path::PathBuf::from(".micos/memory/topics/build.md"),
+                title: "Build".into(),
+                bytes: 20,
+            }],
+            created_index: false,
+        };
+
+        let overview = format_memory(&memory);
+        assert!(overview.contains("project memory"));
+        assert!(overview.contains("build.md"));
+        assert!(overview.contains("Build"));
+        assert_eq!(format_memory_index(&memory), "# Facts\nUse cargo test.");
     }
 
     #[test]

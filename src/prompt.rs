@@ -1,7 +1,7 @@
 use crate::config::{ApiKind, PermissionMode, SessionConfig};
 use crate::context::estimate_text_tokens;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Default)]
@@ -20,6 +20,15 @@ impl PromptBuilder {
             "runtime",
             runtime.body(),
         ));
+
+        if let Some(memory) = runtime.project_memory.as_ref() {
+            sections.push(PromptSectionView::new(
+                "project_memory",
+                "Project memory",
+                memory.source.display().to_string(),
+                memory.text.clone(),
+            ));
+        }
 
         if let Some(append) = config.append_system_prompt.as_deref() {
             let append = append.trim();
@@ -104,6 +113,13 @@ pub struct PromptRuntimeContext {
     pub permission: PermissionMode,
     pub context_window_tokens: usize,
     pub current_date: String,
+    pub project_memory: Option<PromptMemoryIndex>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptMemoryIndex {
+    pub source: PathBuf,
+    pub text: String,
 }
 
 impl PromptRuntimeContext {
@@ -115,7 +131,20 @@ impl PromptRuntimeContext {
             permission: config.permission,
             context_window_tokens: config.context_window_tokens,
             current_date: OffsetDateTime::now_utc().date().to_string(),
+            project_memory: None,
         }
+    }
+
+    pub fn with_project_memory(
+        mut self,
+        source: impl AsRef<Path>,
+        text: impl Into<String>,
+    ) -> Self {
+        self.project_memory = Some(PromptMemoryIndex {
+            source: source.as_ref().to_path_buf(),
+            text: text.into(),
+        });
+        self
     }
 
     fn body(&self) -> String {
@@ -228,7 +257,11 @@ mod tests {
     #[test]
     fn prompt_sections_keep_stable_order() {
         let config = config(None);
-        let build = PromptBuilder::build(&config, &runtime(&config));
+        let runtime = runtime(&config).with_project_memory(
+            "/tmp/micos/.micos/memory/MEMORY.md",
+            "# Repo Facts\nUse tests.",
+        );
+        let build = PromptBuilder::build(&config, &runtime);
         let prompt = build.instructions;
         let expected = [
             "## Identity",
@@ -239,6 +272,7 @@ mod tests {
             "## Verification",
             "## Reporting style",
             "## Runtime context",
+            "## Project memory",
         ];
         let positions = expected
             .iter()
@@ -246,7 +280,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(build.sections[0].id, "identity");
-        assert_eq!(build.sections.last().unwrap().id, "runtime");
+        assert_eq!(build.sections.last().unwrap().id, "project_memory");
         assert!(prompt.contains("Read relevant files before changing code"));
         assert!(prompt.contains("Do not overwrite or revert user changes"));
         assert!(prompt.contains("Do not claim tests, builds, or checks passed"));
@@ -254,18 +288,22 @@ mod tests {
         assert!(prompt.contains("For long tasks, keep the current goal"));
         assert!(prompt.contains("cwd: /tmp/micos"));
         assert!(prompt.contains("current date: 2026-05-27"));
+        assert!(prompt.contains("# Repo Facts"));
     }
 
     #[test]
     fn append_system_prompt_adds_to_base_prompt() {
         let config = config(Some("Prefer short answers.".into()));
-        let build = PromptBuilder::build(&config, &runtime(&config));
+        let runtime =
+            runtime(&config).with_project_memory("/tmp/micos/.micos/memory/MEMORY.md", "# Facts");
+        let build = PromptBuilder::build(&config, &runtime);
         let prompt = build.instructions;
         assert!(prompt.contains("## Identity"));
+        assert!(prompt.contains("## Project memory"));
         assert!(prompt.contains("## Project additional instructions"));
         assert!(prompt.contains("Prefer short answers."));
         assert!(
-            prompt.find("## Runtime context").unwrap()
+            prompt.find("## Project memory").unwrap()
                 < prompt.find("Prefer short answers.").unwrap()
         );
         assert_eq!(build.sections.last().unwrap().id, "project_append");

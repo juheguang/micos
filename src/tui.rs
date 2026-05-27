@@ -4,9 +4,10 @@ use crate::model::OpenAiModelClient;
 use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
-    format_compact_report, format_context, format_help, format_prompt, format_resume_report,
-    format_sessions, format_status, format_summary, format_trace, format_transcript, AgentEvent,
-    ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
+    format_compact_report, format_context, format_help, format_memory, format_memory_index,
+    format_prompt, format_resume_report, format_sessions, format_status, format_summary,
+    format_trace, format_transcript, AgentEvent, ApprovalDecision, SlashCommand, SlashInvocation,
+    UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -576,6 +577,37 @@ impl TuiUi {
                             MessageKind::Warning,
                             "/resume",
                             format!("resume failed: {error}"),
+                        ),
+                    }
+                }
+            }
+            SlashCommand::Memory => {
+                let agent = self.agent.as_ref().expect("agent checked above");
+                let Some(memory) = agent.project_memory() else {
+                    self.push_message(
+                        MessageKind::Warning,
+                        "/memory",
+                        "project memory is not loaded",
+                    );
+                    return Ok(true);
+                };
+                if invocation.args.is_empty() {
+                    self.push_message(MessageKind::System, "/memory", format_memory(memory));
+                } else if invocation.args == "index" {
+                    self.push_message(
+                        MessageKind::System,
+                        "/memory index",
+                        format_memory_index(memory),
+                    );
+                } else {
+                    match memory.read_topic(&invocation.args) {
+                        Ok(topic) => {
+                            self.push_message(MessageKind::System, "/memory", topic);
+                        }
+                        Err(error) => self.push_message(
+                            MessageKind::Warning,
+                            "/memory",
+                            format!("memory failed: {error}"),
                         ),
                     }
                 }

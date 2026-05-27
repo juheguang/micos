@@ -75,6 +75,14 @@ pub enum SessionEvent {
         restored_tail_messages: usize,
         estimated_tokens: usize,
     },
+    MemoryLoaded {
+        timestamp: String,
+        root: PathBuf,
+        index_path: PathBuf,
+        index_tokens: usize,
+        topic_count: usize,
+        created_index: bool,
+    },
     ContextSnapshot {
         timestamp: String,
         model: String,
@@ -301,6 +309,26 @@ mod tests {
         assert_eq!(value["used_summary"], true);
         assert_eq!(value["restored_tail_messages"], 8);
         assert_eq!(value["estimated_tokens"], 123);
+    }
+
+    #[test]
+    fn memory_loaded_event_serializes_with_expected_fields() {
+        let event = SessionEvent::MemoryLoaded {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            root: PathBuf::from(".micos/memory"),
+            index_path: PathBuf::from(".micos/memory/MEMORY.md"),
+            index_tokens: 42,
+            topic_count: 2,
+            created_index: true,
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "memory_loaded");
+        assert_eq!(value["root"], ".micos/memory");
+        assert_eq!(value["index_path"], ".micos/memory/MEMORY.md");
+        assert_eq!(value["index_tokens"], 42);
+        assert_eq!(value["topic_count"], 2);
+        assert_eq!(value["created_index"], true);
     }
 
     #[test]

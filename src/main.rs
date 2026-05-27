@@ -4,8 +4,9 @@ use micos::agent::Agent;
 use micos::config::{
     resolve_api_key, ConfigOverrides, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode,
 };
+use micos::memory::ProjectMemory;
 use micos::model::{ModelClient, OpenAiModelClient};
-use micos::session::{Session, StopReason};
+use micos::session::{now, Session, SessionEvent, StopReason};
 use micos::tui;
 use micos::ui::{parse_input, ConsoleUi, InputCommand, SlashCommand, SlashInvocation};
 use rustyline::error::ReadlineError;
@@ -133,6 +134,16 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
     let api_key = resolve_api_key()?;
     let client = OpenAiModelClient::new(api_key, config.api_kind, config.base_url.clone());
     let mut agent = Agent::new(config, client, session);
+    match ProjectMemory::load_or_init(&agent.config().cwd) {
+        Ok(memory) => agent.install_project_memory(memory)?,
+        Err(error) => {
+            agent.session().append(&SessionEvent::Error {
+                timestamp: now(),
+                message: format!("load project memory failed: {error}"),
+            })?;
+            return Err(error);
+        }
+    }
     let initial_resume_report = if let Some(target) = args.resume.as_deref() {
         Some(agent.resume_session(target)?)
     } else {
@@ -252,6 +263,28 @@ async fn handle_console_slash<C: ModelClient>(
                     Ok(report) => ui.print_resume_report(&report),
                     Err(error) => eprintln!("resume failed: {error}"),
                 }
+            }
+        }
+        SlashCommand::Memory => {
+            if invocation.args.is_empty() {
+                if let Some(memory) = agent.project_memory() {
+                    ui.print_memory(memory);
+                } else {
+                    eprintln!("project memory is not loaded");
+                }
+            } else if invocation.args == "index" {
+                if let Some(memory) = agent.project_memory() {
+                    ui.print_memory_index(memory);
+                } else {
+                    eprintln!("project memory is not loaded");
+                }
+            } else if let Some(memory) = agent.project_memory() {
+                match memory.read_topic(&invocation.args) {
+                    Ok(topic) => println!("{topic}"),
+                    Err(error) => eprintln!("memory failed: {error}"),
+                }
+            } else {
+                eprintln!("project memory is not loaded");
             }
         }
         SlashCommand::Model => {

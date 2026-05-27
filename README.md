@@ -120,6 +120,7 @@ REPL 支持常用 slash commands：
 - `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
 - `/resume <session-id-or-path>`：从旧 session JSONL 恢复当前运行时 model-visible context。
+- `/memory`：显示项目本地 memory index 和 topic 列表。
 - `/model`：在 TUI 模式中选择模型和思考设置。
 - `/clear`：清屏。
 - `/exit`：退出。
@@ -214,6 +215,25 @@ cargo run -- chat --resume <session-id-or-path>
 resume 会读取 `.micos/sessions/*.jsonl`，重建当前运行时的 model-visible transcript。若旧 session 有成功 compact，则优先恢复 `compacted summary + retained tail`；否则从 `user_input`、`assistant_text`、`tool_call` 和 `tool_output` 事件重建 transcript。`context_snapshot`、`permission_decision`、trace/report 和 stop 事件不会进入 model-visible context。
 
 resume 不会重放工具，也不会修改旧 session JSONL；它会在当前新 session 中写入 `session_resumed`，字段包含 `timestamp`、`source_session_id`、`source_path`、`restored_messages`、`used_summary`、`restored_tail_messages`、`estimated_tokens`。
+
+## Project Memory
+
+每次 `chat` 启动时，`micos` 会初始化项目本地 memory：
+
+```text
+.micos/memory/MEMORY.md
+.micos/memory/topics/*.md
+```
+
+`.micos/` 默认由 `.gitignore` 忽略，因此这层 memory 是当前 checkout 的本地运行态。`MEMORY.md` 用于稳定项目事实、约定、常见失败和 runbook；如果它不是空模板，会作为 `Project memory` prompt section 注入每次模型请求。topic 文件不会自动进入上下文，只能按需查看。
+
+REPL/TUI 支持：
+
+- `/memory`：显示 memory root、index、token 估算和 topic 列表。
+- `/memory index`：显示完整 `MEMORY.md`。
+- `/memory <topic-file.md>`：读取 `.micos/memory/topics/` 下的单个 topic 文件；路径逃逸会被拒绝。
+
+session JSONL 会在启动时写入 `memory_loaded`，字段包含 `timestamp`、`root`、`index_path`、`index_tokens`、`topic_count`、`created_index`。
 
 ## Model-visible 工具输出
 

@@ -109,10 +109,11 @@ base prompt
 
 ### 0.4.1 Project Memory
 
-- 新增 `.micos/memory/MEMORY.md`，作为项目级 memory index。
-- 新增 `.micos/memory/topics/*.md`，承载详细主题笔记。
-- 启动时只加载 memory index，topic 文件按需读取。
-- 新增 `/memory` 查看 memory index、topic 列表和 stale/source metadata。
+- 已新增 `.micos/memory/MEMORY.md`，作为项目级 memory index。
+- 已新增 `.micos/memory/topics/*.md`，承载详细主题笔记。
+- 启动时只把非模板 memory index 注入 prompt，topic 文件按需读取。
+- 已新增 `/memory`、`/memory index`、`/memory <topic-file.md>`。
+- 已新增 `memory_loaded` session event。
 
 ### 0.4.2 Active Plan / Handoff
 
