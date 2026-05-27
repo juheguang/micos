@@ -487,18 +487,6 @@ where
 {
     fn on_event(&mut self, event: AgentEvent) -> Result<()> {
         match &event {
-            AgentEvent::AssistantDelta { text } => {
-                self.session.append(&SessionEvent::AssistantDelta {
-                    timestamp: now(),
-                    text: text.clone(),
-                })?;
-            }
-            AgentEvent::ReasoningDelta { text } => {
-                self.session.append(&SessionEvent::ReasoningDelta {
-                    timestamp: now(),
-                    text: text.clone(),
-                })?;
-            }
             AgentEvent::Error { message } => {
                 self.session.append(&SessionEvent::Error {
                     timestamp: now(),
@@ -755,6 +743,8 @@ mod tests {
         assert!(log.contains("\"decision\":\"allow\""));
         assert!(log.contains("\"reason\":\"tool\""));
         assert!(log.contains("\"type\":\"tool_output\""));
+        assert!(log.contains("\"type\":\"assistant_text\""));
+        assert!(!log.contains("\"type\":\"assistant_delta\""));
         assert!(log.contains("\"reason\":\"final_answer\""));
     }
 
