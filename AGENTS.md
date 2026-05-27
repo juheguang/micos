@@ -29,6 +29,14 @@ Follow the formatter and linter once introduced. Until then, use consistent inde
 
 Use lowercase, hyphenated names for documentation and asset files, for example `docs/api-overview.md`. Use native language conventions for source files, classes, functions, and tests.
 
+## Rust Architecture Guidelines
+
+Treat `micos` as a minimal agent harness with explicit runtime boundaries. Keep model providers, tool execution, permission policy, session persistence, CLI wiring, and UI rendering in separate modules with small public surfaces.
+
+Prefer typed interfaces over shared mutable state: use traits for replaceable dependencies such as model providers, tool registries, permission policies, and session stores; use enums for finite runtime states and stop reasons; use structs for data that crosses module boundaries. Add generics when they make a dependency swappable in tests or future harness extensions.
+
+Avoid collecting unrelated behavior in a single large file. When adding functionality, place it in the closest existing subsystem module, and introduce a new submodule when the behavior has its own lifecycle, tests, or ownership boundary.
+
 ## Testing Guidelines
 
 Add tests with every behavioral change. Keep test files close to the behavior they verify, either under `tests/` with matching paths or in Rust module test blocks next to the implementation.
@@ -44,3 +52,7 @@ Pull requests should include a concise description, reason for the change, test 
 ## Security & Configuration Tips
 
 Keep secrets out of the repository. Use ignored local environment files for credentials, and provide checked-in examples such as `.env.example` when configuration is required. This project is MIT licensed; preserve the license notice in substantial redistributed portions.
+
+## Project Documentation
+
+Use [docs/README.md](docs/README.md) as the entry point for project docs, roadmap notes, and durable context pointers.

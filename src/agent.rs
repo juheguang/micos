@@ -1,8 +1,9 @@
 use crate::config::{ModelSettings, SessionConfig, ThinkingMode};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
-use crate::session::{now, Session, SessionEvent, StopReason};
+use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::tools::{
-    permission_decision, BuiltinTool, Tool, ToolContext, ToolPermissionDecision, ToolResult,
+    BuiltinToolRegistry, ModePermissionPolicy, PermissionPolicy, ToolContext,
+    ToolPermissionDecision, ToolRegistry, ToolResult,
 };
 #[cfg(test)]
 use crate::ui::NullUi;
@@ -12,25 +13,56 @@ use serde_json::{json, Value};
 use std::time::Instant;
 use uuid::Uuid;
 
-pub struct Agent<C> {
+pub type Agent<C> = AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy>;
+
+pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermissionPolicy> {
     config: SessionConfig,
     client: C,
-    session: Session,
-    tools: Vec<BuiltinTool>,
+    session: R,
+    tools: T,
+    permission_policy: P,
     transcript: Vec<Value>,
 }
 
-impl<C: ModelClient> Agent<C> {
+impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
     pub fn new(config: SessionConfig, client: C, session: Session) -> Self {
         Self {
             config,
             client,
             session,
-            tools: BuiltinTool::all(),
+            tools: BuiltinToolRegistry::default(),
+            permission_policy: ModePermissionPolicy,
             transcript: Vec::new(),
         }
     }
+}
 
+impl<C, R, T, P> AgentRuntime<C, R, T, P> {
+    pub fn with_parts(
+        config: SessionConfig,
+        client: C,
+        session: R,
+        tools: T,
+        permission_policy: P,
+    ) -> Self {
+        Self {
+            config,
+            client,
+            session,
+            tools,
+            permission_policy,
+            transcript: Vec::new(),
+        }
+    }
+}
+
+impl<C, R, T, P> AgentRuntime<C, R, T, P>
+where
+    C: ModelClient,
+    R: SessionStore + Sync,
+    T: ToolRegistry,
+    P: PermissionPolicy,
+{
     pub fn config(&self) -> &SessionConfig {
         &self.config
     }
@@ -40,7 +72,7 @@ impl<C: ModelClient> Agent<C> {
     }
 
     pub fn session_path(&self) -> &std::path::Path {
-        self.session.path()
+        self.session.path().as_path()
     }
 
     pub async fn stop(&self, reason: StopReason) -> Result<()> {
@@ -85,7 +117,7 @@ impl<C: ModelClient> Agent<C> {
             let request = ModelRequest {
                 model: self.config.model.clone(),
                 input: self.transcript.clone(),
-                tools: self.tools.iter().map(Tool::schema).collect(),
+                tools: self.tools.schemas(),
                 instructions: system_instructions(),
                 parallel_tool_calls: false,
                 thinking: self.config.thinking.map(|value| value.to_string()),
@@ -241,11 +273,10 @@ impl<C: ModelClient> Agent<C> {
         arguments: Value,
         ui: &mut S,
     ) -> ToolResult {
-        let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
-            return ToolResult::error(format!("unknown tool: {name}"));
-        };
-
-        match permission_decision(self.config.permission, name, &arguments) {
+        match self
+            .permission_policy
+            .decide(self.config.permission, name, &arguments)
+        {
             ToolPermissionDecision::Allowed => {}
             ToolPermissionDecision::NeedsApproval { summary } => {
                 match ui.approve_tool(name, &summary) {
@@ -257,18 +288,23 @@ impl<C: ModelClient> Agent<C> {
             ToolPermissionDecision::Denied { reason } => return ToolResult::denied(reason),
         }
 
-        tool.execute(
-            arguments,
-            ToolContext {
-                cwd: self.config.cwd.clone(),
-                permission: self.config.permission,
-            },
-        )
-        .await
+        self.tools
+            .execute(
+                name,
+                arguments,
+                ToolContext {
+                    cwd: self.config.cwd.clone(),
+                    permission: self.config.permission,
+                },
+            )
+            .await
     }
 }
 
-impl Agent<OpenAiModelClient> {
+impl<R, T, P> AgentRuntime<OpenAiModelClient, R, T, P>
+where
+    R: SessionStore,
+{
     pub fn apply_model_settings(&mut self, settings: ModelSettings) -> Result<()> {
         self.config.apply_model_settings(&settings);
         self.client
@@ -283,12 +319,16 @@ impl Agent<OpenAiModelClient> {
     }
 }
 
-struct SessionRecordingUi<'a, S> {
-    session: &'a Session,
+struct SessionRecordingUi<'a, R, S> {
+    session: &'a R,
     inner: &'a mut S,
 }
 
-impl<S: UiSink> UiSink for SessionRecordingUi<'_, S> {
+impl<R, S> UiSink for SessionRecordingUi<'_, R, S>
+where
+    R: SessionStore,
+    S: UiSink,
+{
     fn on_event(&mut self, event: AgentEvent) -> Result<()> {
         match &event {
             AgentEvent::AssistantDelta { text } => {

@@ -17,6 +17,12 @@ pub struct Session {
     path: PathBuf,
 }
 
+pub trait SessionStore {
+    fn id(&self) -> Uuid;
+    fn path(&self) -> &PathBuf;
+    fn append(&self, event: &SessionEvent) -> Result<()>;
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -164,6 +170,20 @@ impl Session {
         serde_json::to_writer(&mut file, event).context("serialize session event")?;
         file.write_all(b"\n").context("write session event")?;
         Ok(())
+    }
+}
+
+impl SessionStore for Session {
+    fn id(&self) -> Uuid {
+        self.id()
+    }
+
+    fn path(&self) -> &PathBuf {
+        self.path()
+    }
+
+    fn append(&self, event: &SessionEvent) -> Result<()> {
+        self.append(event)
     }
 }
 

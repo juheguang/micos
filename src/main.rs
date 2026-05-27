@@ -1,24 +1,17 @@
-mod agent;
-mod config;
-mod model;
-mod session;
-mod tools;
-mod tui;
-mod ui;
-
-use agent::Agent;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use config::{
+use micos::agent::Agent;
+use micos::config::{
     resolve_api_key, ConfigOverrides, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode,
 };
-use model::{ModelClient, OpenAiModelClient};
+use micos::model::{ModelClient, OpenAiModelClient};
+use micos::session::{Session, StopReason};
+use micos::tui;
+use micos::ui::{parse_input, ConsoleUi, InputCommand, SlashCommand};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use session::{Session, StopReason};
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
-use ui::{parse_input, ConsoleUi, InputCommand, SlashCommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "micos", version, about = "A minimal local agent harness")]

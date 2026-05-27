@@ -1,0 +1,122 @@
+use crate::config::PermissionMode;
+use serde_json::Value;
+use std::path::PathBuf;
+
+#[allow(async_fn_in_trait)]
+pub trait Tool {
+    fn name(&self) -> &'static str;
+    fn schema(&self) -> Value;
+    async fn execute(&self, input: Value, ctx: ToolContext) -> ToolResult;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ToolRegistry {
+    fn schemas(&self) -> Vec<Value>;
+    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> ToolResult;
+}
+
+pub trait PermissionPolicy {
+    fn decide(
+        &self,
+        permission: PermissionMode,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> ToolPermissionDecision;
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolContext {
+    pub cwd: PathBuf,
+    pub permission: PermissionMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolResult {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+    pub denied: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolPermissionDecision {
+    Allowed,
+    NeedsApproval { summary: String },
+    Denied { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModePermissionPolicy;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolSummary {
+    pub summary: String,
+}
+
+impl ToolSummary {
+    pub fn from_arguments(name: &str, arguments: &Value) -> Self {
+        let summary = match name {
+            "list_files" => format!(
+                "path={}",
+                arguments.get("path").and_then(Value::as_str).unwrap_or(".")
+            ),
+            "read_file" => format!(
+                "path={}",
+                arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>")
+            ),
+            "write_file" => {
+                let path = arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                let bytes = arguments
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0);
+                format!("path={path} bytes={bytes}")
+            }
+            "shell" => format!(
+                "command={}",
+                arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>")
+            ),
+            _ => arguments.to_string(),
+        };
+        Self { summary }
+    }
+}
+
+impl ToolResult {
+    pub fn ok(output: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            output: output.into(),
+            error: None,
+            denied: false,
+        }
+    }
+
+    pub fn error(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            error: Some(error.into()),
+            denied: false,
+        }
+    }
+
+    pub fn denied(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            error: Some(error.into()),
+            denied: true,
+        }
+    }
+}
