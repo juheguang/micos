@@ -218,6 +218,7 @@ async fn handle_console_slash<C: ModelClient>(
         }
         SlashCommand::Sessions => ui.print_sessions(&agent.config().cwd)?,
         SlashCommand::Transcript => ui.print_transcript(agent.session_path())?,
+        SlashCommand::Trace => ui.print_trace(agent.session_path())?,
         SlashCommand::Model => {
             eprintln!("The /model picker is only available in TUI mode. Restart without --no-tui.")
         }

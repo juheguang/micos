@@ -12,6 +12,7 @@ pub enum SlashCommand {
     Status,
     Sessions,
     Transcript,
+    Trace,
     Model,
     Clear,
     Exit,
@@ -44,6 +45,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "transcript",
         description: "show current transcript and recent events",
         command: SlashCommand::Transcript,
+    },
+    SlashCommandInfo {
+        name: "trace",
+        description: "show recent tool and permission trace",
+        command: SlashCommand::Trace,
     },
     SlashCommandInfo {
         name: "model",
@@ -185,6 +191,28 @@ pub fn format_transcript(path: &Path) -> Result<String> {
     Ok(output.join("\n"))
 }
 
+pub fn format_trace(path: &Path) -> Result<String> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read trace {}", path.display()))?;
+    let lines = text
+        .lines()
+        .filter_map(summarize_trace_line)
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(format!(
+            "trace: {}\nNo trace events recorded.",
+            path.display()
+        ));
+    }
+    let mut output = vec![format!("trace: {}", path.display()), "recent trace:".into()];
+    for line in lines.into_iter().rev() {
+        output.push(format!("  {line}"));
+    }
+    Ok(output.join("\n"))
+}
+
 fn trim_one_line(text: &str, max_chars: usize) -> String {
     let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() > max_chars {
@@ -192,6 +220,10 @@ fn trim_one_line(text: &str, max_chars: usize) -> String {
         compact.push_str("...");
     }
     compact
+}
+
+fn json_summary(value: &Value, max_chars: usize) -> String {
+    trim_one_line(&value.to_string(), max_chars)
 }
 
 fn summarize_json_line(line: &str) -> String {
@@ -230,6 +262,92 @@ fn summarize_json_line(line: &str) -> String {
                 .unwrap_or("unknown")
         ),
         _ => event_type.to_string(),
+    }
+}
+
+fn summarize_trace_line(line: &str) -> Option<String> {
+    let value = match serde_json::from_str::<Value>(line) {
+        Ok(value) => value,
+        Err(_) => return Some(format!("unparsed: {}", trim_one_line(line, 180))),
+    };
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("event");
+    match event_type {
+        "tool_call" => Some(format!(
+            "tool_call: {} args={}",
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value
+                .get("arguments")
+                .map(|arguments| json_summary(arguments, 120))
+                .unwrap_or_else(|| "{}".into())
+        )),
+        "permission_decision" => Some(format!(
+            "permission_decision: {} {} decision={} reason={} source={} mode={} elapsed={}ms",
+            value
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            trim_one_line(
+                value
+                    .get("argument_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                80
+            ),
+            value
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value
+                .get("rule_source")
+                .and_then(Value::as_str)
+                .unwrap_or("none"),
+            value
+                .get("permission_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0)
+        )),
+        "tool_finished" => Some(format!(
+            "tool_finished: {} success={} elapsed={}ms",
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0)
+        )),
+        "permission_denied" => Some(format!(
+            "permission_denied: {} reason={}",
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            trim_one_line(
+                value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("denied"),
+                120
+            )
+        )),
+        "stop" => Some(format!(
+            "stop: {}",
+            value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )),
+        _ => None,
     }
 }
 
@@ -276,6 +394,7 @@ mod tests {
                 "status",
                 "sessions",
                 "transcript",
+                "trace",
                 "model",
                 "clear",
                 "exit"
@@ -291,5 +410,50 @@ mod tests {
             vec!["status"]
         );
         assert!(slash_command_matches("/missing").is_empty());
+    }
+
+    #[test]
+    fn formats_trace_events() {
+        let path = std::env::temp_dir().join(format!("micos-trace-{}.jsonl", Uuid::new_v4()));
+        fs::write(
+            &path,
+            r#"{"type":"user_input","text":"ignored"}
+{"type":"tool_call","call_id":"call_1","name":"shell","arguments":{"command":"rm -rf x"}}
+{"type":"permission_decision","call_id":"call_1","tool":"shell","argument_summary":"rm -rf x","decision":"deny","reason":"rule","rule_source":"config","permission_mode":"safe","elapsed_ms":2}
+{"type":"tool_finished","call_id":"call_1","name":"shell","success":false,"elapsed_ms":3}
+{"type":"permission_denied","call_id":"call_1","name":"shell","reason":"denied by rule"}
+{"type":"stop","reason":"tool_denied"}
+"#,
+        )
+        .unwrap();
+
+        let output = format_trace(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(output.contains("trace:"));
+        assert!(output.contains("tool_call: shell"));
+        assert!(output.contains("permission_decision: shell rm -rf x decision=deny"));
+        assert!(output.contains("source=config"));
+        assert!(output.contains("permission_denied: shell reason=denied by rule"));
+        assert!(output.contains("stop: tool_denied"));
+        assert!(!output.contains("call_1"));
+        assert!(!output.contains("user_input"));
+    }
+
+    #[test]
+    fn formats_empty_and_malformed_trace() {
+        let empty_path =
+            std::env::temp_dir().join(format!("micos-empty-trace-{}.jsonl", Uuid::new_v4()));
+        fs::write(&empty_path, "").unwrap();
+        let empty = format_trace(&empty_path).unwrap();
+        fs::remove_file(&empty_path).unwrap();
+        assert!(empty.contains("No trace events recorded."));
+
+        let malformed_path =
+            std::env::temp_dir().join(format!("micos-bad-trace-{}.jsonl", Uuid::new_v4()));
+        fs::write(&malformed_path, "not json\n").unwrap();
+        let malformed = format_trace(&malformed_path).unwrap();
+        fs::remove_file(&malformed_path).unwrap();
+        assert!(malformed.contains("unparsed: not json"));
     }
 }

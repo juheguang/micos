@@ -5,6 +5,7 @@ This directory is the stable entry point for project docs, roadmap notes, and du
 ## Core Index
 
 - [Harness roadmap](./harness-roadmap.md): next-phase plan for tool permissions, context governance, memory, recovery, evals, multi-agent work, hooks, MCP, and TUI/operator control.
+- [Claude Code 权限与 Trace 调研](./claude-code-policy-trace-research.md): 面向 v0.3.1 的 permission policy 与 trace foundation 实现调研。
 - [Project memory](./project-memory.md): compact pointer file for durable repository context.
 - [What is harness](./what%20is%20harness/): local background material on harness engineering.
 

@@ -1,4 +1,7 @@
-use super::{format_help, format_sessions, format_status, format_transcript, AgentEvent, UiSink};
+use super::{
+    format_help, format_sessions, format_status, format_trace, format_transcript, AgentEvent,
+    UiSink,
+};
 use crate::config::SessionConfig;
 use crate::session::StopReason;
 use crate::tools::{ToolResult, ToolSummary};
@@ -96,6 +99,11 @@ impl ConsoleUi {
 
     pub fn print_transcript(&mut self, path: &Path) -> Result<()> {
         println!("{}", format_transcript(path)?);
+        Ok(())
+    }
+
+    pub fn print_trace(&mut self, path: &Path) -> Result<()> {
+        println!("{}", format_trace(path)?);
         Ok(())
     }
 
