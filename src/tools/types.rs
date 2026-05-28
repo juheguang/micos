@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 #[allow(async_fn_in_trait)]
 pub trait Tool {
@@ -64,6 +65,7 @@ pub trait PermissionPolicy {
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub permission: PermissionMode,
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,7 +75,6 @@ pub enum ToolErrorKind {
     Io,
     Parse,
     Permission,
-    ProcessExit,
     Utf8,
     Unknown,
 }

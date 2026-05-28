@@ -2,8 +2,8 @@ use crate::config::{
     ModelSettings, ReasoningEffort, ThinkingMode, DEEPSEEK_CHAT_COMPLETIONS_BASE_URL,
 };
 use crate::ui::{
-    parse_input, slash_command_matches, ApprovalDecision, InputCommand, SessionChoice,
-    SlashCommand, SlashCommandInfo, SlashInvocation,
+    parse_input, slash_command_matches, ApprovalDecision, InputCommand, PlanApprovalDecision,
+    SessionChoice, SlashCommand, SlashCommandInfo, SlashInvocation,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::mpsc as std_mpsc;
@@ -13,6 +13,8 @@ use unicode_width::UnicodeWidthStr;
 pub(super) struct ApprovalPickerState {
     selected: usize,
     response: Option<std_mpsc::Sender<ApprovalDecision>>,
+    plan_response: Option<std_mpsc::Sender<PlanApprovalDecision>>,
+    option_count: usize,
 }
 
 impl ApprovalPickerState {
@@ -20,20 +22,39 @@ impl ApprovalPickerState {
         Self {
             selected: 0,
             response: Some(response),
+            plan_response: None,
+            option_count: 4,
         }
+    }
+
+    pub(super) fn new_plan(response: std_mpsc::Sender<PlanApprovalDecision>) -> Self {
+        Self {
+            selected: 0,
+            response: None,
+            plan_response: Some(response),
+            option_count: 3,
+        }
+    }
+
+    pub(super) fn is_plan_mode(&self) -> bool {
+        self.plan_response.is_some()
     }
 
     pub(super) fn selected(&self) -> usize {
         self.selected
     }
 
+    pub(super) fn option_count(&self) -> usize {
+        self.option_count
+    }
+
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> ApprovalAction {
         match key.code {
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                 self.selected = if matches!(key.code, KeyCode::Up | KeyCode::Left) {
-                    self.selected.checked_sub(1).unwrap_or(3)
+                    self.selected.checked_sub(1).unwrap_or(self.option_count - 1)
                 } else {
-                    (self.selected + 1) % 4
+                    (self.selected + 1) % self.option_count
                 };
                 ApprovalAction::None
             }
@@ -60,6 +81,12 @@ impl ApprovalPickerState {
         }
     }
 
+    pub(super) fn send_plan_decision(&mut self, decision: PlanApprovalDecision) {
+        if let Some(response) = self.plan_response.take() {
+            let _ = response.send(decision);
+        }
+    }
+
     fn selected_decision(&self) -> ApprovalDecision {
         match self.selected {
             0 => ApprovalDecision::AllowSession,
@@ -73,6 +100,7 @@ impl ApprovalPickerState {
 impl Drop for ApprovalPickerState {
     fn drop(&mut self) {
         self.send(ApprovalDecision::Deny);
+        self.send_plan_decision(PlanApprovalDecision::Approve);
     }
 }
 
@@ -150,8 +178,7 @@ impl ComposerState {
         }
     }
 
-    #[cfg(test)]
-    pub fn buffer(&self) -> &str {
+    pub(super) fn buffer(&self) -> &str {
         &self.buffer
     }
 
@@ -385,12 +412,19 @@ impl ComposerState {
         };
     }
 
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
         self.popup_open = false;
         self.popup_dismissed = false;
         self.selected = 0;
+    }
+
+    pub(super) fn restore_text(&mut self, text: String) {
+        self.buffer = text;
+        self.cursor = self.buffer.len();
+        self.popup_open = false;
+        self.popup_dismissed = false;
     }
 
     fn refresh_popup(&mut self) {

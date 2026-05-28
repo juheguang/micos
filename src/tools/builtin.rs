@@ -30,6 +30,12 @@ pub enum BuiltinTool {
     Grep,
     Edit,
     Glob,
+    EnterPlanMode,
+    ExitPlanMode,
+    TaskCreate,
+    TaskGet,
+    TaskUpdate,
+    TaskList,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +53,12 @@ impl BuiltinTool {
             Self::Grep,
             Self::Edit,
             Self::Glob,
+            Self::EnterPlanMode,
+            Self::ExitPlanMode,
+            Self::TaskCreate,
+            Self::TaskGet,
+            Self::TaskUpdate,
+            Self::TaskList,
         ]
     }
 }
@@ -124,6 +136,12 @@ impl Tool for BuiltinTool {
             BuiltinTool::Grep => "grep",
             BuiltinTool::Edit => "edit",
             BuiltinTool::Glob => "glob",
+            BuiltinTool::EnterPlanMode => "enter_plan_mode",
+            BuiltinTool::ExitPlanMode => "exit_plan_mode",
+            BuiltinTool::TaskCreate => "task_create",
+            BuiltinTool::TaskGet => "task_get",
+            BuiltinTool::TaskUpdate => "task_update",
+            BuiltinTool::TaskList => "task_list",
         }
     }
 
@@ -132,7 +150,14 @@ impl Tool for BuiltinTool {
             BuiltinTool::ListFiles
             | BuiltinTool::ReadFile
             | BuiltinTool::Grep
-            | BuiltinTool::Glob => (true, false, true, PermissionDecision::Allow),
+            | BuiltinTool::Glob
+            | BuiltinTool::EnterPlanMode
+            | BuiltinTool::ExitPlanMode
+            | BuiltinTool::TaskGet
+            | BuiltinTool::TaskList => (true, false, true, PermissionDecision::Allow),
+            BuiltinTool::TaskCreate | BuiltinTool::TaskUpdate => {
+                (false, false, false, PermissionDecision::Allow)
+            }
             BuiltinTool::WriteFile | BuiltinTool::Edit => {
                 (false, true, false, PermissionDecision::Ask)
             }
@@ -268,6 +293,87 @@ impl Tool for BuiltinTool {
                 },
                 "strict": false
             }),
+            BuiltinTool::EnterPlanMode => json!({
+                "type": "function",
+                "name": "enter_plan_mode",
+                "description": "Switch to plan mode, restricting to read-only exploration. Use when asked to plan before implementing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
+            BuiltinTool::ExitPlanMode => json!({
+                "type": "function",
+                "name": "exit_plan_mode",
+                "description": "Exit plan mode and restore the previous permission mode. Call when planning is complete.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
+            BuiltinTool::TaskCreate => json!({
+                "type": "function",
+                "name": "task_create",
+                "description": "Create a new task to track work. Use to break down a plan into concrete steps. Each task has a status: pending, in_progress, or completed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string", "description": "Brief imperative title (e.g. 'Fix login bug')"},
+                        "description": {"type": "string", "description": "What needs to be done"},
+                        "active_form": {"type": "string", "description": "Present continuous form for progress display (e.g. 'Fixing login bug')"}
+                    },
+                    "required": ["subject", "description"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
+            BuiltinTool::TaskGet => json!({
+                "type": "function",
+                "name": "task_get",
+                "description": "Get full details of a task by its ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "The task ID (e.g. '1')"}
+                    },
+                    "required": ["task_id"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
+            BuiltinTool::TaskUpdate => json!({
+                "type": "function",
+                "name": "task_update",
+                "description": "Update a task's status, subject, or description. Mark in_progress when starting work, completed when done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "The task ID"},
+                        "subject": {"type": "string", "description": "New subject (optional)"},
+                        "description": {"type": "string", "description": "New description (optional)"},
+                        "active_form": {"type": "string", "description": "New active form text (optional)"},
+                        "status": {"type": "string", "description": "New status: pending, in_progress, or completed"}
+                    },
+                    "required": ["task_id"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
+            BuiltinTool::TaskList => json!({
+                "type": "function",
+                "name": "task_list",
+                "description": "List all current tasks with their IDs, subjects, and statuses.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
         }
     }
 
@@ -288,10 +394,6 @@ impl Tool for BuiltinTool {
                 ToolExecError::Permission(msg) => {
                     ToolResult::error_with_kind(ToolErrorKind::Permission, msg)
                 }
-                ToolExecError::ProcessExit { code } => ToolResult::error_with_kind(
-                    ToolErrorKind::ProcessExit,
-                    format!("process exited with code {code:?}"),
-                ),
                 ToolExecError::Utf8(error) => {
                     ToolResult::error_with_kind(ToolErrorKind::Utf8, error.to_string())
                 }
@@ -326,10 +428,6 @@ impl Tool for BuiltinTool {
                     ToolExecError::Permission(msg) => {
                         ToolResult::error_with_kind(ToolErrorKind::Permission, msg)
                     }
-                    ToolExecError::ProcessExit { code } => ToolResult::error_with_kind(
-                        ToolErrorKind::ProcessExit,
-                        format!("process exited with code {code:?}"),
-                    ),
                     ToolExecError::Utf8(error) => {
                         ToolResult::error_with_kind(ToolErrorKind::Utf8, error.to_string())
                     }
@@ -357,6 +455,13 @@ impl BuiltinTool {
             BuiltinTool::Grep => grep(input, &ctx.cwd).await,
             BuiltinTool::Edit => edit(input, &ctx).await,
             BuiltinTool::Glob => glob(input, &ctx.cwd).await,
+            BuiltinTool::EnterPlanMode | BuiltinTool::ExitPlanMode => {
+                Ok(ToolResult::ok("handled by agent"))
+            }
+            BuiltinTool::TaskCreate
+            | BuiltinTool::TaskGet
+            | BuiltinTool::TaskUpdate
+            | BuiltinTool::TaskList => Ok(ToolResult::ok("handled by agent")),
         }
     }
 
@@ -386,8 +491,6 @@ enum ToolExecError {
     Parse(#[from] serde_json::Error),
     #[error("permission denied: {0}")]
     Permission(String),
-    #[error("process exited with code {code:?}")]
-    ProcessExit { code: Option<i32> },
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error(transparent)]
@@ -544,13 +647,24 @@ async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResul
         stderr.read_to_end(&mut buf).await.map(|_| buf)
     });
 
-    let status = match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(result) => result.context("wait for shell command")?,
-        Err(_) => {
+    let cancel = ctx.cancellation.clone();
+    let status = tokio::select! {
+        result = child.wait() => {
+            result.context("wait for shell command")?
+        }
+        _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
             let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(ToolExecError::Timeout {
                 duration_ms: timeout_ms,
             });
+        }
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(ToolExecError::Other(anyhow::anyhow!("cancelled")));
         }
     };
 
@@ -652,6 +766,7 @@ async fn shell_streaming<S: UiSink + Send>(
     let timeout_fut = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(timeout_fut);
 
+    let cancel = ctx.cancellation.clone();
     loop {
         tokio::select! {
             _ = &mut timeout_fut => {
@@ -661,6 +776,12 @@ async fn shell_streaming<S: UiSink + Send>(
                 return Err(ToolExecError::Timeout {
                     duration_ms: timeout_ms,
                 });
+            }
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(ToolExecError::Other(anyhow::anyhow!("cancelled")));
             }
             delta = delta_rx.recv() => {
                 match delta {

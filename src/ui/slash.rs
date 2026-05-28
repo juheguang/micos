@@ -35,6 +35,7 @@ pub enum SlashCommand {
     Handoff,
     Recover,
     Plan,
+    PlanMode,
     Model,
     Clear,
     Exit,
@@ -149,6 +150,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "plan",
         description: "show current active plan handoff",
         command: SlashCommand::Plan,
+    },
+    SlashCommandInfo {
+        name: "plan-mode",
+        description: "toggle plan mode on/off",
+        command: SlashCommand::PlanMode,
     },
     SlashCommandInfo {
         name: "model",
@@ -1018,6 +1024,7 @@ mod tests {
                 "handoff",
                 "recover",
                 "plan",
+                "plan-mode",
                 "model",
                 "clear",
                 "exit"
@@ -1070,6 +1077,7 @@ mod tests {
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             auto_compact: Default::default(),
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
             cwd,
         };
         let path = std::env::temp_dir().join(format!("micos-context-{}.jsonl", Uuid::new_v4()));
@@ -1118,6 +1126,7 @@ mod tests {
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: Some("Prefer concise replies.".into()),
             auto_compact: Default::default(),
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
             cwd: std::env::temp_dir(),
         };
         let runtime = crate::prompt::PromptRuntimeContext::from_config(&config);

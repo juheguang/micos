@@ -3,6 +3,37 @@ use crate::ui::{AgentEvent, UiSink};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelErrorClass {
+    ContextPressure,
+    RateLimit,
+    ServerError,
+    Fatal,
+}
+
+impl ModelErrorClass {
+    pub fn classify(error: &anyhow::Error) -> Self {
+        let msg = error.to_string();
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("prompt_too_long")
+            || lower.contains("context_length_exceeded")
+            || lower.contains("error 413")
+            || lower.contains("413")
+        {
+            Self::ContextPressure
+        } else if lower.contains("rate_limit")
+            || lower.contains("error 429")
+            || lower.contains("429")
+        {
+            Self::RateLimit
+        } else if lower.contains("error 50") || lower.contains("error 5") {
+            Self::ServerError
+        } else {
+            Self::Fatal
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait ModelClient {
     async fn respond(&self, request: ModelRequest) -> Result<ModelResponse>;
@@ -196,6 +227,63 @@ fn function_call_item_to_chat_message(item: &Value) -> Option<Value> {
             }
         }]
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_error_class_context_pressure() {
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!(
+                "Responses API error 413: request too large"
+            )),
+            ModelErrorClass::ContextPressure
+        );
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!("prompt_too_long")),
+            ModelErrorClass::ContextPressure
+        );
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!("context_length_exceeded")),
+            ModelErrorClass::ContextPressure
+        );
+    }
+
+    #[test]
+    fn model_error_class_rate_limit() {
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!(
+                "Chat Completions API error 429: rate limit"
+            )),
+            ModelErrorClass::RateLimit
+        );
+    }
+
+    #[test]
+    fn model_error_class_server_error() {
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!("Responses API error 502: Bad Gateway")),
+            ModelErrorClass::ServerError
+        );
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!("Responses API error 503: overloaded")),
+            ModelErrorClass::ServerError
+        );
+    }
+
+    #[test]
+    fn model_error_class_fatal() {
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!("401 Unauthorized")),
+            ModelErrorClass::Fatal
+        );
+        assert_eq!(
+            ModelErrorClass::classify(&anyhow::anyhow!("unknown network error")),
+            ModelErrorClass::Fatal
+        );
+    }
 }
 
 pub fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {

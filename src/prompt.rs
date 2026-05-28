@@ -39,6 +39,39 @@ impl PromptBuilder {
             ));
         }
 
+        if runtime.permission == crate::config::PermissionMode::Plan {
+            sections.push(PromptSectionView::new(
+                "plan_mode",
+                "Plan mode",
+                "plan_mode",
+                "\
+You are in plan mode — explore and design before implementing. \
+Do NOT write code or edit source files. \
+The only file you can write is .micos/plans/active.md for your plan. \
+Use read-only tools and safe shell commands to gather information.\n\
+\n\
+Work through these phases:\n\
+\n\
+Phase 1 — Initial Understanding: Explore the codebase. \
+Read relevant files to understand existing patterns, architecture, \
+and dependencies. Identify what needs to change and what depends on it.\n\
+\n\
+Phase 2 — Design: Design the implementation approach. \
+Consider edge cases, error handling, and testing. \
+Break the work into concrete, ordered tasks — use task_create \
+to define each step.\n\
+\n\
+Phase 3 — Write the plan: Write your plan to .micos/plans/active.md \
+using write_file. Write to that path ONLY. \
+Include: what files to change, the approach for each change, \
+a task list, and verification steps. Keep it concise but actionable.\n\
+\n\
+Phase 4 — Call exit_plan_mode: When the plan is complete, \
+call exit_plan_mode. The user will review your plan and can \
+approve it, request changes, or provide additional guidance.",
+            ));
+        }
+
         if let Some(append) = config.append_system_prompt.as_deref() {
             let append = append.trim();
             if !append.is_empty() {
@@ -268,9 +301,9 @@ A parse error means the arguments were malformed — check required fields and \
 types in the tool schema. \
 A non-zero process exit means the command itself failed — read stderr for \
 details and adjust the command. \
-Do not retry the same failing operation more than once without changing the \
-approach. If a tool fails twice consecutively, the turn ends with a recovery \
-report. API errors are handled by the harness — the session state is preserved.",
+Tool errors do not end the turn — you can try different approaches until the \
+problem is solved. API errors are handled by the harness — the session state \
+is preserved.",
     },
     PromptSection {
         id: "verification",
@@ -427,6 +460,7 @@ mod tests {
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt,
             auto_compact: Default::default(),
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
             cwd: PathBuf::from("/tmp/micos"),
         }
     }

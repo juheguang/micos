@@ -13,7 +13,7 @@ use crate::memory::{
     build_candidates, extraction_request, parse_extraction_output, MemoryCandidateReport,
     MemoryEntry, MemoryExtractionReport, MemoryStatus, ProjectMemory,
 };
-use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
+use crate::model::{ModelClient, ModelRequest, ModelResponse, OpenAiModelClient};
 use crate::plan::{self, ActivePlan, HandoffReport};
 use crate::prompt::{
     compact_instructions, compact_repair_instructions, PromptBuild, PromptBuilder,
@@ -29,7 +29,7 @@ use crate::tools::{
 };
 #[cfg(test)]
 use crate::ui::NullUi;
-use crate::ui::{AgentEvent, ApprovalDecision, UiSink};
+use crate::ui::{AgentEvent, ApprovalDecision, PlanApprovalDecision, UiSink};
 use crate::verify::{
     load_verification_checks, select_verification_checks, shell_exit_code, VerificationCheckReport,
     VerificationRunReport,
@@ -48,6 +48,16 @@ use std::time::Instant;
 use uuid::Uuid;
 
 pub type Agent<C> = AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionReason {
+    NextTurn,
+    AutoCompactApplied,
+    AutoCompactSkipped,
+    AutoCompactFailed,
+    MicroCompactApplied,
+    CompactRetry,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCompactReport {
@@ -73,6 +83,10 @@ pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermiss
     last_compact_at: Option<std::time::Instant>,
     last_micro_compact_at: Option<std::time::Instant>,
     consecutive_compact_failures: usize,
+    pub(crate) last_transition: Option<TransitionReason>,
+    cancellation: tokio_util::sync::CancellationToken,
+    pre_plan_mode: Option<PermissionMode>,
+    task_list: Option<crate::tasks::TaskList>,
 }
 
 impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
@@ -90,6 +104,10 @@ impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
             last_compact_at: None,
             last_micro_compact_at: None,
             consecutive_compact_failures: 0,
+            last_transition: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            pre_plan_mode: None,
+            task_list: None,
         }
     }
 }
@@ -114,6 +132,10 @@ impl<C, R, T, P> AgentRuntime<C, R, T, P> {
             last_compact_at: None,
             last_micro_compact_at: None,
             consecutive_compact_failures: 0,
+            last_transition: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            pre_plan_mode: None,
+            task_list: None,
         }
     }
 }
@@ -156,6 +178,154 @@ where
 
     pub fn context_stats(&self) -> ContextStats {
         self.build_model_context().stats
+    }
+
+    pub fn last_transition(&self) -> Option<TransitionReason> {
+        self.last_transition
+    }
+
+    pub fn set_cancellation_token(&mut self, token: tokio_util::sync::CancellationToken) {
+        self.cancellation = token;
+    }
+
+    pub fn is_plan_mode(&self) -> bool {
+        self.config.permission == PermissionMode::Plan
+    }
+
+    pub fn load_task_list(&mut self) -> Result<()> {
+        self.task_list = Some(crate::tasks::TaskList::load_or_init(&self.config.cwd)?);
+        Ok(())
+    }
+
+    fn ensure_task_list(&mut self) -> Result<&mut crate::tasks::TaskList> {
+        if self.task_list.is_none() {
+            self.task_list = Some(crate::tasks::TaskList::load_or_init(&self.config.cwd)?);
+        }
+        Ok(self.task_list.as_mut().unwrap())
+    }
+
+    fn handle_task_create(&mut self, arguments: &Value) -> ToolResult {
+        let subject = arguments
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let description = arguments
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let active_form = arguments
+            .get("active_form")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        match self.ensure_task_list() {
+            Ok(list) => {
+                match list.create(subject.to_string(), description.to_string(), active_form) {
+                    Ok(task) => {
+                        ToolResult::ok(format!("Task #{} created: {}", task.id, task.subject))
+                    }
+                    Err(e) => ToolResult::error(e.to_string()),
+                }
+            }
+            Err(e) => ToolResult::error(e.to_string()),
+        }
+    }
+
+    fn handle_task_get(&mut self, arguments: &Value) -> ToolResult {
+        let task_id = arguments
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match self.ensure_task_list() {
+            Ok(list) => match list.get(task_id) {
+                Some(task) => ToolResult::ok(format!(
+                    "#{} [{}] {}\n{}\nblocks: {}\nblocked by: {}",
+                    task.id,
+                    task.status.as_str(),
+                    task.subject,
+                    task.description,
+                    task.blocks.join(", "),
+                    task.blocked_by.join(", ")
+                )),
+                None => ToolResult::error(format!("task {task_id} not found")),
+            },
+            Err(e) => ToolResult::error(e.to_string()),
+        }
+    }
+
+    fn handle_task_update(&mut self, arguments: &Value) -> ToolResult {
+        let task_id = arguments
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let subject = arguments
+            .get("subject")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let description = arguments
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let active_form = arguments
+            .get("active_form")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let status = arguments.get("status").and_then(Value::as_str).map(|s| {
+            if s == "in_progress" {
+                crate::tasks::TaskStatus::InProgress
+            } else if s == "completed" {
+                crate::tasks::TaskStatus::Completed
+            } else {
+                crate::tasks::TaskStatus::Pending
+            }
+        });
+
+        match self.ensure_task_list() {
+            Ok(list) => match list.update(task_id, subject, description, active_form, status) {
+                Ok(task) => ToolResult::ok(format!(
+                    "Task #{} updated: [{}] {}",
+                    task.id,
+                    task.status.as_str(),
+                    task.subject
+                )),
+                Err(e) => ToolResult::error(e.to_string()),
+            },
+            Err(e) => ToolResult::error(e.to_string()),
+        }
+    }
+
+    fn handle_task_list(&mut self) -> ToolResult {
+        match self.ensure_task_list() {
+            Ok(list) => {
+                if list.task_count() == 0 {
+                    return ToolResult::ok("no tasks");
+                }
+                let reminder = list
+                    .reminder_text()
+                    .unwrap_or_else(|| "no active tasks".into());
+                ToolResult::ok(reminder)
+            }
+            Err(e) => ToolResult::error(e.to_string()),
+        }
+    }
+
+    pub fn enter_plan_mode(&mut self) -> Result<()> {
+        if self.config.permission == PermissionMode::Plan {
+            return Ok(());
+        }
+        self.pre_plan_mode = Some(self.config.permission);
+        self.apply_permission_mode(PermissionMode::Plan)?;
+        let _ = self.load_task_list();
+        Ok(())
+    }
+
+    pub fn exit_plan_mode(&mut self) -> Result<()> {
+        if self.config.permission != PermissionMode::Plan {
+            return Ok(());
+        }
+        let previous = self.pre_plan_mode.take().unwrap_or(PermissionMode::Ask);
+        self.apply_permission_mode(previous)
     }
 
     pub fn prompt_build(&self) -> PromptBuild {
@@ -595,6 +765,101 @@ where
         self.compact_context().await
     }
 
+    async fn end_turn<S: UiSink + Send>(
+        &mut self,
+        reason: StopReason,
+        ui: &mut S,
+    ) -> Result<StopReason> {
+        self.stop(reason).await?;
+
+        match reason {
+            StopReason::FinalAnswer => {}
+            _ => {
+                self.write_handoff(&reason.to_string())?;
+                let _ = self.write_recovery_report(&reason.to_string());
+            }
+        }
+
+        ui.on_event(AgentEvent::Stop { reason })?;
+        Ok(reason)
+    }
+
+    async fn recover_from_api_error<S: UiSink + Send>(
+        &mut self,
+        request: ModelRequest,
+        error: anyhow::Error,
+        ui: &mut S,
+    ) -> Result<ModelResponse> {
+        use crate::model::ModelErrorClass;
+
+        let error_class = ModelErrorClass::classify(&error);
+
+        if matches!(
+            error_class,
+            ModelErrorClass::RateLimit | ModelErrorClass::Fatal
+        ) {
+            return Err(error);
+        }
+
+        if self.config.max_retries >= 1 {
+            let _cleared =
+                compact::micro_compact(&mut self.transcript, compact::MICRO_COMPACT_KEEP);
+            self.last_micro_compact_at = Some(std::time::Instant::now());
+
+            let retry_result = {
+                let mut recording_ui = SessionRecordingUi {
+                    session: &self.session,
+                    inner: ui,
+                };
+                self.client
+                    .respond_streaming(request.clone(), &mut recording_ui)
+                    .await
+            };
+            match retry_result {
+                Ok(response) => {
+                    self.last_transition = Some(TransitionReason::MicroCompactApplied);
+                    return Ok(response);
+                }
+                Err(_) => { /* fall through */ }
+            }
+        }
+
+        if self.config.max_retries >= 2 {
+            let compacted = match self.compact_context().await {
+                Ok(report) => {
+                    self.last_compact_at = Some(std::time::Instant::now());
+                    self.consecutive_compact_failures = 0;
+                    report.compacted
+                }
+                Err(_) => {
+                    self.consecutive_compact_failures += 1;
+                    false
+                }
+            };
+            self.last_transition = if compacted {
+                Some(TransitionReason::AutoCompactApplied)
+            } else {
+                Some(TransitionReason::CompactRetry)
+            };
+
+            let retry_result = {
+                let mut recording_ui = SessionRecordingUi {
+                    session: &self.session,
+                    inner: ui,
+                };
+                self.client
+                    .respond_streaming(request, &mut recording_ui)
+                    .await
+            };
+            match retry_result {
+                Ok(response) => return Ok(response),
+                Err(final_error) => return Err(final_error),
+            }
+        }
+
+        Err(error)
+    }
+
     pub async fn run_verification_with_ui<S: UiSink + Send>(
         &mut self,
         check_name: Option<&str>,
@@ -693,13 +958,23 @@ where
             let _cleared =
                 compact::micro_compact(&mut self.transcript, compact::MICRO_COMPACT_KEEP);
             self.last_micro_compact_at = Some(std::time::Instant::now());
+            self.last_transition = Some(TransitionReason::MicroCompactApplied);
         }
 
-        let _compact = self.maybe_auto_compact(ui).await;
-
-        let mut consecutive_tool_failures = 0usize;
+        let compact_outcome = self.maybe_auto_compact(ui).await;
+        self.last_transition = compact_outcome.as_ref().map(|report| {
+            if report.compacted {
+                TransitionReason::AutoCompactApplied
+            } else {
+                TransitionReason::AutoCompactSkipped
+            }
+        });
 
         for _step in 0..self.config.max_steps {
+            if self.cancellation.is_cancelled() {
+                return self.end_turn(StopReason::UserInterrupt, ui).await;
+            }
+
             let reasoning_effort = if self.config.thinking == Some(ThinkingMode::Disabled) {
                 None
             } else {
@@ -717,32 +992,38 @@ where
                 reasoning_effort,
             };
 
-            let mut recording_ui = SessionRecordingUi {
-                session: &self.session,
-                inner: ui,
-            };
-            let response = match self
-                .client
-                .respond_streaming(request, &mut recording_ui)
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    self.session.append(&SessionEvent::Error {
-                        timestamp: now(),
-                        message: error.to_string(),
-                    })?;
-                    ui.on_event(AgentEvent::Error {
-                        message: error.to_string(),
-                    })?;
-                    self.stop(StopReason::ApiError).await?;
-                    self.write_handoff(&StopReason::ApiError.to_string())?;
-                    let _ = self.write_recovery_report(&StopReason::ApiError.to_string());
-                    let _ = self.extract_memories().await;
-                    ui.on_event(AgentEvent::Stop {
-                        reason: StopReason::ApiError,
-                    })?;
-                    return Ok(StopReason::ApiError);
+            let cancel = self.cancellation.clone();
+            let response = {
+                let mut recording_ui = SessionRecordingUi {
+                    session: &self.session,
+                    inner: ui,
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return self.end_turn(StopReason::UserInterrupt, ui).await;
+                    }
+                    result = self.client.respond_streaming(request.clone(), &mut recording_ui) => {
+                        match result {
+                            Ok(response) => response,
+                            Err(error) => {
+                                self.session.append(&SessionEvent::Error {
+                                    timestamp: now(),
+                                    message: error.to_string(),
+                                })?;
+                                let recovery = self.recover_from_api_error(request, error, ui).await;
+                                match recovery {
+                                    Ok(response) => response,
+                                    Err(final_error) => {
+                                        ui.on_event(AgentEvent::Error {
+                                            message: final_error.to_string(),
+                                        })?;
+                                        return self.end_turn(StopReason::ApiError, ui).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             };
 
@@ -758,12 +1039,7 @@ where
             }
 
             if response.function_calls.is_empty() {
-                self.stop(StopReason::FinalAnswer).await?;
-                let _ = self.extract_memories().await;
-                ui.on_event(AgentEvent::Stop {
-                    reason: StopReason::FinalAnswer,
-                })?;
-                return Ok(StopReason::FinalAnswer);
+                return self.end_turn(StopReason::FinalAnswer, ui).await;
             }
 
             for call in response.function_calls {
@@ -837,50 +1113,14 @@ where
                     elapsed,
                 })?;
 
-                if result.denied {
-                    self.transcript
-                        .push(function_call_output(&call.call_id, &result));
-                    self.stop(StopReason::ToolDenied).await?;
-                    self.write_handoff(&StopReason::ToolDenied.to_string())?;
-                    let _ = self.write_recovery_report(&StopReason::ToolDenied.to_string());
-                    let _ = self.extract_memories().await;
-                    ui.on_event(AgentEvent::Stop {
-                        reason: StopReason::ToolDenied,
-                    })?;
-                    return Ok(StopReason::ToolDenied);
-                }
-
-                if result.success {
-                    consecutive_tool_failures = 0;
-                } else {
-                    consecutive_tool_failures += 1;
-                    if consecutive_tool_failures >= 2 {
-                        self.transcript
-                            .push(function_call_output(&call.call_id, &result));
-                        self.stop(StopReason::ToolError).await?;
-                        self.write_handoff(&StopReason::ToolError.to_string())?;
-                        let _ = self.write_recovery_report(&StopReason::ToolError.to_string());
-                        let _ = self.extract_memories().await;
-                        ui.on_event(AgentEvent::Stop {
-                            reason: StopReason::ToolError,
-                        })?;
-                        return Ok(StopReason::ToolError);
-                    }
-                }
-
                 self.transcript
                     .push(function_call_output(&call.call_id, &result));
             }
+
+            self.last_transition = Some(TransitionReason::NextTurn);
         }
 
-        self.stop(StopReason::MaxSteps).await?;
-        self.write_handoff(&StopReason::MaxSteps.to_string())?;
-        let _ = self.write_recovery_report(&StopReason::MaxSteps.to_string());
-        let _ = self.extract_memories().await;
-        ui.on_event(AgentEvent::Stop {
-            reason: StopReason::MaxSteps,
-        })?;
-        Ok(StopReason::MaxSteps)
+        self.end_turn(StopReason::MaxSteps, ui).await
     }
 
     async fn execute_tool<S: UiSink + Send>(
@@ -890,6 +1130,53 @@ where
         arguments: Value,
         ui: &mut S,
     ) -> ToolResult {
+        if name == "enter_plan_mode" {
+            let _ = self.enter_plan_mode();
+            return ToolResult::ok("entered plan mode — read-only exploration only");
+        }
+        if name == "exit_plan_mode" {
+            let plan_text = self
+                .active_plan
+                .as_ref()
+                .and_then(|p| p.active_text())
+                .unwrap_or("(no plan written yet)");
+            match ui.approve_plan(plan_text) {
+                Ok(crate::ui::PlanApprovalDecision::Approve) => {
+                    let _ = self.exit_plan_mode();
+                    return ToolResult::ok("plan approved — exited plan mode");
+                }
+                Ok(crate::ui::PlanApprovalDecision::Edit) => {
+                    return ToolResult::ok(
+                        "plan stays in plan mode — user will edit the plan",
+                    );
+                }
+                Ok(crate::ui::PlanApprovalDecision::MoreGuidance(text)) => {
+                    if !text.is_empty() {
+                        self.transcript.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}]
+                        }));
+                    }
+                    return ToolResult::ok(format!(
+                        "staying in plan mode — additional guidance applied: {text}"
+                    ));
+                }
+                Err(e) => return ToolResult::error(e.to_string()),
+            }
+        }
+        if name == "task_create" {
+            return self.handle_task_create(&arguments);
+        }
+        if name == "task_get" {
+            return self.handle_task_get(&arguments);
+        }
+        if name == "task_update" {
+            return self.handle_task_update(&arguments);
+        }
+        if name == "task_list" {
+            return self.handle_task_list();
+        }
         let metadata = self
             .tools
             .metadata(name, &arguments)
@@ -1027,6 +1314,7 @@ where
                 ToolContext {
                     cwd: self.config.cwd.clone(),
                     permission: self.config.permission,
+                    cancellation: self.cancellation.clone(),
                 },
                 ui,
             )
@@ -1228,6 +1516,10 @@ where
     fn approve_tool(&mut self, name: &str, summary: &str) -> Result<ApprovalDecision> {
         self.inner.approve_tool(name, summary)
     }
+
+    fn approve_plan(&mut self, plan_text: &str) -> Result<PlanApprovalDecision> {
+        self.inner.approve_plan(plan_text)
+    }
 }
 
 #[cfg(test)]
@@ -1343,6 +1635,7 @@ mod tests {
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             auto_compact: Default::default(),
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
             cwd,
         }
     }
@@ -1506,23 +1799,23 @@ status = "active"
     async fn non_final_stop_writes_handoff() {
         let mut agent = test_agent(
             PermissionMode::Safe,
-            3,
+            1,
             vec![Ok(tool_response(
-                "write_file",
+                "list_files",
                 "call_1",
-                json!({"path": "x.txt", "content": "x"}),
+                json!({"path": "."}),
             ))],
         );
         let path = agent.session.path().clone();
 
-        let reason = agent.run_turn("write".into()).await.unwrap();
-        assert_eq!(reason, StopReason::ToolDenied);
+        let reason = agent.run_turn("list".into()).await.unwrap();
+        assert_eq!(reason, StopReason::MaxSteps);
 
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\"type\":\"handoff_written\""));
-        assert!(log.contains("\"trigger\":\"tool_denied\""));
+        assert!(log.contains("\"trigger\":\"max_steps\""));
         assert!(log.contains("\"type\":\"recovery_report_written\""));
-        assert!(log.contains("\"failure_class\":\"tool_denied\""));
+        assert!(log.contains("\"failure_class\":\"max_steps\""));
         let plan = std::fs::read_to_string(
             agent
                 .config
@@ -1531,7 +1824,7 @@ status = "active"
                 .join(crate::plan::ACTIVE_PLAN_FILE),
         )
         .unwrap();
-        assert!(plan.contains("non-final stop: tool_denied"));
+        assert!(plan.contains("non-final stop: max_steps"));
         let recovery = std::fs::read_to_string(
             agent
                 .config
@@ -1540,7 +1833,7 @@ status = "active"
                 .join(crate::recovery::LATEST_RECOVERY_FILE),
         )
         .unwrap();
-        assert!(recovery.contains("tool_denied"));
+        assert!(recovery.contains("max_steps"));
     }
 
     #[tokio::test]
@@ -1855,19 +2148,22 @@ status = "active"
     }
 
     #[tokio::test]
-    async fn tool_denial_stops_turn() {
+    async fn tool_denial_flows_to_transcript_and_model_adapts() {
         let mut agent = test_agent(
             PermissionMode::Safe,
             3,
-            vec![Ok(tool_response(
-                "write_file",
-                "call_1",
-                json!({"path": "x.txt", "content": "x"}),
-            ))],
+            vec![
+                Ok(tool_response(
+                    "write_file",
+                    "call_1",
+                    json!({"path": "x.txt", "content": "x"}),
+                )),
+                Ok(final_response("cannot write in safe mode")),
+            ],
         );
 
         let reason = agent.run_turn("write".into()).await.unwrap();
-        assert_eq!(reason, StopReason::ToolDenied);
+        assert_eq!(reason, StopReason::FinalAnswer);
     }
 
     #[tokio::test]
@@ -1893,7 +2189,13 @@ status = "active"
                 "write_file",
                 "grep",
                 "edit",
-                "glob"
+                "glob",
+                "enter_plan_mode",
+                "exit_plan_mode",
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
             ]
         );
     }
@@ -1909,16 +2211,19 @@ status = "active"
         let path_config = config.clone();
         let mut agent = test_agent_with_config(
             config,
-            vec![Ok(tool_response(
-                "shell",
-                "call_1",
-                json!({"command":"rm -rf x"}),
-            ))],
+            vec![
+                Ok(tool_response(
+                    "shell",
+                    "call_1",
+                    json!({"command":"rm -rf x"}),
+                )),
+                Ok(final_response("cannot run that command")),
+            ],
         );
         let path = agent.session.path().clone();
 
         let reason = agent.run_turn("remove".into()).await.unwrap();
-        assert_eq!(reason, StopReason::ToolDenied);
+        assert_eq!(reason, StopReason::FinalAnswer);
         let requests = agent.client.requests.lock().unwrap();
         let tool_names = requests[0]
             .tools
@@ -1934,7 +2239,13 @@ status = "active"
                 "shell",
                 "grep",
                 "edit",
-                "glob"
+                "glob",
+                "enter_plan_mode",
+                "exit_plan_mode",
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list",
             ]
         );
         assert_eq!(path_config.permission_rules.len(), 1);
@@ -2098,11 +2409,14 @@ status = "active"
             ];
         let mut agent = test_agent_with_config(
             config,
-            vec![Ok(tool_response(
-                "shell",
-                "call_1",
-                json!({"command":"rm -rf x"}),
-            ))],
+            vec![
+                Ok(tool_response(
+                    "shell",
+                    "call_1",
+                    json!({"command":"rm -rf x"}),
+                )),
+                Ok(final_response("cannot run that command")),
+            ],
         );
         let mut ui = ApprovalUi::new(vec![ApprovalDecision::AllowSession]);
 
@@ -2110,23 +2424,27 @@ status = "active"
             .run_turn_with_ui("remove".into(), &mut ui)
             .await
             .unwrap();
-        assert_eq!(reason, StopReason::ToolDenied);
+        assert_eq!(reason, StopReason::FinalAnswer);
         assert_eq!(ui.call_count(), 0);
     }
 
     #[tokio::test]
-    async fn repeated_tool_failure_stops_turn() {
+    async fn tool_error_flows_to_transcript_and_continues() {
+        // Tool errors go into the transcript as normal results;
+        // the model sees them and can self-correct.
+        // The harness does NOT stop on tool errors.
         let mut agent = test_agent(
             PermissionMode::Auto,
             4,
             vec![
                 Ok(tool_response("missing", "call_1", json!({}))),
-                Ok(tool_response("missing", "call_2", json!({}))),
+                Ok(tool_response("list_files", "call_2", json!({"path": "."}))),
+                Ok(final_response("recovered after error")),
             ],
         );
 
-        let reason = agent.run_turn("fail twice".into()).await.unwrap();
-        assert_eq!(reason, StopReason::ToolError);
+        let reason = agent.run_turn("try".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
     }
 
     #[tokio::test]
@@ -2143,5 +2461,196 @@ status = "active"
 
         let reason = agent.run_turn("loop".into()).await.unwrap();
         assert_eq!(reason, StopReason::MaxSteps);
+    }
+
+    #[tokio::test]
+    async fn api_error_context_pressure_retries_and_recovers() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![
+                Err(anyhow::anyhow!(
+                    "Responses API error 413: request too large"
+                )),
+                Ok(final_response("done after retry")),
+            ],
+        );
+        agent.config.max_retries = 1;
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            agent.last_transition(),
+            Some(TransitionReason::MicroCompactApplied)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_error_rate_limit_stops_immediately() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![Err(anyhow::anyhow!("Responses API error 429: rate limit"))],
+        );
+        agent.config.max_retries = 2;
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::ApiError);
+
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_error_exhausts_retries_and_stops() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![
+                Err(anyhow::anyhow!("Responses API error 503: overloaded")),
+                Err(anyhow::anyhow!("Responses API error 503: still overloaded")),
+                Err(anyhow::anyhow!("Responses API error 503: still overloaded")),
+            ],
+        );
+        agent.config.max_retries = 2;
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::ApiError);
+
+        let requests = agent.client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn end_turn_final_answer_skips_handoff() {
+        let mut agent = test_agent(PermissionMode::Safe, 3, vec![Ok(final_response("done"))]);
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("\"type\":\"handoff_written\""));
+        assert!(!log.contains("\"type\":\"recovery_report_written\""));
+    }
+
+    #[tokio::test]
+    async fn tool_denied_does_not_stop_turn() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![
+                Ok(tool_response(
+                    "write_file",
+                    "call_1",
+                    json!({"path": "x.txt", "content": "x"}),
+                )),
+                Ok(final_response("write denied, cannot proceed")),
+            ],
+        );
+        let path = agent.session.path().clone();
+
+        let reason = agent.run_turn("write".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("\"decision\":\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn transition_tracking_next_turn_after_tool_call() {
+        let mut agent = test_agent(
+            PermissionMode::Safe,
+            3,
+            vec![
+                Ok(tool_response("list_files", "call_1", json!({"path": "."}))),
+                Ok(final_response("listed")),
+            ],
+        );
+
+        let reason = agent.run_turn("list".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        assert_eq!(agent.last_transition(), Some(TransitionReason::NextTurn));
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_turn_before_api_call() {
+        let mut agent = test_agent(PermissionMode::Safe, 10, vec![Ok(final_response("done"))]);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        agent.set_cancellation_token(token);
+
+        let reason = agent.run_turn("hello".into()).await.unwrap();
+        assert_eq!(reason, StopReason::UserInterrupt);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_writes_and_model_adapts() {
+        let mut agent = test_agent(
+            PermissionMode::Plan,
+            3,
+            vec![
+                Ok(tool_response(
+                    "write_file",
+                    "call_1",
+                    json!({"path": "x.txt", "content": "x"}),
+                )),
+                Ok(final_response("I cannot write in plan mode")),
+            ],
+        );
+        let reason = agent.run_turn("write".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_reads() {
+        let mut agent = test_agent(
+            PermissionMode::Plan,
+            3,
+            vec![
+                Ok(tool_response("list_files", "call_1", json!({"path": "."}))),
+                Ok(final_response("done")),
+            ],
+        );
+        let reason = agent.run_turn("list".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+    }
+
+    #[test]
+    fn exit_plan_mode_restores_previous_mode() {
+        let config = temp_config(PermissionMode::Ask, 3);
+        let session = Session::new(&config).unwrap();
+        let mut agent = Agent::new(config, MockModel::new(vec![]), session);
+
+        agent.enter_plan_mode().unwrap();
+        assert_eq!(agent.config().permission, PermissionMode::Plan);
+
+        agent.exit_plan_mode().unwrap();
+        assert_eq!(agent.config().permission, PermissionMode::Ask);
+    }
+
+    #[tokio::test]
+    async fn transition_tracking_micro_compact() {
+        let mut responses: Vec<anyhow::Result<ModelResponse>> = (0..8)
+            .map(|i| {
+                Ok(tool_response(
+                    "list_files",
+                    &format!("call_{i}"),
+                    json!({"path": "."}),
+                ))
+            })
+            .collect();
+        responses.push(Ok(final_response("done")));
+
+        let mut agent = test_agent(PermissionMode::Safe, 10, responses);
+
+        let reason = agent.run_turn("repeat".into()).await.unwrap();
+        assert_eq!(reason, StopReason::FinalAnswer);
+        // Micro compact fires at turn start, but NextTurn overwrites it
+        // after each successful tool iteration.
+        assert_eq!(agent.last_transition(), Some(TransitionReason::NextTurn));
     }
 }

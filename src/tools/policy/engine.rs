@@ -424,6 +424,18 @@ fn classify_shell_segment(command: &str) -> ShellSafety {
 fn default_for_shell(permission: PermissionMode, arguments: &Value) -> PolicyDecision {
     let command = shell_command(arguments);
     match (permission, classify_shell_command(command)) {
+        (PermissionMode::Plan, ShellSafety::Safe) => decision(
+            PermissionDecision::Allow,
+            DecisionReason::SafetyCheck,
+            Some(RuleSource::RuntimeDefault),
+            "shell command classified as safe — allowed in plan mode",
+        ),
+        (PermissionMode::Plan, _) => decision(
+            PermissionDecision::Deny,
+            DecisionReason::Mode,
+            Some(RuleSource::RuntimeDefault),
+            "destructive or unknown shell commands are denied in plan mode",
+        ),
         (_, ShellSafety::Safe) => decision(
             PermissionDecision::Allow,
             DecisionReason::SafetyCheck,
@@ -463,6 +475,24 @@ fn default_for_write_file(
     arguments: &Value,
 ) -> PolicyDecision {
     match permission {
+        PermissionMode::Plan => {
+            let path = write_path(arguments);
+            if is_plan_file(path) {
+                decision(
+                    PermissionDecision::Allow,
+                    DecisionReason::Mode,
+                    Some(RuleSource::RuntimeDefault),
+                    "write_file allowed for plan file in plan mode",
+                )
+            } else {
+                decision(
+                    PermissionDecision::Deny,
+                    DecisionReason::Mode,
+                    Some(RuleSource::RuntimeDefault),
+                    "write_file is denied in plan mode — only .micos/plans/active.md can be written",
+                )
+            }
+        }
         PermissionMode::Safe => decision(
             PermissionDecision::Deny,
             DecisionReason::Mode,
@@ -573,6 +603,11 @@ fn write_path(arguments: &Value) -> &str {
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or_default()
+}
+
+fn is_plan_file(path: &str) -> bool {
+    path == ".micos/plans/active.md"
+        || path.ends_with("/.micos/plans/active.md")
 }
 
 fn shell_command(arguments: &Value) -> &str {

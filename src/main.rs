@@ -163,6 +163,7 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         max_steps: args.max_steps,
         context_window_tokens: None,
         context_warning_percent: None,
+        max_retries: None,
         auto_compact: args.auto_compact.map(Into::into),
         cwd: args.cwd,
     };
@@ -359,6 +360,15 @@ async fn handle_console_slash<C: ModelClient>(
             Err(error) => eprintln!("recover failed: {error}"),
         },
         SlashCommand::Plan => ui.print_active_plan(agent.active_plan()),
+        SlashCommand::PlanMode => {
+            if agent.is_plan_mode() {
+                agent.exit_plan_mode()?;
+                eprintln!("plan mode: exited");
+            } else {
+                agent.enter_plan_mode()?;
+                eprintln!("plan mode: entered — write operations are now denied");
+            }
+        }
         SlashCommand::Model => {
             eprintln!("The /model picker is only available in TUI mode. Restart without --no-tui.")
         }

@@ -23,6 +23,8 @@ pub(super) struct FooterState {
     pub(super) show_reasoning: bool,
     pub(super) run_status: RunStatus,
     pub(super) animation_tick: usize,
+    pub(super) pending_count: usize,
+    pub(super) plan_mode: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,9 +83,12 @@ pub(super) fn draw_frame(
     composer: &ComposerState,
     model_panel: Option<&ModelPanelState>,
     approval_selected: Option<usize>,
+    approval_is_plan: bool,
+    approval_option_count: usize,
     footer: &FooterState,
 ) {
-    let bottom_height = bottom_panel_height(composer, model_panel, approval_selected);
+    let bottom_height =
+        bottom_panel_height(composer, model_panel, approval_selected, approval_is_plan);
     let working_height = working_panel_height(footer);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -101,7 +106,13 @@ pub(super) fn draw_frame(
     if let Some(panel) = model_panel {
         draw_model_panel(frame, chunks[3], panel);
     } else if let Some(selected) = approval_selected {
-        draw_approval_picker(frame, chunks[3], selected);
+        draw_approval_picker(
+            frame,
+            chunks[3],
+            selected,
+            approval_is_plan,
+            approval_option_count,
+        );
     } else if composer.popup_open() {
         draw_popup(frame, chunks[3], composer);
     } else {
@@ -121,6 +132,7 @@ pub(super) fn bottom_panel_height(
     composer: &ComposerState,
     model_panel: Option<&ModelPanelState>,
     approval_selected: Option<usize>,
+    _approval_is_plan: bool,
 ) -> u16 {
     if model_panel.is_some() {
         9
@@ -245,24 +257,41 @@ fn popup_window_start(selected: usize, visible_rows: usize, total: usize) -> usi
     selected.saturating_add(1).saturating_sub(visible_rows)
 }
 
-fn draw_approval_picker(frame: &mut Frame<'_>, footer_area: Rect, selected: usize) {
+fn draw_approval_picker(
+    frame: &mut Frame<'_>,
+    footer_area: Rect,
+    selected: usize,
+    is_plan: bool,
+    option_count: usize,
+) {
     let width = 68u16.min(footer_area.width);
     let area = Rect::new(footer_area.x, footer_area.y, width, footer_area.height);
+    let title = if is_plan { " plan review " } else { " approval " };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" approval ");
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    let items = [
-        ("Session", "remember this rule for this session"),
-        ("Once", "allow this call only"),
-        ("Project", "save this rule to .micos/config.toml"),
-        ("Deny", "skip this tool call"),
-    ];
+
+    let items: &[(&str, &str)] = if is_plan {
+        &[
+            ("Approve", "approve the plan and start implementing"),
+            ("Edit", "keep planning — user will edit the plan"),
+            ("More", "keep planning — user will add guidance"),
+        ]
+    } else {
+        &[
+            ("Session", "remember this rule for this session"),
+            ("Once", "allow this call only"),
+            ("Project", "save this rule to .micos/config.toml"),
+            ("Deny", "skip this tool call"),
+        ]
+    };
+
     let lines = items
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(index, (label, description))| {
             let style = if index == selected {
@@ -272,11 +301,27 @@ fn draw_approval_picker(frame: &mut Frame<'_>, footer_area: Rect, selected: usiz
             };
             Line::from(vec![
                 Span::styled(format!("{label:<12}"), style.add_modifier(Modifier::BOLD)),
-                Span::styled(description, style),
+                Span::styled(*description, style),
             ])
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
+
+    if is_plan && option_count > 0 {
+        let hint = format!(
+            " [a]pprove  [e]dit  [m]ore guidance  Enter/arrows to select",
+        );
+        let hint_area = Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            hint_area,
+        );
+    }
 }
 
 fn draw_model_panel(frame: &mut Frame<'_>, footer_area: Rect, panel: &ModelPanelState) {
@@ -325,10 +370,17 @@ pub(super) fn footer_text(footer: &FooterState) -> String {
     } else {
         "reasoning hidden"
     };
-    format!(
+    let mut text = format!(
         "{} · {}/{} · {} · {}",
         footer.model, footer.thinking, footer.reasoning_effort, footer.cwd, reasoning
-    )
+    );
+    if footer.pending_count > 0 {
+        text.push_str(&format!(" · [{} queued]", footer.pending_count));
+    }
+    if footer.plan_mode {
+        text.push_str(" · [plan]");
+    }
+    text
 }
 
 pub(super) fn short_thinking(thinking: Option<ThinkingMode>) -> &'static str {

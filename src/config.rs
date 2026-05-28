@@ -9,7 +9,8 @@ use std::str::FromStr;
 pub const DEFAULT_MODEL: &str = "gpt-5.3-codex";
 pub const DEFAULT_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1/responses";
 pub const DEEPSEEK_CHAT_COMPLETIONS_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
-pub const DEFAULT_MAX_STEPS: usize = 20;
+pub const DEFAULT_MAX_STEPS: usize = usize::MAX;
+pub const DEFAULT_MAX_RETRIES: usize = 2;
 pub const DEFAULT_CONTEXT_WARNING_PERCENT: usize = 80;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -18,6 +19,7 @@ pub enum PermissionMode {
     Safe,
     Ask,
     Auto,
+    Plan,
 }
 
 impl fmt::Display for PermissionMode {
@@ -26,6 +28,7 @@ impl fmt::Display for PermissionMode {
             PermissionMode::Safe => write!(f, "safe"),
             PermissionMode::Ask => write!(f, "ask"),
             PermissionMode::Auto => write!(f, "auto"),
+            PermissionMode::Plan => write!(f, "plan"),
         }
     }
 }
@@ -38,6 +41,7 @@ impl FromStr for PermissionMode {
             "safe" => Ok(PermissionMode::Safe),
             "ask" => Ok(PermissionMode::Ask),
             "auto" => Ok(PermissionMode::Auto),
+            "plan" => Ok(PermissionMode::Plan),
             other => bail!("unknown permission mode: {other}"),
         }
     }
@@ -175,6 +179,7 @@ pub struct SessionConfig {
     pub context_window_tokens: usize,
     pub context_warning_percent: usize,
     pub auto_compact: AutoCompactMode,
+    pub max_retries: usize,
     pub append_system_prompt: Option<String>,
     pub cwd: PathBuf,
 }
@@ -197,6 +202,7 @@ pub struct ConfigOverrides {
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
     pub context_warning_percent: Option<usize>,
+    pub max_retries: Option<usize>,
     pub auto_compact: Option<AutoCompactMode>,
     pub cwd: Option<PathBuf>,
 }
@@ -212,6 +218,7 @@ pub struct FileConfig {
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
     pub context_warning_percent: Option<usize>,
+    pub max_retries: Option<usize>,
     pub auto_compact: Option<AutoCompactMode>,
     pub append_system_prompt: Option<String>,
     pub cwd: Option<PathBuf>,
@@ -237,6 +244,7 @@ pub struct EnvConfig {
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
     pub context_warning_percent: Option<usize>,
+    pub max_retries: Option<usize>,
     pub auto_compact: Option<AutoCompactMode>,
     pub cwd: Option<PathBuf>,
 }
@@ -319,6 +327,11 @@ impl SessionConfig {
                 .or(env.auto_compact)
                 .or(file.auto_compact)
                 .unwrap_or_default(),
+            max_retries: cli
+                .max_retries
+                .or(env.max_retries)
+                .or(file.max_retries)
+                .unwrap_or(DEFAULT_MAX_RETRIES),
             append_system_prompt: file.append_system_prompt,
             cwd,
         })
@@ -494,6 +507,10 @@ impl EnvConfig {
             Ok(value) => Some(value.parse()?),
             Err(_) => None,
         };
+        let max_retries = match std::env::var("MICOS_MAX_RETRIES") {
+            Ok(value) => Some(value.parse().context("parse MICOS_MAX_RETRIES")?),
+            Err(_) => None,
+        };
 
         Ok(Self {
             model: std::env::var("MICOS_MODEL").ok(),
@@ -505,6 +522,7 @@ impl EnvConfig {
             context_window_tokens,
             context_warning_percent,
             auto_compact,
+            max_retries,
             cwd,
         })
     }
@@ -577,6 +595,7 @@ mod tests {
             crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(cfg.context_warning_percent, DEFAULT_CONTEXT_WARNING_PERCENT);
+        assert_eq!(cfg.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(cfg.append_system_prompt, None);
     }
 
@@ -595,6 +614,7 @@ mod tests {
                 context_window_tokens: Some(123_000),
                 context_warning_percent: Some(70),
                 append_system_prompt: None,
+                max_retries: Some(3),
                 auto_compact: None,
                 cwd: None,
             },
@@ -607,6 +627,7 @@ mod tests {
                 max_steps: Some(4),
                 context_window_tokens: Some(124_000),
                 context_warning_percent: Some(75),
+                max_retries: Some(4),
                 auto_compact: None,
                 cwd: None,
             },
@@ -619,6 +640,7 @@ mod tests {
                 max_steps: Some(5),
                 context_window_tokens: Some(125_000),
                 context_warning_percent: Some(90),
+                max_retries: Some(5),
                 auto_compact: None,
                 cwd: None,
             },
@@ -634,6 +656,7 @@ mod tests {
         assert_eq!(cfg.max_steps, 5);
         assert_eq!(cfg.context_window_tokens, 125_000);
         assert_eq!(cfg.context_warning_percent, 90);
+        assert_eq!(cfg.max_retries, 5);
     }
 
     #[test]

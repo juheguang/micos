@@ -115,11 +115,14 @@ async fn denied_tool(root: &std::path::Path) -> Result<EvalFixtureReport> {
         root,
         "denied-tool",
         PermissionMode::Safe,
-        vec![tool_call(
-            "call_write",
-            "write_file",
-            json!({"path":"src/denied.txt","content":"no\n"}),
-        )],
+        vec![
+            tool_call(
+                "call_write",
+                "write_file",
+                json!({"path":"src/denied.txt","content":"no\n"}),
+            ),
+            assistant("write_file is denied in safe mode"),
+        ],
     )?;
     let reason = run_eval_turn(&mut agent, "Write a file.").await?;
     let path = agent.session_path().to_path_buf();
@@ -128,18 +131,21 @@ async fn denied_tool(root: &std::path::Path) -> Result<EvalFixtureReport> {
         "denied_tool",
         path,
         Some(reason),
-        reason == StopReason::ToolDenied && log.contains("recovery_report_written"),
+        reason == StopReason::FinalAnswer && log.contains("\"decision\":\"deny\""),
     )
 }
 
 async fn failing_tool_recovery(root: &std::path::Path) -> Result<EvalFixtureReport> {
+    // Tool errors flow through to the transcript; the harness does NOT stop.
+    // The model sees errors and can try different approaches.
     let mut agent = eval_agent(
         root,
         "failing-tool",
         PermissionMode::Safe,
         vec![
             tool_call("call_read_1", "read_file", json!({"path":"missing.txt"})),
-            tool_call("call_read_2", "read_file", json!({"path":"missing.txt"})),
+            tool_call("call_list_1", "list_files", json!({"path":"."})),
+            assistant("file is missing but directory listing succeeded"),
         ],
     )?;
     let reason = run_eval_turn(&mut agent, "Read missing file.").await?;
@@ -149,7 +155,7 @@ async fn failing_tool_recovery(root: &std::path::Path) -> Result<EvalFixtureRepo
         "failing_tool_recovery",
         path,
         Some(reason),
-        reason == StopReason::ToolError && log.contains("recovery_report_written"),
+        reason == StopReason::FinalAnswer && log.contains("\"success\":false"),
     )
 }
 
@@ -210,6 +216,7 @@ fn eval_agent(
         context_warning_percent: DEFAULT_CONTEXT_WARNING_PERCENT,
         append_system_prompt: None,
         auto_compact: Default::default(),
+        max_retries: crate::config::DEFAULT_MAX_RETRIES,
         cwd,
     };
     let session = Session::new(&config)?;

@@ -9,6 +9,7 @@ pub mod prompt;
 pub mod recovery;
 pub mod session;
 pub mod session_replay;
+pub mod tasks;
 pub mod tools;
 pub mod tui;
 pub mod ui;

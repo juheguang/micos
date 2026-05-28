@@ -124,7 +124,13 @@ mod tests {
                 "shell",
                 "grep",
                 "edit",
-                "glob"
+                "glob",
+                "enter_plan_mode",
+                "exit_plan_mode",
+                "task_create",
+                "task_get",
+                "task_update",
+                "task_list"
             ]
         );
         assert_eq!(schemas[1]["parameters"]["required"], json!(["path"]));

@@ -14,6 +14,13 @@ pub enum ApprovalDecision {
 }
 
 #[derive(Clone, Debug)]
+pub enum PlanApprovalDecision {
+    Approve,
+    Edit,
+    MoreGuidance(String),
+}
+
+#[derive(Clone, Debug)]
 pub enum AgentEvent {
     TurnStarted {
         input: String,
@@ -60,6 +67,10 @@ pub trait UiSink {
         Ok(ApprovalDecision::Deny)
     }
 
+    fn approve_plan(&mut self, _plan_text: &str) -> Result<PlanApprovalDecision> {
+        Ok(PlanApprovalDecision::Approve)
+    }
+
     fn confirm_compact(&mut self, _usage_percent: usize) -> Result<bool> {
         Ok(true)
     }
@@ -75,5 +86,9 @@ impl UiSink for NullUi {
 
     fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<ApprovalDecision> {
         Ok(ApprovalDecision::Deny)
+    }
+
+    fn approve_plan(&mut self, _plan_text: &str) -> Result<PlanApprovalDecision> {
+        Ok(PlanApprovalDecision::Approve)
     }
 }

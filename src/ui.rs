@@ -3,7 +3,7 @@ mod events;
 mod slash;
 
 pub use console::ConsoleUi;
-pub use events::{AgentEvent, ApprovalDecision, NullUi, UiSink};
+pub use events::{AgentEvent, ApprovalDecision, NullUi, PlanApprovalDecision, UiSink};
 pub use slash::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
     format_memory, format_memory_candidate_report, format_memory_candidates, format_memory_entry,

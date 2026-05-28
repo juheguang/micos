@@ -10,7 +10,7 @@ use crate::ui::{
     format_memory_index, format_memory_sweep, format_prompt, format_recovery_report,
     format_resume_report, format_sessions, format_status, format_summary, format_trace,
     format_transcript, format_verification_report, recent_session_choices, AgentEvent,
-    ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
+    ApprovalDecision, PlanApprovalDecision, SlashCommand, SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -88,6 +88,10 @@ enum TuiAgentMessage {
         summary: String,
         response: std_mpsc::Sender<ApprovalDecision>,
     },
+    PlanApprovalRequest {
+        plan_text: String,
+        response: std_mpsc::Sender<PlanApprovalDecision>,
+    },
     TurnFinished {
         agent: Agent<OpenAiModelClient>,
         result: std::result::Result<StopReason, String>,
@@ -119,6 +123,15 @@ impl UiSink for TuiAgentSink {
         });
         Ok(decision.recv().unwrap_or(ApprovalDecision::Deny))
     }
+
+    fn approve_plan(&mut self, plan_text: &str) -> Result<PlanApprovalDecision> {
+        let (response, decision) = std_mpsc::channel();
+        let _ = self.tx.send(TuiAgentMessage::PlanApprovalRequest {
+            plan_text: plan_text.to_string(),
+            response,
+        });
+        Ok(decision.recv().unwrap_or(PlanApprovalDecision::Approve))
+    }
 }
 
 pub struct TuiUi {
@@ -145,6 +158,9 @@ pub struct TuiUi {
     stick_to_bottom: bool,
     last_message_lines: usize,
     last_message_height: usize,
+    cancellation: tokio_util::sync::CancellationToken,
+    pending_messages: Vec<String>,
+    last_input: String,
 }
 
 impl TuiUi {
@@ -174,6 +190,9 @@ impl TuiUi {
             stick_to_bottom: true,
             last_message_lines: 0,
             last_message_height: 0,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            pending_messages: Vec::new(),
+            last_input: String::new(),
         }
     }
 
@@ -223,6 +242,16 @@ impl TuiUi {
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
+                        if self.agent_task.is_some() {
+                            self.cancellation.cancel();
+                            self.pending_messages.clear();
+                            self.push_message(
+                                MessageKind::System,
+                                "interrupted",
+                                "turn cancelled — press Ctrl+C again to exit",
+                            );
+                            continue;
+                        }
                         if self.agent.is_some() {
                             self.write_handoff_with_status("user_interrupt")?;
                             self.agent
@@ -237,12 +266,14 @@ impl TuiUi {
                             self.run_status = RunStatus::Idle;
                             self.render()?;
                             break;
-                        } else {
-                            self.push_message(
-                                MessageKind::Warning,
-                                "busy",
-                                "wait for the current turn to finish before exiting",
-                            );
+                        }
+                        continue;
+                    }
+
+                    if key.code == KeyCode::Esc {
+                        if self.agent_task.is_some() {
+                            self.cancellation.cancel();
+                            self.push_message(MessageKind::System, "cancelled", "turn cancelled");
                             continue;
                         }
                     }
@@ -257,11 +288,17 @@ impl TuiUi {
                         continue;
                     }
                     if self.agent_task.is_some() && key.code == KeyCode::Enter {
-                        self.push_message(
-                            MessageKind::Warning,
-                            "busy",
-                            "agent is still working on the current turn",
-                        );
+                        let input = self.composer.buffer().trim().to_string();
+                        if !input.is_empty() {
+                            self.pending_messages.push(input);
+                            self.composer.clear();
+                            self.cancellation.cancel();
+                            self.push_message(
+                                MessageKind::System,
+                                "queued",
+                                format!("message queued ({} pending)", self.pending_messages.len()),
+                            );
+                        }
                         continue;
                     }
 
@@ -290,6 +327,8 @@ impl TuiUi {
             show_reasoning: self.show_reasoning,
             run_status: self.run_status.clone(),
             animation_tick: self.animation_tick,
+            pending_count: self.pending_messages.len(),
+            plan_mode: self.agent.as_ref().is_some_and(|a| a.is_plan_mode()),
         }
     }
 
@@ -308,12 +347,22 @@ impl TuiUi {
 
     fn render_with_footer(&mut self, footer: &FooterState) -> Result<()> {
         let size = self.terminal.size().context("read terminal size")?;
-        let approval_selected = self
+        let approval_selected = self.approval_picker.as_ref().map(|p| p.selected());
+        let approval_is_plan = self
             .approval_picker
             .as_ref()
-            .map(ApprovalPickerState::selected);
-        let bottom_height =
-            bottom_panel_height(&self.composer, self.model_panel.as_ref(), approval_selected);
+            .is_some_and(|p| p.is_plan_mode());
+        let approval_option_count = self
+            .approval_picker
+            .as_ref()
+            .map(|p| p.option_count())
+            .unwrap_or(0);
+        let bottom_height = bottom_panel_height(
+            &self.composer,
+            self.model_panel.as_ref(),
+            approval_selected,
+            approval_is_plan,
+        );
         let working_height = working_panel_height(footer);
         let message_height =
             size.height
@@ -342,6 +391,8 @@ impl TuiUi {
                     &composer,
                     model_panel.as_ref(),
                     approval_selected,
+                    approval_is_plan,
+                    approval_option_count,
                     &footer,
                 )
             })
@@ -382,6 +433,17 @@ impl TuiUi {
                     self.push_permission_message(&name, &summary);
                     self.approval_picker = Some(ApprovalPickerState::new(response));
                 }
+                TuiAgentMessage::PlanApprovalRequest {
+                    plan_text,
+                    response,
+                } => {
+                    self.run_status = RunStatus::WaitingApproval;
+                    self.model_panel = None;
+                    self.composer.popup_open = false;
+                    self.push_message(MessageKind::System, "plan review", plan_text);
+                    self.approval_picker =
+                        Some(ApprovalPickerState::new_plan(response));
+                }
                 TuiAgentMessage::TurnFinished {
                     agent,
                     result,
@@ -391,10 +453,19 @@ impl TuiUi {
                     self.agent_task = None;
                     self.run_status = RunStatus::Idle;
                     self.active_tool_message = None;
-                    match result {
-                        Ok(reason) => self.push_turn_elapsed(reason, elapsed),
+                    match &result {
+                        Ok(reason) => {
+                            self.push_turn_elapsed(*reason, elapsed);
+                            if *reason == StopReason::UserInterrupt
+                                && self.pending_messages.is_empty()
+                                && !self.last_input.is_empty()
+                            {
+                                self.composer
+                                    .restore_text(std::mem::take(&mut self.last_input));
+                            }
+                        }
                         Err(message) => {
-                            self.push_message(MessageKind::Error, "error", message);
+                            self.push_message(MessageKind::Error, "error", message.clone());
                             self.push_message_with_status(
                                 MessageKind::System,
                                 "stopped",
@@ -403,6 +474,7 @@ impl TuiUi {
                             );
                         }
                     }
+                    self.drain_pending_messages();
                 }
                 TuiAgentMessage::CompactFinished {
                     agent,
@@ -435,6 +507,18 @@ impl TuiUi {
         Ok(())
     }
 
+    fn drain_pending_messages(&mut self) {
+        while !self.pending_messages.is_empty() {
+            let next = self.pending_messages.remove(0);
+            if self.agent_task.is_none() {
+                self.start_agent_turn(next);
+            } else {
+                self.pending_messages.insert(0, next);
+                break;
+            }
+        }
+    }
+
     fn start_agent_turn(&mut self, input: String) {
         if self.agent_task.is_some() {
             self.push_message(
@@ -444,9 +528,12 @@ impl TuiUi {
             );
             return;
         }
+        self.last_input = input.clone();
         let Some(mut agent) = self.agent.take() else {
             return;
         };
+        self.cancellation = tokio_util::sync::CancellationToken::new();
+        agent.set_cancellation_token(self.cancellation.clone());
         self.run_status = RunStatus::Working;
         let tx = self.agent_tx.clone();
         self.agent_task = Some(tokio::spawn(async move {
@@ -734,6 +821,20 @@ impl TuiUi {
                     format_active_plan(agent.active_plan()),
                 );
             }
+            SlashCommand::PlanMode => {
+                let agent = self.agent.as_mut().expect("agent checked above");
+                if agent.is_plan_mode() {
+                    agent.exit_plan_mode()?;
+                    self.push_message(MessageKind::System, "/plan-mode", "exited plan mode");
+                } else {
+                    agent.enter_plan_mode()?;
+                    self.push_message(
+                        MessageKind::System,
+                        "/plan-mode",
+                        "entered plan mode — write operations are now denied",
+                    );
+                }
+            }
             SlashCommand::Model => {
                 let agent = self.agent.as_ref().expect("agent checked above");
                 self.model_panel = Some(ModelPanelState::from_settings(
@@ -823,6 +924,37 @@ impl TuiUi {
             return Ok(false);
         }
         let picker = self.approval_picker.as_mut().expect("picker checked above");
+        if picker.is_plan_mode() {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.finish_plan_approval(PlanApprovalDecision::Approve);
+                    return Ok(true);
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.finish_plan_approval(PlanApprovalDecision::Edit);
+                    return Ok(true);
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    self.finish_plan_approval(PlanApprovalDecision::MoreGuidance(String::new()));
+                    return Ok(true);
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    let decision = match picker.selected() {
+                        0 => PlanApprovalDecision::Approve,
+                        1 => PlanApprovalDecision::Edit,
+                        _ => PlanApprovalDecision::MoreGuidance(String::new()),
+                    };
+                    self.finish_plan_approval(decision);
+                    return Ok(true);
+                }
+                KeyCode::Esc => {
+                    self.finish_plan_approval(PlanApprovalDecision::Edit);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
         match picker.handle_key(key) {
             ApprovalAction::None => {}
             ApprovalAction::Decide(decision) => {
@@ -837,6 +969,13 @@ impl TuiUi {
             picker.send(decision);
         }
         self.remove_permission_message();
+        self.run_status = RunStatus::Working;
+    }
+
+    fn finish_plan_approval(&mut self, decision: PlanApprovalDecision) {
+        if let Some(mut picker) = self.approval_picker.take() {
+            picker.send_plan_decision(decision);
+        }
         self.run_status = RunStatus::Working;
     }
 
@@ -1543,6 +1682,7 @@ mod tests {
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             auto_compact: Default::default(),
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);
@@ -1581,6 +1721,7 @@ mod tests {
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             auto_compact: Default::default(),
+            max_retries: crate::config::DEFAULT_MAX_RETRIES,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);
@@ -1621,6 +1762,8 @@ mod tests {
             show_reasoning: false,
             run_status: RunStatus::Working,
             animation_tick: 2,
+            pending_count: 0,
+            plan_mode: false,
         };
         let text = footer_text(&footer);
         assert!(text.contains("deepseek-v4-flash"));
@@ -1643,9 +1786,15 @@ mod tests {
     fn bottom_panel_expands_for_popup_below_composer() {
         let mut composer = ComposerState::new();
         composer.handle_key(key(KeyCode::Char('/')));
-        assert!(bottom_panel_height(&composer, None, None) > 1);
-        assert_eq!(bottom_panel_height(&ComposerState::new(), None, None), 1);
-        assert_eq!(bottom_panel_height(&ComposerState::new(), None, Some(0)), 6);
+        assert!(bottom_panel_height(&composer, None, None, false) > 1);
+        assert_eq!(
+            bottom_panel_height(&ComposerState::new(), None, None, false),
+            1
+        );
+        assert_eq!(
+            bottom_panel_height(&ComposerState::new(), None, Some(0), false),
+            6
+        );
     }
 
     #[test]
@@ -1744,6 +1893,8 @@ mod tests {
             show_reasoning: false,
             run_status: RunStatus::Idle,
             animation_tick: 0,
+            pending_count: 0,
+            plan_mode: false,
         };
         assert_eq!(working_panel_height(&footer), 0);
         footer.run_status = RunStatus::Working;

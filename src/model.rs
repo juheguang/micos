@@ -6,7 +6,7 @@ mod types;
 
 pub use chat::ChatCompletionsResponse;
 pub use types::{
-    responses_input_to_chat_messages, responses_tools_to_chat_tools, ModelClient,
+    responses_input_to_chat_messages, responses_tools_to_chat_tools, ModelClient, ModelErrorClass,
     ModelFunctionCall, ModelRequest, ModelResponse, OpenAiModelClient,
 };
 #[cfg(test)]
