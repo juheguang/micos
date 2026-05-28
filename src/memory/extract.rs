@@ -34,22 +34,19 @@ pub fn parse_extraction_output(text: &str) -> Vec<ExtractedMemory> {
             if line.is_empty() {
                 return None;
             }
-            serde_json::from_str::<MemoryLine>(line).ok().map(|m| {
-                ExtractedMemory {
+            serde_json::from_str::<MemoryLine>(line)
+                .ok()
+                .map(|m| ExtractedMemory {
                     title: m.title.trim().to_string(),
                     body: m.body.trim().to_string(),
                     memory_type: m.memory_type.unwrap_or_else(|| "project".to_string()),
-                }
-            })
+                })
         })
         .filter(|m| !m.title.is_empty() && !m.body.is_empty())
         .collect()
 }
 
-pub fn extraction_request(
-    draft: &HandoffDraft,
-    existing_entries: &[&MemoryEntry],
-) -> String {
+pub fn extraction_request(draft: &HandoffDraft, existing_entries: &[&MemoryEntry]) -> String {
     let files = if draft.files_touched.is_empty() {
         "none".to_string()
     } else {
@@ -137,11 +134,8 @@ pub fn build_candidates(
 
     if candidates.is_empty() && skipped.iter().all(|s| s.starts_with("duplicate")) {
         // all extracted memories are duplicates — fall back to deterministic draft
-        let fallback_candidate = candidate_from_draft(
-            fallback,
-            source_session,
-            timestamp.to_string(),
-        );
+        let fallback_candidate =
+            candidate_from_draft(fallback, source_session, timestamp.to_string());
         write_toml(
             &candidates_dir.join(format!("{}.toml", sanitize_id(&fallback_candidate.id))),
             &fallback_candidate,

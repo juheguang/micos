@@ -404,10 +404,7 @@ fn handle_console_memory<C: ModelClient>(
     }
     if args == "sweep" {
         match agent.sweep_memory(30) {
-            Ok(stale) => println!(
-                "{}",
-                format_memory_sweep(&stale, 30)
-            ),
+            Ok(stale) => println!("{}", format_memory_sweep(&stale, 30)),
             Err(error) => eprintln!("memory sweep failed: {error}"),
         }
         return Ok(());

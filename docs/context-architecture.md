@@ -7,7 +7,7 @@ append-only 聊天记录，而是由 **7 个固定层** 按优先级从高到低
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ Layer 1: Base prompt         (~3K tokens)         │ ← 11 段静态行为指令
+│ Layer 1: Base prompt         (~5K tokens)         │ ← 11 段静态行为指令
 ├──────────────────────────────────────────────────┤
 │ Layer 2: Runtime context       (~100 tokens)       │ ← cwd / model / permission / date
 ├──────────────────────────────────────────────────┤
@@ -29,7 +29,7 @@ append-only 聊天记录，而是由 **7 个固定层** 按优先级从高到低
 
 **来源**: `src/prompt.rs` → `BASE_SECTIONS` 常量（11 个章节）
 
-固定的行为指令，不随 session 变化。包括：
+固定的行为指令（~5K tokens，7 段→11 段扩展后），不随 session 变化。包括：
 - Identity — 你是谁
 - Task discipline — 怎么做事
 - Tool selection — 何时用哪个工具

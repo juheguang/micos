@@ -5,17 +5,15 @@ use std::path::{Path, PathBuf};
 
 mod extract;
 mod records;
-use records::{
-    candidate_from_draft, deduplicate_candidate, entry_from_candidate, render_active_entries,
-    sanitize_id, scan_toml_dir, write_toml,
-};
 pub use extract::{
     build_candidates, extraction_request, parse_extraction_output, ExtractedMemory,
     MemoryExtractionReport,
 };
-pub use records::{
-    MemoryCandidate, MemoryCandidateReport, MemoryEntry, MemoryStatus, MemoryType,
+use records::{
+    candidate_from_draft, deduplicate_candidate, entry_from_candidate, render_active_entries,
+    sanitize_id, scan_toml_dir, write_toml,
 };
+pub use records::{MemoryCandidate, MemoryCandidateReport, MemoryEntry, MemoryStatus, MemoryType};
 
 pub const MEMORY_DIR: &str = ".micos/memory";
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
@@ -199,8 +197,7 @@ impl ProjectMemory {
             .iter()
             .filter(|e| e.status == MemoryStatus::Active)
             .collect();
-        let dup_status =
-            deduplicate_candidate(&candidate.title, &candidate.body, &active);
+        let dup_status = deduplicate_candidate(&candidate.title, &candidate.body, &active);
         if dup_status == "duplicate" {
             bail!("duplicate of existing entry — use /memory promote only for new facts");
         }
@@ -304,8 +301,7 @@ impl ProjectMemory {
             sanitize_id(&entry.id),
             trim_first_line(&entry.body, 120)
         );
-        let mut index = std::fs::read_to_string(&self.index_path)
-            .unwrap_or_default();
+        let mut index = std::fs::read_to_string(&self.index_path).unwrap_or_default();
         if index.contains(&entry.id) {
             return Ok(());
         }
@@ -330,12 +326,8 @@ impl ProjectMemory {
     }
 
     fn remove_from_index(&self, id: &str) -> Result<()> {
-        let index = std::fs::read_to_string(&self.index_path)
-            .unwrap_or_default();
-        let filtered: Vec<&str> = index
-            .lines()
-            .filter(|line| !line.contains(id))
-            .collect();
+        let index = std::fs::read_to_string(&self.index_path).unwrap_or_default();
+        let filtered: Vec<&str> = index.lines().filter(|line| !line.contains(id)).collect();
         std::fs::write(&self.index_path, filtered.join("\n"))
             .with_context(|| format!("write memory index {}", self.index_path.display()))?;
         Ok(())
@@ -405,16 +397,14 @@ fn parse_date(date_str: &str) -> Result<(i32, time::Month, u8)> {
     let year: i32 = parts[0].parse().context("parse year")?;
     let month_num: u8 = parts[1].parse().context("parse month")?;
     let day: u8 = parts[2].parse().context("parse day")?;
-    let month = time::Month::try_from(month_num).map_err(|_| anyhow::anyhow!("invalid month: {month_num}"))?;
+    let month = time::Month::try_from(month_num)
+        .map_err(|_| anyhow::anyhow!("invalid month: {month_num}"))?;
     Ok((year, month, day))
 }
 
 fn trim_first_line(text: &str, max_chars: usize) -> String {
     let line = text.lines().next().unwrap_or(text).trim();
-    let compact: String = line
-        .chars()
-        .take(max_chars)
-        .collect();
+    let compact: String = line.chars().take(max_chars).collect();
     if line.chars().count() > max_chars {
         format!("{compact}...")
     } else {

@@ -690,7 +690,8 @@ where
         }));
 
         if compact::should_micro_compact(&self.transcript, self.last_micro_compact_at) {
-            let _cleared = compact::micro_compact(&mut self.transcript, compact::MICRO_COMPACT_KEEP);
+            let _cleared =
+                compact::micro_compact(&mut self.transcript, compact::MICRO_COMPACT_KEEP);
             self.last_micro_compact_at = Some(std::time::Instant::now());
         }
 
@@ -1020,13 +1021,14 @@ where
         }
         let result = self
             .tools
-            .execute(
+            .execute_streaming(
                 name,
                 arguments,
                 ToolContext {
                     cwd: self.config.cwd.clone(),
                     permission: self.config.permission,
                 },
+                ui,
             )
             .await;
         if !metadata.read_only {
@@ -1883,7 +1885,17 @@ status = "active"
             .iter()
             .map(|schema| schema["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(tool_names, vec!["list_files", "read_file", "write_file", "grep", "edit", "glob"]);
+        assert_eq!(
+            tool_names,
+            vec![
+                "list_files",
+                "read_file",
+                "write_file",
+                "grep",
+                "edit",
+                "glob"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1915,7 +1927,15 @@ status = "active"
             .collect::<Vec<_>>();
         assert_eq!(
             tool_names,
-            vec!["list_files", "read_file", "write_file", "shell", "grep", "edit", "glob"]
+            vec![
+                "list_files",
+                "read_file",
+                "write_file",
+                "shell",
+                "grep",
+                "edit",
+                "glob"
+            ]
         );
         assert_eq!(path_config.permission_rules.len(), 1);
 

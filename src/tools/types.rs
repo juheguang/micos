@@ -1,5 +1,6 @@
 use crate::config::PermissionMode;
 use crate::tools::policy::{PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine};
+use crate::ui::UiSink;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -11,6 +12,15 @@ pub trait Tool {
     fn metadata(&self, arguments: &Value) -> ToolMetadata;
     fn schema(&self) -> Value;
     async fn execute(&self, input: Value, ctx: ToolContext) -> ToolResult;
+
+    async fn execute_streaming<S: UiSink + Send>(
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        _sink: &mut S,
+    ) -> ToolResult {
+        self.execute(input, ctx).await
+    }
 }
 
 #[allow(async_fn_in_trait)]
@@ -23,6 +33,16 @@ pub trait ToolRegistry {
     ) -> Vec<Value>;
     fn metadata(&self, name: &str, arguments: &Value) -> Option<ToolMetadata>;
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> ToolResult;
+
+    async fn execute_streaming<S: UiSink + Send>(
+        &self,
+        name: &str,
+        input: Value,
+        ctx: ToolContext,
+        _sink: &mut S,
+    ) -> ToolResult {
+        self.execute(name, input, ctx).await
+    }
 }
 
 pub trait PermissionPolicy {

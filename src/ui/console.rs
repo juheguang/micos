@@ -261,6 +261,19 @@ impl UiSink for ConsoleUi {
                     self.active_spinner = Some(spinner);
                 }
             }
+            AgentEvent::ToolOutputDelta {
+                name: _,
+                delta,
+                is_stderr,
+            } => {
+                self.finish_spinner();
+                if is_stderr && self.color {
+                    print!("{}", style(delta).yellow());
+                } else {
+                    print!("{delta}");
+                }
+                io::stdout().flush().context("flush tool output delta")?;
+            }
             AgentEvent::ToolCallFinished {
                 call_id: _,
                 name,

@@ -8,10 +8,9 @@ use crate::ui::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
     format_memory, format_memory_candidate_report, format_memory_candidates, format_memory_entry,
     format_memory_index, format_memory_sweep, format_prompt, format_recovery_report,
-    format_resume_report,
-    format_sessions, format_status, format_summary, format_trace, format_transcript,
-    format_verification_report, recent_session_choices, AgentEvent, ApprovalDecision, SlashCommand,
-    SlashInvocation, UiSink,
+    format_resume_report, format_sessions, format_status, format_summary, format_trace,
+    format_transcript, format_verification_report, recent_session_choices, AgentEvent,
+    ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -1241,6 +1240,21 @@ impl TuiUi {
                     summary,
                     Some(MessageStatus::Running),
                 );
+            }
+            AgentEvent::ToolOutputDelta {
+                name: _,
+                delta,
+                is_stderr,
+            } => {
+                self.tick_animation();
+                if let Some(index) = self.active_tool_message {
+                    if index < self.messages.len() {
+                        let prefix = if is_stderr { "err: " } else { "" };
+                        self.messages[index]
+                            .body
+                            .push_str(&format!("{prefix}{delta}"));
+                    }
+                }
             }
             AgentEvent::ToolCallFinished {
                 call_id: _,

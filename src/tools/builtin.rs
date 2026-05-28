@@ -1,8 +1,9 @@
 use super::{
     classify_shell_command, path_has_symlink_component, resolve_under_cwd,
-    truncate_text_with_metadata, PermissionDecision, ShellSafety, Tool, ToolContext,
-    ToolErrorKind, ToolMetadata, ToolRegistry, ToolResult, ToolSummary,
+    truncate_text_with_metadata, PermissionDecision, ShellSafety, Tool, ToolContext, ToolErrorKind,
+    ToolMetadata, ToolRegistry, ToolResult, ToolSummary,
 };
+use crate::ui::{AgentEvent, UiSink};
 use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -13,6 +14,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 const READ_LIMIT: usize = 64 * 1024;
 const SHELL_OUTPUT_LIMIT: usize = 32 * 1024;
@@ -97,6 +99,19 @@ impl ToolRegistry for BuiltinToolRegistry {
         };
         tool.execute(input, ctx).await
     }
+
+    async fn execute_streaming<S: UiSink + Send>(
+        &self,
+        name: &str,
+        input: Value,
+        ctx: ToolContext,
+        sink: &mut S,
+    ) -> ToolResult {
+        let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
+            return ToolResult::error(format!("unknown tool: {name}"));
+        };
+        tool.execute_streaming(input, ctx, sink).await
+    }
 }
 
 impl Tool for BuiltinTool {
@@ -114,10 +129,10 @@ impl Tool for BuiltinTool {
 
     fn metadata(&self, arguments: &Value) -> ToolMetadata {
         let (read_only, destructive, concurrency_safe, permission_hint) = match self {
-            BuiltinTool::ListFiles | BuiltinTool::ReadFile | BuiltinTool::Grep
-            | BuiltinTool::Glob => {
-                (true, false, true, PermissionDecision::Allow)
-            }
+            BuiltinTool::ListFiles
+            | BuiltinTool::ReadFile
+            | BuiltinTool::Grep
+            | BuiltinTool::Glob => (true, false, true, PermissionDecision::Allow),
             BuiltinTool::WriteFile | BuiltinTool::Edit => {
                 (false, true, false, PermissionDecision::Ask)
             }
@@ -260,13 +275,12 @@ impl Tool for BuiltinTool {
         match self.execute_inner(input, ctx).await {
             Ok(result) => result,
             Err(err) => match err {
-                ToolExecError::Timeout { duration_ms } => {
-                    ToolResult::error_with_kind(ToolErrorKind::Timeout,
-                        format!("timed out after {duration_ms}ms"))
-                }
+                ToolExecError::Timeout { duration_ms } => ToolResult::error_with_kind(
+                    ToolErrorKind::Timeout,
+                    format!("timed out after {duration_ms}ms"),
+                ),
                 ToolExecError::Io { source, context } => {
-                    ToolResult::error_with_kind(ToolErrorKind::Io,
-                        format!("{context}: {source}"))
+                    ToolResult::error_with_kind(ToolErrorKind::Io, format!("{context}: {source}"))
                 }
                 ToolExecError::Parse(error) => {
                     ToolResult::error_with_kind(ToolErrorKind::Parse, error.to_string())
@@ -274,10 +288,10 @@ impl Tool for BuiltinTool {
                 ToolExecError::Permission(msg) => {
                     ToolResult::error_with_kind(ToolErrorKind::Permission, msg)
                 }
-                ToolExecError::ProcessExit { code } => {
-                    ToolResult::error_with_kind(ToolErrorKind::ProcessExit,
-                        format!("process exited with code {code:?}"))
-                }
+                ToolExecError::ProcessExit { code } => ToolResult::error_with_kind(
+                    ToolErrorKind::ProcessExit,
+                    format!("process exited with code {code:?}"),
+                ),
                 ToolExecError::Utf8(error) => {
                     ToolResult::error_with_kind(ToolErrorKind::Utf8, error.to_string())
                 }
@@ -285,6 +299,46 @@ impl Tool for BuiltinTool {
                     ToolResult::error_with_kind(ToolErrorKind::Unknown, error.to_string())
                 }
             },
+        }
+    }
+
+    async fn execute_streaming<S: UiSink + Send>(
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        sink: &mut S,
+    ) -> ToolResult {
+        match self {
+            BuiltinTool::Shell => match self.execute_inner_streaming(input, ctx, sink).await {
+                Ok(result) => result,
+                Err(err) => match err {
+                    ToolExecError::Timeout { duration_ms } => ToolResult::error_with_kind(
+                        ToolErrorKind::Timeout,
+                        format!("timed out after {duration_ms}ms"),
+                    ),
+                    ToolExecError::Io { source, context } => ToolResult::error_with_kind(
+                        ToolErrorKind::Io,
+                        format!("{context}: {source}"),
+                    ),
+                    ToolExecError::Parse(error) => {
+                        ToolResult::error_with_kind(ToolErrorKind::Parse, error.to_string())
+                    }
+                    ToolExecError::Permission(msg) => {
+                        ToolResult::error_with_kind(ToolErrorKind::Permission, msg)
+                    }
+                    ToolExecError::ProcessExit { code } => ToolResult::error_with_kind(
+                        ToolErrorKind::ProcessExit,
+                        format!("process exited with code {code:?}"),
+                    ),
+                    ToolExecError::Utf8(error) => {
+                        ToolResult::error_with_kind(ToolErrorKind::Utf8, error.to_string())
+                    }
+                    ToolExecError::Other(error) => {
+                        ToolResult::error_with_kind(ToolErrorKind::Unknown, error.to_string())
+                    }
+                },
+            },
+            _ => self.execute(input, ctx).await,
         }
     }
 }
@@ -303,6 +357,18 @@ impl BuiltinTool {
             BuiltinTool::Grep => grep(input, &ctx.cwd).await,
             BuiltinTool::Edit => edit(input, &ctx).await,
             BuiltinTool::Glob => glob(input, &ctx.cwd).await,
+        }
+    }
+
+    async fn execute_inner_streaming<S: UiSink + Send>(
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        sink: &mut S,
+    ) -> std::result::Result<ToolResult, ToolExecError> {
+        match self {
+            BuiltinTool::Shell => shell_streaming(input, &ctx, sink).await,
+            _ => self.execute_inner(input, ctx).await,
         }
     }
 }
@@ -513,6 +579,127 @@ async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResul
     ))
 }
 
+const STREAMING_CHUNK_SIZE: usize = 4096;
+
+async fn shell_streaming<S: UiSink + Send>(
+    input: Value,
+    ctx: &ToolContext,
+    sink: &mut S,
+) -> std::result::Result<ToolResult, ToolExecError> {
+    let input: ShellInput = serde_json::from_value(input)?;
+
+    let timeout_ms = input
+        .timeout_ms
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
+        .min(MAX_SHELL_TIMEOUT_MS);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut child = Command::new(shell)
+        .arg("-lc")
+        .arg(&input.command)
+        .current_dir(&ctx.cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn shell command")?;
+
+    let mut stdout = child.stdout.take().context("capture stdout")?;
+    let mut stderr = child.stderr.take().context("capture stderr")?;
+
+    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<(Vec<u8>, bool)>();
+
+    let stdout_task = tokio::spawn({
+        let tx = delta_tx.clone();
+        async move {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = chunk[..n].to_vec();
+                        buf.extend_from_slice(&data);
+                        let _ = tx.send((data, false));
+                    }
+                    Err(_) => break,
+                }
+            }
+            buf
+        }
+    });
+
+    let stderr_task = tokio::spawn({
+        let tx = delta_tx.clone();
+        async move {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; STREAMING_CHUNK_SIZE];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = chunk[..n].to_vec();
+                        buf.extend_from_slice(&data);
+                        let _ = tx.send((data, true));
+                    }
+                    Err(_) => break,
+                }
+            }
+            buf
+        }
+    });
+
+    drop(delta_tx);
+    let timeout_fut = tokio::time::sleep(Duration::from_millis(timeout_ms));
+    tokio::pin!(timeout_fut);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout_fut => {
+                let _ = child.kill().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(ToolExecError::Timeout {
+                    duration_ms: timeout_ms,
+                });
+            }
+            delta = delta_rx.recv() => {
+                match delta {
+                    Some((data, is_stderr)) => {
+                        let text = String::from_utf8_lossy(&data).into_owned();
+                        let _ = sink.on_event(AgentEvent::ToolOutputDelta {
+                            name: "shell".into(),
+                            delta: text,
+                            is_stderr,
+                        });
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.context("wait for shell command")?;
+    let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
+    let stdout_buf = stdout_res.context("join stdout task")?;
+    let stderr_buf = stderr_res.context("join stderr task")?;
+
+    let combined = format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        status
+            .code()
+            .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+        String::from_utf8_lossy(&stdout_buf),
+        String::from_utf8_lossy(&stderr_buf)
+    );
+    let preview = truncate_text_with_metadata(&combined, SHELL_OUTPUT_LIMIT);
+    Ok(ToolResult::ok_with_preview(
+        preview.text,
+        preview.truncated,
+        preview.original_bytes,
+        preview.preview_bytes,
+    ))
+}
+
 const GREP_OUTPUT_LIMIT: usize = 64 * 1024;
 const GREP_TIMEOUT_MS: u64 = 30_000;
 const GREP_MAX_MATCHES: &str = "500";
@@ -556,16 +743,16 @@ async fn grep(input: Value, cwd: &Path) -> std::result::Result<ToolResult, ToolE
         stderr.read_to_end(&mut buf).await.map(|_| buf)
     });
 
-    let status = match tokio::time::timeout(Duration::from_millis(GREP_TIMEOUT_MS), child.wait()).await
-    {
-        Ok(result) => result.context("wait for rg")?,
-        Err(_) => {
-            let _ = child.kill().await;
-            return Err(ToolExecError::Timeout {
-                duration_ms: GREP_TIMEOUT_MS,
-            });
-        }
-    };
+    let status =
+        match tokio::time::timeout(Duration::from_millis(GREP_TIMEOUT_MS), child.wait()).await {
+            Ok(result) => result.context("wait for rg")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(ToolExecError::Timeout {
+                    duration_ms: GREP_TIMEOUT_MS,
+                });
+            }
+        };
 
     let stdout = stdout_task
         .await

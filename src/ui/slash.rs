@@ -651,10 +651,7 @@ pub fn format_memory_sweep(stale: &[MemoryEntry], stale_days: u64) -> String {
         stale.len()
     )];
     for entry in stale {
-        let last = entry
-            .last_validated_at
-            .as_deref()
-            .unwrap_or("unknown");
+        let last = entry.last_validated_at.as_deref().unwrap_or("unknown");
         lines.push(format!("  {} — last validated {}", entry.title, last));
     }
     lines.push("Use /memory stale <id> to mark as stale, /memory forget <id> to remove.".into());

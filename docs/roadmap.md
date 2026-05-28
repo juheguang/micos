@@ -4,9 +4,10 @@ This document is the single source of truth for micos planning. It supersedes
 the archived `harness-roadmap.md` and `minimal-harness-roadmap.md` (see
 [archive/](./archive/)).
 
-## Current Baseline — v0.4.6
+## Current Baseline — v0.7.1
 
-micos is a functioning local coding agent harness. The runtime currently owns:
+micos is a functioning local coding agent harness (~17K lines, 143 tests, 5 eval fixtures).
+The runtime currently owns:
 
 **Model Loop:**
 - OpenAI Responses API and Chat Completions, DeepSeek reasoning replay
@@ -77,96 +78,88 @@ micos is a functioning local coding agent harness. The runtime currently owns:
 8. **Preserve original session JSONL** even when model-visible context is compacted.
 9. **Avoid expanding context automatically** unless the source, size, and reason are inspectable.
 
-## Current Gaps (as of v0.4.6)
+## Current Gaps (as of v0.7.1)
 
-The baseline is functional but has clear weak points identified during review:
+Most v0.5 and v0.6 items are complete. Remaining gaps:
 
-- **Error handling is stringly-typed.** `ToolExecError` has a single `Other(anyhow::Error)` variant. Tool failures carry no structured classification (timeout vs IO vs parse vs permission), making recovery and model guidance imprecise.
-- **Only shell has a timeout.** `read_file`, `write_file`, `list_files` can block indefinitely on slow disks or large directories.
-- **Shell output is batch-collected.** stdout/stderr are read only after the process exits. No streaming progress for long-running commands.
-- **Only 4 tools.** No `grep`/search, no `edit`/patch, no `glob`/find. The model must use `shell` for these, but shell is restricted in safe mode and error-prone even in auto.
-- **Memory is purely deterministic.** Candidate generation extracts facts from handoff fields with no model-driven semantic extraction, no deduplication, no clustering.
-- **No automatic compaction.** `context_warning_percent` is configurable but only sets a flag in context snapshots; it never triggers compaction.
+- **Shell output is batch-collected.** stdout/stderr are read only after the process exits. No streaming progress for long-running commands like `cargo build` or `cargo test`.
+- **No CI.** Tests run only locally via `cargo test`. No automated gate on push/PR.
 - **No hooks system.** No lifecycle events for project-specific rules to hook into.
-- **Prompt is minimal.** 7 short behavioral paragraphs with no concrete examples, error recovery patterns, tool selection priorities, or file editing conventions.
+- **No MCP client.** No external tool server integration.
 
 ## Milestones
 
-### v0.5 — Production Hardening
+### v0.5 — Production Hardening ✅ (done in v0.5.x)
 
 Target: make the existing feature set robust for regular daily use.
 
-**Structured Error Handling:**
-- Replace `ToolExecError::Other(anyhow)` with typed variants: `Timeout`, `Io`, `Parse`, `Permission`, `ProcessExit`, `Utf8`
-- Add configurable per-tool timeouts enforced by the harness (not just shell)
-- Map error types to recovery hints in `/recover` and model-visible messages
-- Classify errors as retryable or terminal at the harness level
+**Structured Error Handling:** ✅
+- `ToolExecError` has 7 typed variants: `Timeout`, `Io`, `Parse`, `Permission`, `ProcessExit`, `Utf8`, `Other`
+- `ToolErrorKind` enum propagates to session events for recovery classification
+- Error types map to retryable/terminal classification
 
-**Tool Enrichment:**
-- `grep` — search file contents with regex, return file:line matches with context lines, respect `.gitignore`
-- `edit` — apply a unified diff or line-range replacement to an existing file, with pre-edit snapshot
-- `glob` — recursive file pattern matching (`**/*.rs`, `src/**/*.md`)
-- All new tools follow the same permission/audit/truncation path as existing tools
+**Tool Enrichment:** ✅
+- `grep` — ripgrep-backed search with regex, file:line matches, 64KB limit, 500 max matches
+- `edit` — search/replace (first occurrence) + line-based range replacement, write_file-level safety
+- `glob` — recursive file pattern matching, 32KB limit, paths relative to cwd
+- All tools follow the same permission/audit/truncation path
 
-**Shell Improvements:**
-- Streaming stdout/stderr capture — emit chunks to UI during execution
+**Auto-Compression:** ✅
+- Threshold trigger with `Off`/`Warn`/`Auto` modes
+- Write-Before-Compaction: extract memories before compacting
+- Circuit breaker: 3 consecutive failures → disable
+- Configurable via CLI (`--auto-compact`), env (`MICOS_AUTO_COMPACT`), or config file
+
+**Prompt Professionalization:** ✅
+- 11 base sections (up from 7): Identity, Task discipline, Tool selection, File editing, Permissions, Error recovery, Verification, Context governance, Safety, Tool reference, Reporting style
+- ~160 lines of behavioral instructions with concrete patterns
+
+**Shell Streaming:** ⬜ (deferred to v0.7.2)
+- Streaming stdout/stderr capture during execution
 - Progress indicators: elapsed time, output bytes accumulated
-- Output ring buffer: keep last N KiB in preview, full output in session log
 
-**Auto-Compression:**
-- Threshold trigger: when `usage_percent >= context_warning_percent`, warn and offer compaction
-- Configurable mode: `off` / `warn` / `auto` (auto still asks before first compact)
-- Circuit breaker: abort after N consecutive compaction failures
-- Pre-compact snapshot saved to session log before any mutation
-
-**Prompt Professionalization:**
-- Add concrete behavior examples to base sections (good vs bad patterns)
-- Document error recovery patterns: when a tool fails, what to check before retrying
-- Add tool selection priorities: when to use `grep` vs `shell(rg)`, when to use `edit` vs `write_file`
-- Include file editing conventions: read before edit, scope edits to the task, don't mix refactors
-- Version the prompt and expose version in `/prompt` output
-
-*Acceptance criteria:*
-- All tool failures produce a typed error variant, not a generic string
-- `grep`, `edit`, and `glob` pass deterministic eval fixtures
-- Shell commands stream output to TUI in real time
-- Auto-compact warns at threshold and asks before executing
-- `/prompt` shows prompt version and per-section token estimates
-
-### v0.6 — Memory and Context Lifecycle
+### v0.6 — Memory and Context Lifecycle ✅ (done in v0.6.x)
 
 Target: close the loop between session work, durable memory, and context budget.
 
-> **Detailed plan:** [docs/roadmap-0.6.md](./roadmap-0.6.md) — 彻底改造记忆和上下文策略，让 harness 承担提取时机、压缩触发、生命周期管理，模型只负责语义理解。
+> **Detailed plan:** [docs/roadmap-0.6.md](./roadmap-0.6.md)
 
-**Memory Enhancement:**
-- Model-driven candidate extraction: after session end (or on `/memory refresh`), ask the model to extract durable facts, decisions, and patterns from the session transcript
-- Candidate deduplication: compare new candidates against existing entries; flag near-duplicates
-- Auto-staleness: entries not referenced or validated in N sessions are suggested for review
-- Topic clustering: group related entries under topic files in `topics/`
+**Memory Enhancement:** ✅
+- Model-driven candidate extraction triggers at session end and on `/memory refresh`
+- Candidate deduplication: title/body comparison against existing entries (new/similar/duplicate)
+- Auto-staleness: `/memory sweep` checks `last_validated_at`, marks stale entries
+- Four memory types: User, Feedback, Project, Reference with structured frontmatter
 
-**Context Budget Management:**
-- Per-category token budgets (system prompt, memory, plan, messages, tool schemas, tool outputs)
-- Gradual degradation: when approaching budget, truncate tool output previews first, then compact, then warn
-- `/context` shows budget utilization per category with color-coded pressure indicators
+**Context Budget Management:** ✅
+- 7-layer context assembly: base_prompt → runtime → memory_index → active_plan → compact_summary → recent_tail → tool_schemas
+- `/context` shows per-layer and per-category token utilization
+- `ContextLayer` struct with name + token count for each layer
 
-**Smarter Compact:**
-- Task-aware preservation: always retain the current file being edited, verification commands and results, and the last 3 user requests
-- Structured compact output with mandatory sections (already implemented), validated against critical context loss
-- Compact preserves tool_call/tool_result pairs correctly (already implemented)
+**Three-Tier Compression:** ✅
+- Micro-compaction: time-based (600s idle), clears old tool outputs in-place, zero API calls
+- Auto-compact: threshold-triggered model summarization with Write-Before-Compaction
+- Manual `/compact`: structured summary with 8 validated headings
+- Compact preserves `function_call`/`function_call_output` pairs
 
-**MEMORY.md Auto-Maintenance:**
-- On promote/forget/stale, update the index file to reflect current state
-- Index regeneration command for consistency repair
-- Topic files carry structured frontmatter (source session, timestamp, scope, last validated)
+**MEMORY.md Auto-Maintenance:** ✅
+- `promote_candidate()` auto-updates MEMORY.md index
+- `mark_entry_status(Forgotten)` auto-removes from index
+- Index trimmed to 200 lines on each write
 
-*Acceptance criteria:*
-- `/memory refresh` produces model-extracted candidates (not just handoff field concatenation)
-- Promoting a candidate updates both the entry TOML and the MEMORY.md index
-- `/context` shows per-category budgets with utilization percentages
-- Stale entries are detectable and reviewable
+### v0.7 — Context Refinement 🟡 (in progress)
 
-### v0.7 — Extensibility
+Target: close remaining context governance gaps and address engineering foundations.
+
+**Completed:**
+- ✅ Micro-compaction (`v0.7.0`-`v0.7.1`): time-based (600s idle) lightweight tool output cleanup, zero API calls, KV-cache-aware design
+- ✅ Context architecture documentation (`docs/context-architecture.md`)
+
+**In Progress / Planned:**
+- ⬜ Shell streaming output (`v0.7.2`): replace batch-collected shell output with real-time streaming to TUI and console
+- ⬜ CI workflow (`v0.7.2`): GitHub Actions with `cargo test` + `cargo fmt --check`
+- ⬜ Roadmap + doc updates (`v0.7.2`): reflect actual completion status
+
+### v0.8 — Extensibility (deferred)
 
 Target: expose controlled lifecycle points and external tool integration.
 
@@ -175,25 +168,18 @@ Target: expose controlled lifecycle points and external tool integration.
 - Hook actions: allow, deny, modify (add context, add warning, suggest permission)
 - Project-local config: `.micos/hooks.toml`
 - Hook sandboxing: timeout per hook, failure isolation (one hook crash doesn't kill the runtime)
-- Hook-added context is size-limited and recorded in session events
 
 **MCP Client:**
 - Connect to MCP servers for external tool schemas
 - External tools follow the same permission → audit → trace pipeline as built-in tools
 - MCP resources and prompts as context sources
-- Capability registry: every external tool has a schema, permission class, and audit name
 
 **Multi-Agent Delegation Foundation:**
 - Define delegation protocol: task brief, allowed tools, context pack, expected artifact, timeout, success criteria
 - Subagent isolation: separate transcript, bounded tool access, independent stop conditions
 - Result merge policy: how subagent output integrates into the main session transcript
 
-*Acceptance criteria:*
-- Hooks can block or warn on tool calls matching project-specific patterns
-- An MCP-provided tool is permissioned and audited identically to a built-in tool
-- A delegation turn starts, runs, and merges results without corrupting the main session
-
-## Deferred Work (Non-Goals for v0.5–v0.7)
+## Deferred Work (Non-Goals for current versions)
 
 - Full plugin ecosystem (hooks are the extension point, not a plugin system)
 - Remote session sync / collaboration
@@ -201,6 +187,7 @@ Target: expose controlled lifecycle points and external tool integration.
 - Destructive rollback (git checkpoints remain audit-only)
 - Automatic memory promotion without user review
 - Claude Code UX parity
+- SQLite or vector DB for memory storage (file system is sufficient)
 
 ## Operating Principles
 

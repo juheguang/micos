@@ -40,6 +40,11 @@ pub enum AgentEvent {
         name: String,
         summary: String,
     },
+    ToolOutputDelta {
+        name: String,
+        delta: String,
+        is_stderr: bool,
+    },
     Stop {
         reason: StopReason,
     },
