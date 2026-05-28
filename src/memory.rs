@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 mod extract;
 mod records;
 use records::{
-    candidate_from_draft, entry_from_candidate, render_active_entries, sanitize_id, scan_toml_dir,
-    write_toml,
+    candidate_from_draft, deduplicate_candidate, entry_from_candidate, render_active_entries,
+    sanitize_id, scan_toml_dir, write_toml,
 };
 pub use extract::{
     build_candidates, extraction_request, parse_extraction_output, ExtractedMemory,
@@ -165,9 +165,37 @@ impl ProjectMemory {
             .find(|candidate| candidate.id == id && candidate.status == MemoryStatus::Candidate)
             .cloned()
             .with_context(|| format!("memory candidate not found: {id}"))?;
+
+        // dedup check against existing active entries
+        let active: Vec<&MemoryEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.status == MemoryStatus::Active)
+            .collect();
+        let dup_status =
+            deduplicate_candidate(&candidate.title, &candidate.body, &active);
+        if dup_status == "duplicate" {
+            bail!("duplicate of existing entry — use /memory promote only for new facts");
+        }
+
+        let prev_forgotten = self
+            .entries
+            .iter()
+            .any(|e| e.id == candidate.id && e.status == MemoryStatus::Forgotten);
+        let is_new_entry = !self.entries.iter().any(|e| e.id == candidate.id);
+
         let entry = entry_from_candidate(candidate.clone(), timestamp);
         write_toml(&self.entry_path(&entry.id), &entry)?;
         let _ = std::fs::remove_file(self.candidate_path(&candidate.id));
+
+        // update MEMORY.md index
+        if is_new_entry && !prev_forgotten {
+            self.append_to_index(&entry)?;
+        }
+        if prev_forgotten {
+            self.remove_from_index(&entry.id)?;
+        }
+
         self.reload_records()?;
         Ok(entry)
     }
@@ -184,6 +212,9 @@ impl ProjectMemory {
             .with_context(|| format!("memory entry not found: {id}"))?;
         entry.status = status;
         write_toml(&self.entry_path(&entry.id), &entry)?;
+        if status == MemoryStatus::Forgotten {
+            self.remove_from_index(&entry.id)?;
+        }
         self.reload_records()?;
         Ok(entry)
     }
@@ -201,10 +232,85 @@ impl ProjectMemory {
         Ok(candidate)
     }
 
+    pub fn sweep(&mut self, stale_days: u64) -> Vec<MemoryEntry> {
+        let now = time::OffsetDateTime::now_utc();
+        let now_date = now.date();
+        let mut to_stale: Vec<(String, MemoryEntry)> = Vec::new();
+        for entry in &self.entries {
+            if entry.status != MemoryStatus::Active {
+                continue;
+            }
+            if let Some(ref validated) = entry.last_validated_at {
+                let date_str = validated.split('T').next().unwrap_or(validated);
+                if let Ok((year, month, day)) = parse_date(date_str) {
+                    if let Ok(entry_date) = time::Date::from_calendar_date(year, month, day) {
+                        let age = now_date - entry_date;
+                        if age.whole_days() as u64 >= stale_days {
+                            let mut e = entry.clone();
+                            e.status = MemoryStatus::Stale;
+                            to_stale.push((self.entry_path(&e.id).display().to_string(), e));
+                        }
+                    }
+                }
+            }
+        }
+        let mut stale_entries = Vec::new();
+        for (path, entry) in to_stale {
+            write_toml(&std::path::PathBuf::from(&path), &entry).ok();
+            stale_entries.push(entry);
+        }
+        self.reload_records().ok();
+        stale_entries
+    }
+
     pub fn reload_records(&mut self) -> Result<()> {
         self.candidates = scan_toml_dir::<MemoryCandidate>(&self.root.join(MEMORY_CANDIDATES_DIR))?;
         self.entries = scan_toml_dir::<MemoryEntry>(&self.root.join(MEMORY_ENTRIES_DIR))?;
         self.active_entries_tokens = estimate_text_tokens(&render_active_entries(&self.entries));
+        Ok(())
+    }
+
+    fn append_to_index(&self, entry: &MemoryEntry) -> Result<()> {
+        let line = format!(
+            "- [{}]({}.md) — {}",
+            entry.title.trim(),
+            sanitize_id(&entry.id),
+            trim_first_line(&entry.body, 120)
+        );
+        let mut index = std::fs::read_to_string(&self.index_path)
+            .unwrap_or_default();
+        if index.contains(&entry.id) {
+            return Ok(());
+        }
+        let lines: Vec<&str> = index.lines().collect();
+        if lines.len() >= 190 {
+            index = lines
+                .iter()
+                .take(180)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            index.push_str("\n<!-- auto-trimmed -->\n");
+        }
+        if !index.ends_with('\n') {
+            index.push('\n');
+        }
+        index.push_str(&line);
+        index.push('\n');
+        std::fs::write(&self.index_path, &index)
+            .with_context(|| format!("write memory index {}", self.index_path.display()))?;
+        Ok(())
+    }
+
+    fn remove_from_index(&self, id: &str) -> Result<()> {
+        let index = std::fs::read_to_string(&self.index_path)
+            .unwrap_or_default();
+        let filtered: Vec<&str> = index
+            .lines()
+            .filter(|line| !line.contains(id))
+            .collect();
+        std::fs::write(&self.index_path, filtered.join("\n"))
+            .with_context(|| format!("write memory index {}", self.index_path.display()))?;
         Ok(())
     }
 
@@ -262,6 +368,31 @@ fn active_index_text(text: &str) -> Option<&str> {
         return None;
     }
     Some(trimmed)
+}
+
+fn parse_date(date_str: &str) -> Result<(i32, time::Month, u8)> {
+    let parts: Vec<&str> = date_str.split('-').collect();
+    if parts.len() != 3 {
+        bail!("invalid date format: {date_str}");
+    }
+    let year: i32 = parts[0].parse().context("parse year")?;
+    let month_num: u8 = parts[1].parse().context("parse month")?;
+    let day: u8 = parts[2].parse().context("parse day")?;
+    let month = time::Month::try_from(month_num).map_err(|_| anyhow::anyhow!("invalid month: {month_num}"))?;
+    Ok((year, month, day))
+}
+
+fn trim_first_line(text: &str, max_chars: usize) -> String {
+    let line = text.lines().next().unwrap_or(text).trim();
+    let compact: String = line
+        .chars()
+        .take(max_chars)
+        .collect();
+    if line.chars().count() > max_chars {
+        format!("{compact}...")
+    } else {
+        compact
+    }
 }
 
 #[cfg(test)]

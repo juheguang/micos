@@ -104,6 +104,11 @@ pub enum SessionEvent {
         candidate_count: usize,
         skipped_count: usize,
     },
+    MemorySwept {
+        timestamp: String,
+        stale_count: usize,
+        stale_days: u64,
+    },
     MemoryPromoted {
         timestamp: String,
         id: String,

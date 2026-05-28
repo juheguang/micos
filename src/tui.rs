@@ -7,7 +7,8 @@ use crate::tools::ToolSummary;
 use crate::ui::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
     format_memory, format_memory_candidate_report, format_memory_candidates, format_memory_entry,
-    format_memory_index, format_prompt, format_recovery_report, format_resume_report,
+    format_memory_index, format_memory_sweep, format_prompt, format_recovery_report,
+    format_resume_report,
     format_sessions, format_status, format_summary, format_trace, format_transcript,
     format_verification_report, recent_session_choices, AgentEvent, ApprovalDecision, SlashCommand,
     SlashInvocation, UiSink,
@@ -692,6 +693,21 @@ impl TuiUi {
             }
             SlashCommand::Memory => {
                 self.handle_memory_command(&invocation.args);
+            }
+            SlashCommand::MemorySweep => {
+                let agent = self.agent.as_mut().expect("agent checked above");
+                match agent.sweep_memory(30) {
+                    Ok(stale) => self.push_message(
+                        MessageKind::System,
+                        "/memory sweep",
+                        format_memory_sweep(&stale, 30),
+                    ),
+                    Err(error) => self.push_message(
+                        MessageKind::Warning,
+                        "/memory sweep",
+                        format!("memory sweep failed: {error}"),
+                    ),
+                }
             }
             SlashCommand::Handoff => {
                 self.write_handoff_with_status("manual")?;

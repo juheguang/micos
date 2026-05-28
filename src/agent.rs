@@ -279,6 +279,22 @@ where
         self.mark_memory_entry_status(id, MemoryStatus::Stale)
     }
 
+    pub fn sweep_memory(&mut self, stale_days: u64) -> Result<Vec<MemoryEntry>> {
+        let memory = self
+            .project_memory
+            .as_mut()
+            .context("project memory is not loaded")?;
+        let stale = memory.sweep(stale_days);
+        if !stale.is_empty() {
+            self.session.append(&SessionEvent::MemorySwept {
+                timestamp: now(),
+                stale_count: stale.len(),
+                stale_days,
+            })?;
+        }
+        Ok(stale)
+    }
+
     pub fn forget_memory(&mut self, id: &str) -> Result<String> {
         let memory = self
             .project_memory

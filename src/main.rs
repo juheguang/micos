@@ -11,8 +11,8 @@ use micos::plan::ActivePlan;
 use micos::session::{now, Session, SessionEvent, StopReason};
 use micos::tui;
 use micos::ui::{
-    format_memory_candidate_report, format_memory_candidates, format_memory_entry, parse_input,
-    ConsoleUi, InputCommand, SlashCommand, SlashInvocation,
+    format_memory_candidate_report, format_memory_candidates, format_memory_entry,
+    format_memory_sweep, parse_input, ConsoleUi, InputCommand, SlashCommand, SlashInvocation,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -342,8 +342,13 @@ async fn handle_console_slash<C: ModelClient>(
                 }
             }
         }
-        SlashCommand::Memory => {
-            handle_console_memory(invocation.args, agent, ui)?;
+        SlashCommand::Memory | SlashCommand::MemorySweep => {
+            let args = if matches!(invocation.command, SlashCommand::MemorySweep) {
+                "sweep".to_string()
+            } else {
+                invocation.args
+            };
+            handle_console_memory(args, agent, ui)?;
         }
         SlashCommand::Handoff => match agent.write_handoff("manual") {
             Ok(report) => ui.print_handoff_report(&report),
@@ -394,6 +399,16 @@ fn handle_console_memory<C: ModelClient>(
             println!("{}", format_memory_candidates(memory));
         } else {
             eprintln!("project memory is not loaded");
+        }
+        return Ok(());
+    }
+    if args == "sweep" {
+        match agent.sweep_memory(30) {
+            Ok(stale) => println!(
+                "{}",
+                format_memory_sweep(&stale, 30)
+            ),
+            Err(error) => eprintln!("memory sweep failed: {error}"),
         }
         return Ok(());
     }

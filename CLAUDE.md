@@ -4,7 +4,7 @@ A minimal Rust-based agent harness. micos provides a CLI REPL (chat loop with
 TUI and console fallback) that calls LLM APIs, executes local tools, and records
 sessions in `.micos/sessions/`.
 
-**Version:** 0.6.1 — see [docs/roadmap.md](./docs/roadmap.md) for planned milestones.
+**Version:** 0.6.2 — see [docs/roadmap.md](./docs/roadmap.md) for planned milestones.
 
 ## Build, Test, and Development Commands
 

@@ -31,6 +31,7 @@ pub enum SlashCommand {
     Verify,
     Resume,
     Memory,
+    MemorySweep,
     Handoff,
     Recover,
     Plan,
@@ -128,6 +129,11 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "memory",
         description: "show project memory, candidates, and accepted entries",
         command: SlashCommand::Memory,
+    },
+    SlashCommandInfo {
+        name: "memory sweep",
+        description: "scan for stale and duplicated memory entries",
+        command: SlashCommand::MemorySweep,
     },
     SlashCommandInfo {
         name: "handoff",
@@ -617,6 +623,25 @@ pub fn format_memory_candidate_report(report: &MemoryCandidateReport) -> String 
     .join("\n")
 }
 
+pub fn format_memory_sweep(stale: &[MemoryEntry], stale_days: u64) -> String {
+    if stale.is_empty() {
+        return format!("memory sweep: all entries fresh (stale threshold: {stale_days} days)");
+    }
+    let mut lines = vec![format!(
+        "memory sweep: {} stale entries (≥{stale_days} days since last validation):",
+        stale.len()
+    )];
+    for entry in stale {
+        let last = entry
+            .last_validated_at
+            .as_deref()
+            .unwrap_or("unknown");
+        lines.push(format!("  {} — last validated {}", entry.title, last));
+    }
+    lines.push("Use /memory stale <id> to mark as stale, /memory forget <id> to remove.".into());
+    lines.join("\n")
+}
+
 pub fn format_memory_entry(entry: &MemoryEntry, action: &str) -> String {
     let type_line = entry
         .memory_type
@@ -973,6 +998,7 @@ mod tests {
                 "verify",
                 "resume",
                 "memory",
+                "memory sweep",
                 "handoff",
                 "recover",
                 "plan",
