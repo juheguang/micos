@@ -1,3 +1,4 @@
+use crate::context::is_compacted_summary_message;
 use crate::prompt::COMPACT_SUMMARY_FORMAT;
 use serde_json::Value;
 
@@ -134,6 +135,80 @@ fn expand_tail_for_tool_pairs(transcript: &[Value], mut start: usize) -> usize {
 fn is_function_call_with_id(item: &Value, call_id: &str) -> bool {
     item.get("type").and_then(Value::as_str) == Some("function_call")
         && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+}
+
+pub(super) const MICRO_COMPACT_KEEP: usize = 6;
+pub(super) const MICRO_COMPACT_IDLE_SECS: u64 = 600;
+
+/// Only trigger when idle — avoid modifying history mid-conversation
+/// which would break KV-cache prefixes.
+pub(super) fn should_micro_compact(
+    transcript: &[Value],
+    last_micro_at: Option<std::time::Instant>,
+) -> bool {
+    // Find last assistant timestamp: iterate backward, find first assistant message
+    // Since we don't store timestamps in transcript items, use cooldown-based approach:
+    // if we haven't micro-compacted recently AND there are enough outputs to clear
+    if let Some(last) = last_micro_at {
+        if last.elapsed() < std::time::Duration::from_secs(MICRO_COMPACT_IDLE_SECS) {
+            return false;
+        }
+    }
+    let output_count = transcript
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .count();
+    output_count > MICRO_COMPACT_KEEP
+}
+
+/// Clear old tool outputs in-place, keeping the most recent N.
+/// Returns total bytes cleared.
+pub(super) fn micro_compact(transcript: &mut Vec<Value>, keep_recent: usize) -> usize {
+    let mut total_cleared = 0usize;
+    // count from the end to find which outputs to keep
+    let output_indices: Vec<usize> = transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, item)| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+        })
+        .take(keep_recent)
+        .map(|(i, _)| i)
+        .collect();
+
+    for (i, item) in transcript.iter_mut().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            continue;
+        }
+        // skip compact summary messages
+        if is_compacted_summary_message(item) {
+            continue;
+        }
+        // keep recent outputs
+        if output_indices.contains(&i) {
+            continue;
+        }
+        // clear the output content but keep metadata
+        if let Some(output) = item.get("output").and_then(Value::as_str) {
+            let cleared = output.len();
+            if cleared > 0 {
+                total_cleared += cleared;
+            }
+        }
+        if let Some(obj) = item.as_object_mut() {
+            let bytes = obj
+                .get("output")
+                .and_then(Value::as_str)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            obj.insert(
+                "output".to_string(),
+                serde_json::Value::String(format!("[cleared: {bytes} bytes]")),
+            );
+        }
+    }
+    total_cleared
 }
 
 fn is_user_message(item: &Value) -> bool {

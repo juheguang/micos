@@ -429,6 +429,25 @@ pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &Conte
             format_tokens(category.tokens)
         ));
     }
+    if !stats.layers.is_empty() {
+        output.push("layers:".into());
+        for layer in &stats.layers {
+            if layer.tokens == 0 {
+                continue;
+            }
+            let pct = if stats.total_tokens_estimate > 0 {
+                (layer.tokens as f64 / stats.total_tokens_estimate as f64 * 100.0) as usize
+            } else {
+                0
+            };
+            output.push(format!(
+                "  {:<22} {:>6} tokens  {}%",
+                layer.name,
+                format_tokens(layer.tokens),
+                pct
+            ));
+        }
+    }
     output.push(format!(
         "largest risk: {}",
         largest_context_risk(stats).unwrap_or("none")
@@ -1075,6 +1094,7 @@ mod tests {
                     tokens: 877,
                 },
             ],
+            layers: Vec::new(),
         };
 
         let output = format_context(&config, &path, &stats);

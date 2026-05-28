@@ -20,11 +20,28 @@ pub struct ContextCategory {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextLayer {
+    pub name: String,
+    pub tokens: usize,
+}
+
+impl ContextLayer {
+    pub fn new(name: impl Into<String>, tokens: usize) -> Self {
+        Self {
+            name: name.into(),
+            tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextStats {
     pub total_tokens_estimate: usize,
     pub max_tokens: usize,
     pub usage_percent: usize,
     pub categories: Vec<ContextCategory>,
+    #[serde(default)]
+    pub layers: Vec<ContextLayer>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,13 +69,15 @@ impl ContextBuilder {
             .iter()
             .map(|section| section.snapshot())
             .collect::<Vec<_>>();
-        let stats = estimate_context_stats_with_prompt_sections(
+        let mut stats = estimate_context_stats_with_prompt_sections(
             &input,
             &prompt.instructions,
             &prompt_sections,
             &tools,
             self.max_tokens,
         );
+        let layers = compute_layers(&prompt, &input, &tools);
+        stats.layers = layers;
         ModelContext {
             input,
             instructions: prompt.instructions,
@@ -140,7 +159,62 @@ pub fn estimate_context_stats_with_prompt_sections(
         max_tokens,
         usage_percent: usage_percent.min(100),
         categories,
+        layers: Vec::new(),
     }
+}
+
+fn compute_layers(prompt: &PromptBuild, input: &[Value], tools: &[Value]) -> Vec<ContextLayer> {
+    let mut layers = Vec::new();
+    // Layer 1: base prompt
+    let base_tokens: usize = prompt
+        .sections
+        .iter()
+        .filter(|s| s.source == "base")
+        .map(|s| s.tokens_estimate)
+        .sum();
+    layers.push(ContextLayer::new("base_prompt", base_tokens));
+    // Layer 2: runtime context
+    let runtime_tokens: usize = prompt
+        .sections
+        .iter()
+        .filter(|s| s.source == "runtime")
+        .map(|s| s.tokens_estimate)
+        .sum();
+    layers.push(ContextLayer::new("runtime", runtime_tokens));
+    // Layer 3: memory index
+    let memory_tokens: usize = prompt
+        .sections
+        .iter()
+        .filter(|s| s.id == "project_memory")
+        .map(|s| s.tokens_estimate)
+        .sum();
+    layers.push(ContextLayer::new("memory_index", memory_tokens));
+    // Layer 4: active plan
+    let plan_tokens: usize = prompt
+        .sections
+        .iter()
+        .filter(|s| s.id == "active_plan")
+        .map(|s| s.tokens_estimate)
+        .sum();
+    layers.push(ContextLayer::new("active_plan", plan_tokens));
+    // Layer 5: compact summary
+    let summary_tokens: usize = input
+        .iter()
+        .filter(|item| is_compacted_summary_message(item))
+        .map(|item| estimate_json_tokens(item, 4))
+        .sum();
+    layers.push(ContextLayer::new("compact_summary", summary_tokens));
+    // Layer 6: recent tail (non-summary messages)
+    let tail_tokens: usize = input
+        .iter()
+        .filter(|item| !is_compacted_summary_message(item))
+        .map(|item| estimate_json_tokens(item, 4))
+        .sum();
+    layers.push(ContextLayer::new("recent_tail", tail_tokens));
+    // Layer 7: tool schemas
+    let tools_tokens = estimate_json_values_tokens(tools, 2);
+    layers.push(ContextLayer::new("tool_schemas", tools_tokens));
+    layers
 }
 
 fn prompt_categories(
@@ -191,7 +265,7 @@ pub fn compacted_summary_message(summary: &str) -> Value {
     })
 }
 
-fn is_compacted_summary_message(item: &Value) -> bool {
+pub(crate) fn is_compacted_summary_message(item: &Value) -> bool {
     item.get("content")
         .and_then(Value::as_array)
         .and_then(|content| content.first())

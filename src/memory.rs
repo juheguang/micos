@@ -106,6 +106,33 @@ impl ProjectMemory {
         (!text.trim().is_empty()).then_some(text)
     }
 
+    pub fn active_entries_index(&self) -> Option<String> {
+        let lines: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.status == MemoryStatus::Active)
+            .map(|e| {
+                let type_tag = e
+                    .memory_type
+                    .as_ref()
+                    .map(|t| format!("[{t}] "))
+                    .unwrap_or_default();
+                format!(
+                    "- {}{} — {}",
+                    type_tag,
+                    e.title.trim(),
+                    trim_first_line(&e.body, 120)
+                )
+            })
+            .collect();
+        (!lines.is_empty()).then(|| {
+            format!(
+                "## Accepted durable memory (use `/memory <id>` for details)\n{}",
+                lines.join("\n")
+            )
+        })
+    }
+
     pub fn pending_candidates(&self) -> Vec<&MemoryCandidate> {
         self.candidates
             .iter()

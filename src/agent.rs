@@ -71,6 +71,7 @@ pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermiss
     project_memory: Option<ProjectMemory>,
     active_plan: Option<ActivePlan>,
     last_compact_at: Option<std::time::Instant>,
+    last_micro_compact_at: Option<std::time::Instant>,
     consecutive_compact_failures: usize,
 }
 
@@ -87,6 +88,7 @@ impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
             project_memory: None,
             active_plan: None,
             last_compact_at: None,
+            last_micro_compact_at: None,
             consecutive_compact_failures: 0,
         }
     }
@@ -110,6 +112,7 @@ impl<C, R, T, P> AgentRuntime<C, R, T, P> {
             project_memory: None,
             active_plan: None,
             last_compact_at: None,
+            last_micro_compact_at: None,
             consecutive_compact_failures: 0,
         }
     }
@@ -686,6 +689,11 @@ where
             "content": [{"type": "input_text", "text": input}]
         }));
 
+        if compact::should_micro_compact(&self.transcript, self.last_micro_compact_at) {
+            let _cleared = compact::micro_compact(&mut self.transcript, compact::MICRO_COMPACT_KEEP);
+            self.last_micro_compact_at = Some(std::time::Instant::now());
+        }
+
         let _compact = self.maybe_auto_compact(ui).await;
 
         let mut consecutive_tool_failures = 0usize;
@@ -1073,8 +1081,8 @@ where
             if let Some(index) = memory.active_index_text() {
                 parts.push(index.to_string());
             }
-            if let Some(entries) = memory.active_entries_text() {
-                parts.push(format!("## Accepted durable memory\n{entries}"));
+            if let Some(entries) = memory.active_entries_index() {
+                parts.push(entries);
             }
             if !parts.is_empty() {
                 runtime = runtime.with_project_memory(&memory.index_path, parts.join("\n\n"));
