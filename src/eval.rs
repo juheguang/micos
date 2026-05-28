@@ -209,6 +209,7 @@ fn eval_agent(
         context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
         context_warning_percent: DEFAULT_CONTEXT_WARNING_PERCENT,
         append_system_prompt: None,
+        auto_compact: Default::default(),
         cwd,
     };
     let session = Session::new(&config)?;

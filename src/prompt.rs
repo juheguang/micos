@@ -349,6 +349,27 @@ Do not use a colon before tool calls. Do not use emojis unless asked.",
     },
 ];
 
+pub const MEMORY_EXTRACTION_PROMPT: &str = "\
+Extract durable project memories from this session. Output each memory as a \
+single JSON line with `title`, `body`, and `type` fields. Do not output \
+anything else.\n\
+\n\
+Memory types:\n\
+- user: the user's role, preferences, knowledge, or working style\n\
+- feedback: corrections the user gave about how to work (stop doing X, keep doing Y)\n\
+- project: non-obvious project context — decisions, constraints, deadlines, \
+  recurring issues. Use absolute dates, not relative ones.\n\
+- reference: pointers to external systems (issue trackers, dashboards, Slack channels)\n\
+\n\
+Exclude: code patterns, architecture, file paths, git history, build commands \
+(these are derivable from the repo). Exclude anything already in CLAUDE.md. \
+Do not save ephemeral task details. Each memory should be 1-3 sentences, \
+specific, and actionable.\n\
+\n\
+Output format (one JSON object per line, no other text):\n\
+{\"title\":\"...\",\"body\":\"...\",\"type\":\"project\"}\n\
+{\"title\":\"...\",\"body\":\"...\",\"type\":\"feedback\"}";
+
 pub const COMPACT_SUMMARY_FORMAT: &[&str] = &[
     "Primary Request and Intent",
     "Key Technical Concepts",
@@ -405,6 +426,7 @@ mod tests {
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt,
+            auto_compact: Default::default(),
             cwd: PathBuf::from("/tmp/micos"),
         }
     }

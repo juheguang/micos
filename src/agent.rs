@@ -9,7 +9,10 @@ use crate::config::{
 use crate::context::{
     compacted_summary_message, estimate_text_tokens, ContextBuilder, ContextStats,
 };
-use crate::memory::{MemoryCandidateReport, MemoryEntry, MemoryStatus, ProjectMemory};
+use crate::memory::{
+    build_candidates, extraction_request, parse_extraction_output, MemoryCandidateReport,
+    MemoryEntry, MemoryExtractionReport, MemoryStatus, ProjectMemory,
+};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::plan::{self, ActivePlan, HandoffReport};
 use crate::prompt::{
@@ -67,6 +70,8 @@ pub struct AgentRuntime<C, R = Session, T = BuiltinToolRegistry, P = ModePermiss
     transcript: Vec<Value>,
     project_memory: Option<ProjectMemory>,
     active_plan: Option<ActivePlan>,
+    last_compact_at: Option<std::time::Instant>,
+    consecutive_compact_failures: usize,
 }
 
 impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
@@ -81,6 +86,8 @@ impl<C> AgentRuntime<C, Session, BuiltinToolRegistry, ModePermissionPolicy> {
             transcript: Vec::new(),
             project_memory: None,
             active_plan: None,
+            last_compact_at: None,
+            consecutive_compact_failures: 0,
         }
     }
 }
@@ -102,6 +109,8 @@ impl<C, R, T, P> AgentRuntime<C, R, T, P> {
             transcript: Vec::new(),
             project_memory: None,
             active_plan: None,
+            last_compact_at: None,
+            consecutive_compact_failures: 0,
         }
     }
 }
@@ -173,6 +182,66 @@ where
         })?;
         self.project_memory = Some(memory);
         Ok(())
+    }
+
+    pub async fn extract_memories(&mut self) -> Result<MemoryExtractionReport> {
+        let memory = self
+            .project_memory
+            .as_mut()
+            .context("project memory is not loaded")?;
+        let draft = crate::plan::HandoffDraft::from_session_log(
+            self.session.path(),
+            "memory_extraction",
+            now(),
+        )?;
+        let entries = memory.active_entries();
+        let request_text = extraction_request(&draft, &entries);
+        let input = vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": request_text}]
+        })];
+        let response = self
+            .client
+            .respond(crate::model::ModelRequest {
+                model: self.config.model.clone(),
+                input,
+                tools: Vec::new(),
+                instructions: String::new(),
+                parallel_tool_calls: false,
+                thinking: None,
+                reasoning_effort: None,
+            })
+            .await?;
+        let text = response.assistant_text.join("\n");
+        let extracted = parse_extraction_output(&text);
+        let candidates_dir = memory.root.join(crate::memory::MEMORY_CANDIDATES_DIR);
+        let report = build_candidates(
+            extracted,
+            self.session.id().to_string().into(),
+            &now(),
+            &entries,
+            &candidates_dir,
+            &draft,
+        )?;
+        memory.reload_records()?;
+        let model_driven = !text.trim().is_empty();
+        self.session.append(&SessionEvent::MemoryExtraction {
+            timestamp: now(),
+            model_driven,
+            candidate_count: report.candidates.len(),
+            skipped_count: report.skipped.len(),
+        })?;
+        for candidate in &report.candidates {
+            self.session.append(&SessionEvent::MemoryCandidateCreated {
+                timestamp: now(),
+                id: candidate.id.clone(),
+                title: candidate.title.clone(),
+                source_session: candidate.source_session.clone(),
+                created: true,
+            })?;
+        }
+        Ok(report)
     }
 
     pub fn refresh_memory_candidates(&mut self) -> Result<MemoryCandidateReport> {
@@ -443,10 +512,67 @@ where
         }
     }
 
+    pub async fn maybe_auto_compact<S: UiSink + Send>(
+        &mut self,
+        ui: &mut S,
+    ) -> Option<ContextCompactReport> {
+        use crate::config::AutoCompactMode;
+        if matches!(self.config.auto_compact, AutoCompactMode::Off) {
+            return None;
+        }
+        let stats = self.context_stats();
+        if stats.usage_percent < self.config.context_warning_percent {
+            return None;
+        }
+        if self.consecutive_compact_failures >= 3 {
+            return None;
+        }
+        if let Some(last) = self.last_compact_at {
+            if last.elapsed() < std::time::Duration::from_secs(60) {
+                return None;
+            }
+        }
+        if matches!(self.config.auto_compact, AutoCompactMode::Warn) {
+            match ui.confirm_compact(stats.usage_percent) {
+                Ok(true) => {}
+                _ => {
+                    self.session
+                        .append(&SessionEvent::CompactSkipped {
+                            timestamp: now(),
+                            reason: "user_denied".into(),
+                            usage_percent: stats.usage_percent,
+                        })
+                        .ok();
+                    return None;
+                }
+            }
+        }
+        let _ = self.extract_memories().await;
+        match self.compact_context().await {
+            Ok(report) => {
+                self.last_compact_at = Some(std::time::Instant::now());
+                self.consecutive_compact_failures = 0;
+                self.session
+                    .append(&SessionEvent::CompactTriggered {
+                        timestamp: now(),
+                        trigger: "threshold".into(),
+                        before_tokens: report.before_tokens,
+                    })
+                    .ok();
+                Some(report)
+            }
+            Err(_error) => {
+                self.consecutive_compact_failures += 1;
+                None
+            }
+        }
+    }
+
     pub async fn compact_context_with_ui<S: UiSink + Send>(
         &mut self,
-        _ui: &mut S,
+        ui: &mut S,
     ) -> Result<ContextCompactReport> {
+        let _ = ui;
         self.compact_context().await
     }
 
@@ -544,6 +670,8 @@ where
             "content": [{"type": "input_text", "text": input}]
         }));
 
+        let _compact = self.maybe_auto_compact(ui).await;
+
         let mut consecutive_tool_failures = 0usize;
 
         for _step in 0..self.config.max_steps {
@@ -585,6 +713,7 @@ where
                     self.stop(StopReason::ApiError).await?;
                     self.write_handoff(&StopReason::ApiError.to_string())?;
                     let _ = self.write_recovery_report(&StopReason::ApiError.to_string());
+                    let _ = self.extract_memories().await;
                     ui.on_event(AgentEvent::Stop {
                         reason: StopReason::ApiError,
                     })?;
@@ -605,6 +734,7 @@ where
 
             if response.function_calls.is_empty() {
                 self.stop(StopReason::FinalAnswer).await?;
+                let _ = self.extract_memories().await;
                 ui.on_event(AgentEvent::Stop {
                     reason: StopReason::FinalAnswer,
                 })?;
@@ -688,6 +818,7 @@ where
                     self.stop(StopReason::ToolDenied).await?;
                     self.write_handoff(&StopReason::ToolDenied.to_string())?;
                     let _ = self.write_recovery_report(&StopReason::ToolDenied.to_string());
+                    let _ = self.extract_memories().await;
                     ui.on_event(AgentEvent::Stop {
                         reason: StopReason::ToolDenied,
                     })?;
@@ -704,6 +835,7 @@ where
                         self.stop(StopReason::ToolError).await?;
                         self.write_handoff(&StopReason::ToolError.to_string())?;
                         let _ = self.write_recovery_report(&StopReason::ToolError.to_string());
+                        let _ = self.extract_memories().await;
                         ui.on_event(AgentEvent::Stop {
                             reason: StopReason::ToolError,
                         })?;
@@ -719,6 +851,7 @@ where
         self.stop(StopReason::MaxSteps).await?;
         self.write_handoff(&StopReason::MaxSteps.to_string())?;
         let _ = self.write_recovery_report(&StopReason::MaxSteps.to_string());
+        let _ = self.extract_memories().await;
         ui.on_event(AgentEvent::Stop {
             reason: StopReason::MaxSteps,
         })?;
@@ -1183,6 +1316,7 @@ mod tests {
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
+            auto_compact: Default::default(),
             cwd,
         }
     }

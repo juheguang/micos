@@ -4,6 +4,26 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryType {
+    User,
+    Feedback,
+    Project,
+    Reference,
+}
+
+impl std::fmt::Display for MemoryType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemoryType::User => write!(f, "user"),
+            MemoryType::Feedback => write!(f, "feedback"),
+            MemoryType::Project => write!(f, "project"),
+            MemoryType::Reference => write!(f, "reference"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MemoryCandidate {
     pub id: String,
     pub title: String,
@@ -12,6 +32,8 @@ pub struct MemoryCandidate {
     pub created_at: String,
     pub scope: String,
     pub status: MemoryStatus,
+    #[serde(default)]
+    pub memory_type: Option<MemoryType>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -24,6 +46,8 @@ pub struct MemoryEntry {
     pub last_validated_at: Option<String>,
     pub scope: String,
     pub status: MemoryStatus,
+    #[serde(default)]
+    pub memory_type: Option<MemoryType>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,6 +93,7 @@ pub(super) fn candidate_from_draft(
         created_at: timestamp,
         scope: "project".into(),
         status: MemoryStatus::Candidate,
+        memory_type: None,
     }
 }
 
@@ -82,6 +107,7 @@ pub(super) fn entry_from_candidate(candidate: MemoryCandidate, timestamp: String
         last_validated_at: Some(timestamp),
         scope: candidate.scope,
         status: MemoryStatus::Active,
+        memory_type: candidate.memory_type,
     }
 }
 
@@ -125,10 +151,16 @@ pub(super) fn render_active_entries(entries: &[MemoryEntry]) -> String {
         .iter()
         .filter(|entry| entry.status == MemoryStatus::Active)
         .map(|entry| {
+            let type_line = entry
+                .memory_type
+                .as_ref()
+                .map(|t| format!("type: {t}\n"))
+                .unwrap_or_default();
             format!(
-                "### {} ({})\n{}\nsource_session: {}\nlast_validated_at: {}",
+                "### {} ({})\n{}{}\nsource_session: {}\nlast_validated_at: {}",
                 entry.title.trim(),
                 entry.id,
+                type_line,
                 entry.body.trim(),
                 entry.source_session.as_deref().unwrap_or("unknown"),
                 entry.last_validated_at.as_deref().unwrap_or("unknown")
@@ -156,6 +188,35 @@ pub(super) fn sanitize_id(text: &str) -> String {
     } else {
         id
     }
+}
+
+pub(super) fn deduplicate_candidate(title: &str, body: &str, entries: &[&MemoryEntry]) -> String {
+    let title_lower = title.to_lowercase();
+    let body_words: Vec<&str> = body.split_whitespace().collect();
+    for entry in entries {
+        let entry_title = entry.title.to_lowercase();
+        if title_lower == entry_title {
+            return "duplicate".to_string();
+        }
+        let overlap = entry_title
+            .split_whitespace()
+            .filter(|w| title_lower.contains(*w))
+            .count();
+        let entry_words: Vec<&str> = entry.body.split_whitespace().collect();
+        let body_overlap = body_words
+            .iter()
+            .filter(|w| entry_words.contains(w))
+            .count();
+        let body_ratio = if body_words.len() > 0 {
+            body_overlap as f64 / body_words.len() as f64
+        } else {
+            0.0
+        };
+        if overlap >= 2 || body_ratio > 0.7 {
+            return "similar".to_string();
+        }
+    }
+    "new".to_string()
 }
 
 fn draft_title(draft: &HandoffDraft) -> String {

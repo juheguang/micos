@@ -98,6 +98,12 @@ pub enum SessionEvent {
         source_session: Option<String>,
         created: bool,
     },
+    MemoryExtraction {
+        timestamp: String,
+        model_driven: bool,
+        candidate_count: usize,
+        skipped_count: usize,
+    },
     MemoryPromoted {
         timestamp: String,
         id: String,
@@ -174,6 +180,16 @@ pub enum SessionEvent {
         compression_ratio_percent: usize,
         #[serde(default)]
         validation_status: String,
+    },
+    CompactTriggered {
+        timestamp: String,
+        trigger: String,
+        before_tokens: usize,
+    },
+    CompactSkipped {
+        timestamp: String,
+        reason: String,
+        usage_percent: usize,
     },
     ContextSummary {
         timestamp: String,

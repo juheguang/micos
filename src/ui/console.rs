@@ -326,6 +326,16 @@ impl UiSink for ConsoleUi {
             .context("read permission response")?;
         Ok(parse_approval_decision(&line))
     }
+
+    fn confirm_compact(&mut self, usage_percent: usize) -> Result<bool> {
+        print!("Context at {usage_percent}%, compact? [y/N] ");
+        io::stdout().flush().context("flush compact prompt")?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .context("read compact response")?;
+        Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+    }
 }
 
 fn parse_approval_decision(line: &str) -> ApprovalDecision {

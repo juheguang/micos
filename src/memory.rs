@@ -3,12 +3,19 @@ use crate::plan::HandoffDraft;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
+mod extract;
 mod records;
 use records::{
     candidate_from_draft, entry_from_candidate, render_active_entries, sanitize_id, scan_toml_dir,
     write_toml,
 };
-pub use records::{MemoryCandidate, MemoryCandidateReport, MemoryEntry, MemoryStatus};
+pub use extract::{
+    build_candidates, extraction_request, parse_extraction_output, ExtractedMemory,
+    MemoryExtractionReport,
+};
+pub use records::{
+    MemoryCandidate, MemoryCandidateReport, MemoryEntry, MemoryStatus, MemoryType,
+};
 
 pub const MEMORY_DIR: &str = ".micos/memory";
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
@@ -194,7 +201,7 @@ impl ProjectMemory {
         Ok(candidate)
     }
 
-    fn reload_records(&mut self) -> Result<()> {
+    pub fn reload_records(&mut self) -> Result<()> {
         self.candidates = scan_toml_dir::<MemoryCandidate>(&self.root.join(MEMORY_CANDIDATES_DIR))?;
         self.entries = scan_toml_dir::<MemoryEntry>(&self.root.join(MEMORY_ENTRIES_DIR))?;
         self.active_entries_tokens = estimate_text_tokens(&render_active_entries(&self.entries));

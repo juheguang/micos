@@ -580,10 +580,16 @@ pub fn format_memory_candidates(memory: &ProjectMemory) -> String {
     }
     let mut output = vec!["memory candidates:".to_string()];
     for candidate in candidates {
+        let type_tag = candidate
+            .memory_type
+            .as_ref()
+            .map(|t| format!("[{t}] "))
+            .unwrap_or_default();
         output.push(format!(
-            "  {:<32} {:<9} {}",
+            "  {:<32} {:<9} {}{}",
             candidate.id,
             candidate.status,
+            type_tag,
             trim_one_line(&candidate.title, 80)
         ));
     }
@@ -612,11 +618,16 @@ pub fn format_memory_candidate_report(report: &MemoryCandidateReport) -> String 
 }
 
 pub fn format_memory_entry(entry: &MemoryEntry, action: &str) -> String {
+    let type_line = entry
+        .memory_type
+        .as_ref()
+        .map(|t| format!("type: {t}\n"))
+        .unwrap_or_default();
     [
         format!("memory {action}"),
         format!("id: {}", entry.id),
         format!("status: {}", entry.status),
-        format!("title: {}", entry.title),
+        format!("{type_line}title: {}", entry.title),
     ]
     .join("\n")
 }
@@ -1016,6 +1027,7 @@ mod tests {
             context_window_tokens: 1_000,
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
+            auto_compact: Default::default(),
             cwd,
         };
         let path = std::env::temp_dir().join(format!("micos-context-{}.jsonl", Uuid::new_v4()));
@@ -1062,6 +1074,7 @@ mod tests {
             context_window_tokens: 1_000,
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: Some("Prefer concise replies.".into()),
+            auto_compact: Default::default(),
             cwd: std::env::temp_dir(),
         };
         let runtime = crate::prompt::PromptRuntimeContext::from_config(&config);

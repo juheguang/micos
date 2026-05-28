@@ -1512,6 +1512,7 @@ mod tests {
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
+            auto_compact: Default::default(),
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);
@@ -1549,6 +1550,7 @@ mod tests {
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
             context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
+            auto_compact: Default::default(),
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
         let mut panel = ModelPanelState::from_settings(&config, false);

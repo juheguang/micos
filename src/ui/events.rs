@@ -54,6 +54,10 @@ pub trait UiSink {
     fn approve_tool(&mut self, _name: &str, _summary: &str) -> Result<ApprovalDecision> {
         Ok(ApprovalDecision::Deny)
     }
+
+    fn confirm_compact(&mut self, _usage_percent: usize) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 #[derive(Default)]

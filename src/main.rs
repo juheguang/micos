@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use micos::agent::Agent;
 use micos::config::{
-    resolve_api_key, save_permission_mode, ConfigOverrides, PermissionMode, ReasoningEffort,
-    SessionConfig, ThinkingMode,
+    resolve_api_key, save_permission_mode, AutoCompactMode, ConfigOverrides, PermissionMode,
+    ReasoningEffort, SessionConfig, ThinkingMode,
 };
 use micos::memory::ProjectMemory;
 use micos::model::{ModelClient, OpenAiModelClient};
@@ -58,6 +58,9 @@ struct ChatArgs {
     #[arg(long)]
     max_steps: Option<usize>,
 
+    #[arg(long, value_enum)]
+    auto_compact: Option<AutoCompactArg>,
+
     #[arg(long)]
     cwd: Option<PathBuf>,
 
@@ -88,6 +91,23 @@ enum ReasoningEffortArg {
     High,
     Xhigh,
     Max,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum AutoCompactArg {
+    Off,
+    Warn,
+    Auto,
+}
+
+impl From<AutoCompactArg> for AutoCompactMode {
+    fn from(value: AutoCompactArg) -> Self {
+        match value {
+            AutoCompactArg::Off => AutoCompactMode::Off,
+            AutoCompactArg::Warn => AutoCompactMode::Warn,
+            AutoCompactArg::Auto => AutoCompactMode::Auto,
+        }
+    }
 }
 
 impl From<ThinkingArg> for ThinkingMode {
@@ -143,6 +163,7 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         max_steps: args.max_steps,
         context_window_tokens: None,
         context_warning_percent: None,
+        auto_compact: args.auto_compact.map(Into::into),
         cwd: args.cwd,
     };
     let config = SessionConfig::load(overrides).context("load configuration")?;

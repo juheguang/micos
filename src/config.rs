@@ -56,6 +56,38 @@ impl ApiKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoCompactMode {
+    #[default]
+    Off,
+    Warn,
+    Auto,
+}
+
+impl fmt::Display for AutoCompactMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AutoCompactMode::Off => write!(f, "off"),
+            AutoCompactMode::Warn => write!(f, "warn"),
+            AutoCompactMode::Auto => write!(f, "auto"),
+        }
+    }
+}
+
+impl FromStr for AutoCompactMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(AutoCompactMode::Off),
+            "warn" => Ok(AutoCompactMode::Warn),
+            "auto" => Ok(AutoCompactMode::Auto),
+            other => bail!("unknown auto compact mode: {other}"),
+        }
+    }
+}
+
 impl fmt::Display for ApiKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -142,6 +174,7 @@ pub struct SessionConfig {
     pub max_steps: usize,
     pub context_window_tokens: usize,
     pub context_warning_percent: usize,
+    pub auto_compact: AutoCompactMode,
     pub append_system_prompt: Option<String>,
     pub cwd: PathBuf,
 }
@@ -164,6 +197,7 @@ pub struct ConfigOverrides {
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
     pub context_warning_percent: Option<usize>,
+    pub auto_compact: Option<AutoCompactMode>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -178,6 +212,7 @@ pub struct FileConfig {
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
     pub context_warning_percent: Option<usize>,
+    pub auto_compact: Option<AutoCompactMode>,
     pub append_system_prompt: Option<String>,
     pub cwd: Option<PathBuf>,
 }
@@ -202,6 +237,7 @@ pub struct EnvConfig {
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
     pub context_warning_percent: Option<usize>,
+    pub auto_compact: Option<AutoCompactMode>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -278,6 +314,11 @@ impl SessionConfig {
                 .unwrap_or(DEFAULT_MAX_STEPS),
             context_window_tokens,
             context_warning_percent,
+            auto_compact: cli
+                .auto_compact
+                .or(env.auto_compact)
+                .or(file.auto_compact)
+                .unwrap_or_default(),
             append_system_prompt: file.append_system_prompt,
             cwd,
         })
@@ -449,6 +490,10 @@ impl EnvConfig {
             ),
             Err(_) => None,
         };
+        let auto_compact = match std::env::var("MICOS_AUTO_COMPACT") {
+            Ok(value) => Some(value.parse()?),
+            Err(_) => None,
+        };
 
         Ok(Self {
             model: std::env::var("MICOS_MODEL").ok(),
@@ -459,6 +504,7 @@ impl EnvConfig {
             max_steps,
             context_window_tokens,
             context_warning_percent,
+            auto_compact,
             cwd,
         })
     }
@@ -549,6 +595,7 @@ mod tests {
                 context_window_tokens: Some(123_000),
                 context_warning_percent: Some(70),
                 append_system_prompt: None,
+                auto_compact: None,
                 cwd: None,
             },
             EnvConfig {
@@ -560,6 +607,7 @@ mod tests {
                 max_steps: Some(4),
                 context_window_tokens: Some(124_000),
                 context_warning_percent: Some(75),
+                auto_compact: None,
                 cwd: None,
             },
             ConfigOverrides {
@@ -571,6 +619,7 @@ mod tests {
                 max_steps: Some(5),
                 context_window_tokens: Some(125_000),
                 context_warning_percent: Some(90),
+                auto_compact: None,
                 cwd: None,
             },
         )
