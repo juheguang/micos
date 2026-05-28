@@ -141,11 +141,16 @@ impl RecoveryDraft {
                         }
                     }
                     if !success {
+                        let kind = json_string(event, "error_kind")
+                            .map(|k| format!("{k}: "))
+                            .unwrap_or_default();
                         let detail = json_string(event, "error")
                             .or_else(|| json_string(event, "output"))
                             .unwrap_or_else(|| "tool failed".into());
-                        known_failures
-                            .push(format!("tool {call_id}: {}", trim_one_line(&detail, 180)));
+                        known_failures.push(format!(
+                            "tool {call_id}: {kind}{}",
+                            trim_one_line(&detail, 180)
+                        ));
                     }
                 }
                 Some("permission_denied") => {

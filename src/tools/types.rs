@@ -1,5 +1,6 @@
 use crate::config::PermissionMode;
 use crate::tools::policy::{PermissionDecision, PermissionRule, PolicyDecision, PolicyEngine};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
@@ -45,11 +46,24 @@ pub struct ToolContext {
     pub permission: PermissionMode,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorKind {
+    Timeout,
+    Io,
+    Parse,
+    Permission,
+    ProcessExit,
+    Utf8,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    pub error_kind: Option<ToolErrorKind>,
     pub denied: bool,
     pub truncated: bool,
     pub original_bytes: usize,
@@ -120,6 +134,14 @@ impl ToolSummary {
                     .and_then(Value::as_str)
                     .unwrap_or("<missing>")
             ),
+            "grep" => format!(
+                "pattern={} path={}",
+                arguments
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>"),
+                arguments.get("path").and_then(Value::as_str).unwrap_or(".")
+            ),
             _ => arguments.to_string(),
         };
         Self { summary }
@@ -144,6 +166,7 @@ impl ToolResult {
             success: true,
             output,
             error: None,
+            error_kind: None,
             denied: false,
             truncated: false,
             original_bytes: bytes,
@@ -161,6 +184,7 @@ impl ToolResult {
             success: true,
             output: output.into(),
             error: None,
+            error_kind: None,
             denied: false,
             truncated,
             original_bytes,
@@ -173,6 +197,20 @@ impl ToolResult {
             success: false,
             output: String::new(),
             error: Some(error.into()),
+            error_kind: None,
+            denied: false,
+            truncated: false,
+            original_bytes: 0,
+            preview_bytes: 0,
+        }
+    }
+
+    pub fn error_with_kind(kind: ToolErrorKind, error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            error: Some(error.into()),
+            error_kind: Some(kind),
             denied: false,
             truncated: false,
             original_bytes: 0,
@@ -185,6 +223,7 @@ impl ToolResult {
             success: false,
             output: String::new(),
             error: Some(error.into()),
+            error_kind: Some(ToolErrorKind::Permission),
             denied: true,
             truncated: false,
             original_bytes: 0,

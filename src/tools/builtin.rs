@@ -1,9 +1,9 @@
 use super::{
     classify_shell_command, path_has_symlink_component, resolve_under_cwd,
-    truncate_text_with_metadata, PermissionDecision, ShellSafety, Tool, ToolContext, ToolMetadata,
-    ToolRegistry, ToolResult, ToolSummary,
+    truncate_text_with_metadata, PermissionDecision, ShellSafety, Tool, ToolContext,
+    ToolErrorKind, ToolMetadata, ToolRegistry, ToolResult, ToolSummary,
 };
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt;
@@ -25,6 +25,7 @@ pub enum BuiltinTool {
     ReadFile,
     WriteFile,
     Shell,
+    Grep,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,7 @@ impl BuiltinTool {
             Self::ReadFile,
             Self::WriteFile,
             Self::Shell,
+            Self::Grep,
         ]
     }
 }
@@ -100,12 +102,13 @@ impl Tool for BuiltinTool {
             BuiltinTool::ReadFile => "read_file",
             BuiltinTool::WriteFile => "write_file",
             BuiltinTool::Shell => "shell",
+            BuiltinTool::Grep => "grep",
         }
     }
 
     fn metadata(&self, arguments: &Value) -> ToolMetadata {
         let (read_only, destructive, concurrency_safe, permission_hint) = match self {
-            BuiltinTool::ListFiles | BuiltinTool::ReadFile => {
+            BuiltinTool::ListFiles | BuiltinTool::ReadFile | BuiltinTool::Grep => {
                 (true, false, true, PermissionDecision::Allow)
             }
             BuiltinTool::WriteFile => (false, true, false, PermissionDecision::Ask),
@@ -189,13 +192,55 @@ impl Tool for BuiltinTool {
                 },
                 "strict": false
             }),
+            BuiltinTool::Grep => json!({
+                "type": "function",
+                "name": "grep",
+                "description": "Search file contents with a regex pattern under session cwd. Respects .gitignore via ripgrep.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Regex pattern to search for."},
+                        "path": {"type": "string", "description": "File or directory relative to cwd. Defaults to ."},
+                        "include": {"type": "string", "description": "Glob to filter files (e.g. '*.rs')."},
+                        "context": {"type": "integer", "description": "Lines of context around each match."}
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
         }
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> ToolResult {
         match self.execute_inner(input, ctx).await {
             Ok(result) => result,
-            Err(ToolExecError::Other(error)) => ToolResult::error(error.to_string()),
+            Err(err) => match err {
+                ToolExecError::Timeout { duration_ms } => {
+                    ToolResult::error_with_kind(ToolErrorKind::Timeout,
+                        format!("timed out after {duration_ms}ms"))
+                }
+                ToolExecError::Io { source, context } => {
+                    ToolResult::error_with_kind(ToolErrorKind::Io,
+                        format!("{context}: {source}"))
+                }
+                ToolExecError::Parse(error) => {
+                    ToolResult::error_with_kind(ToolErrorKind::Parse, error.to_string())
+                }
+                ToolExecError::Permission(msg) => {
+                    ToolResult::error_with_kind(ToolErrorKind::Permission, msg)
+                }
+                ToolExecError::ProcessExit { code } => {
+                    ToolResult::error_with_kind(ToolErrorKind::ProcessExit,
+                        format!("process exited with code {code:?}"))
+                }
+                ToolExecError::Utf8(error) => {
+                    ToolResult::error_with_kind(ToolErrorKind::Utf8, error.to_string())
+                }
+                ToolExecError::Other(error) => {
+                    ToolResult::error_with_kind(ToolErrorKind::Unknown, error.to_string())
+                }
+            },
         }
     }
 }
@@ -211,12 +256,28 @@ impl BuiltinTool {
             BuiltinTool::ReadFile => read_file(input, &ctx.cwd).await,
             BuiltinTool::WriteFile => write_file(input, &ctx).await.map(ToolResult::ok),
             BuiltinTool::Shell => shell(input, &ctx).await,
+            BuiltinTool::Grep => grep(input, &ctx.cwd).await,
         }
     }
 }
 
 #[derive(Debug, Error)]
 enum ToolExecError {
+    #[error("timed out after {duration_ms}ms")]
+    Timeout { duration_ms: u64 },
+    #[error("I/O error: {context}")]
+    Io {
+        source: std::io::Error,
+        context: String,
+    },
+    #[error(transparent)]
+    Parse(#[from] serde_json::Error),
+    #[error("permission denied: {0}")]
+    Permission(String),
+    #[error("process exited with code {code:?}")]
+    ProcessExit { code: Option<i32> },
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -243,6 +304,14 @@ struct ShellInput {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct GrepInput {
+    pattern: String,
+    path: Option<String>,
+    include: Option<String>,
+    context: Option<u32>,
+}
+
 #[derive(serde::Serialize)]
 struct DirEntryInfo {
     name: String,
@@ -250,7 +319,7 @@ struct DirEntryInfo {
 }
 
 async fn list_files(input: Value, cwd: &Path) -> std::result::Result<String, ToolExecError> {
-    let input: PathInput = serde_json::from_value(input).context("parse list_files input")?;
+    let input: PathInput = serde_json::from_value(input)?;
     let path = resolve_under_cwd(cwd, input.path.as_deref().unwrap_or("."))?;
     let mut dir = tokio::fs::read_dir(&path)
         .await
@@ -279,12 +348,12 @@ async fn list_files(input: Value, cwd: &Path) -> std::result::Result<String, Too
 }
 
 async fn read_file(input: Value, cwd: &Path) -> std::result::Result<ToolResult, ToolExecError> {
-    let input: ReadInput = serde_json::from_value(input).context("parse read_file input")?;
+    let input: ReadInput = serde_json::from_value(input)?;
     let path = resolve_under_cwd(cwd, &input.path)?;
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("read file {}", path.display()))?;
-    let text = String::from_utf8(bytes).context("file is not valid UTF-8")?;
+    let text = String::from_utf8(bytes)?;
     let preview = truncate_text_with_metadata(&text, READ_LIMIT);
     Ok(ToolResult::ok_with_preview(
         preview.text,
@@ -295,10 +364,10 @@ async fn read_file(input: Value, cwd: &Path) -> std::result::Result<ToolResult, 
 }
 
 async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<String, ToolExecError> {
-    let input: WriteInput = serde_json::from_value(input).context("parse write_file input")?;
+    let input: WriteInput = serde_json::from_value(input)?;
     let path = resolve_under_cwd(&ctx.cwd, &input.path)?;
     if path_has_symlink_component(&ctx.cwd, &path)? {
-        return Err(ToolExecError::Other(anyhow!(
+        return Err(ToolExecError::Permission(format!(
             "refusing to write through symlink path {}",
             path.display()
         )));
@@ -318,7 +387,7 @@ async fn write_file(input: Value, ctx: &ToolContext) -> std::result::Result<Stri
 }
 
 async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResult, ToolExecError> {
-    let input: ShellInput = serde_json::from_value(input).context("parse shell input")?;
+    let input: ShellInput = serde_json::from_value(input)?;
 
     let timeout_ms = input
         .timeout_ms
@@ -350,9 +419,9 @@ async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResul
         Ok(result) => result.context("wait for shell command")?,
         Err(_) => {
             let _ = child.kill().await;
-            return Err(ToolExecError::Other(anyhow!(
-                "shell command timed out after {timeout_ms}ms"
-            )));
+            return Err(ToolExecError::Timeout {
+                duration_ms: timeout_ms,
+            });
         }
     };
 
@@ -373,6 +442,95 @@ async fn shell(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResul
         String::from_utf8_lossy(&stderr)
     );
     let preview = truncate_text_with_metadata(&combined, SHELL_OUTPUT_LIMIT);
+    Ok(ToolResult::ok_with_preview(
+        preview.text,
+        preview.truncated,
+        preview.original_bytes,
+        preview.preview_bytes,
+    ))
+}
+
+const GREP_OUTPUT_LIMIT: usize = 64 * 1024;
+const GREP_TIMEOUT_MS: u64 = 30_000;
+const GREP_MAX_MATCHES: &str = "500";
+
+async fn grep(input: Value, cwd: &Path) -> std::result::Result<ToolResult, ToolExecError> {
+    let input: GrepInput = serde_json::from_value(input)?;
+    let path = resolve_under_cwd(cwd, input.path.as_deref().unwrap_or("."))?;
+
+    let mut cmd = Command::new("rg");
+    cmd.arg("--no-heading")
+        .arg("--line-number")
+        .arg("--max-count")
+        .arg(GREP_MAX_MATCHES)
+        .arg("--regexp")
+        .arg(&input.pattern)
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    if let Some(include) = &input.include {
+        cmd.arg("--glob").arg(include);
+    }
+    if let Some(ctx) = input.context {
+        cmd.arg("--context").arg(ctx.to_string());
+    }
+
+    let mut child = cmd.spawn().map_err(|e| ToolExecError::Io {
+        source: e,
+        context: "spawn rg".into(),
+    })?;
+
+    let mut stdout = child.stdout.take().context("capture rg stdout")?;
+    let mut stderr = child.stderr.take().context("capture rg stderr")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await.map(|_| buf)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).await.map(|_| buf)
+    });
+
+    let status = match tokio::time::timeout(Duration::from_millis(GREP_TIMEOUT_MS), child.wait()).await
+    {
+        Ok(result) => result.context("wait for rg")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(ToolExecError::Timeout {
+                duration_ms: GREP_TIMEOUT_MS,
+            });
+        }
+    };
+
+    let stdout = stdout_task
+        .await
+        .context("join rg stdout task")?
+        .context("read rg stdout")?;
+    let stderr = stderr_task
+        .await
+        .context("join rg stderr task")?
+        .context("read rg stderr")?;
+
+    let code = status.code();
+    if code == Some(2) {
+        return Err(ToolExecError::Other(anyhow::anyhow!(
+            "rg failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+
+    let output = String::from_utf8(stdout)?;
+    let output = if output.is_empty() && code == Some(1) {
+        "no matches found".to_string()
+    } else if output.is_empty() {
+        String::from_utf8_lossy(&stderr).trim().to_string()
+    } else {
+        output
+    };
+
+    let preview = truncate_text_with_metadata(&output, GREP_OUTPUT_LIMIT);
     Ok(ToolResult::ok_with_preview(
         preview.text,
         preview.truncated,

@@ -434,6 +434,7 @@ mod tests {
                 success: true,
                 output: "ok".into(),
                 error: None,
+                error_kind: None,
                 truncated: false,
                 original_bytes: 2,
                 preview_bytes: 2,

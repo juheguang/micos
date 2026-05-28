@@ -1,7 +1,7 @@
 use crate::config::{ApiKind, PermissionMode, ReasoningEffort, SessionConfig, ThinkingMode};
 use crate::context::ContextCategory;
 use crate::prompt::PromptSectionSnapshot;
-use crate::tools::{DecisionReason, PermissionDecision, RuleSource};
+use crate::tools::{DecisionReason, PermissionDecision, RuleSource, ToolErrorKind};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -218,6 +218,8 @@ pub enum SessionEvent {
         output: String,
         error: Option<String>,
         #[serde(default)]
+        error_kind: Option<ToolErrorKind>,
+        #[serde(default)]
         truncated: bool,
         #[serde(default)]
         original_bytes: usize,
@@ -259,6 +261,8 @@ pub enum SessionEvent {
         success: bool,
         output: String,
         error: Option<String>,
+        #[serde(default)]
+        error_kind: Option<ToolErrorKind>,
         elapsed_ms: u64,
         #[serde(default)]
         truncated: bool,

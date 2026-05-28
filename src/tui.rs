@@ -1687,6 +1687,7 @@ mod tests {
                 success: true,
                 output: "contents".into(),
                 error: None,
+                error_kind: None,
                 denied: false,
                 truncated: false,
                 original_bytes: 8,

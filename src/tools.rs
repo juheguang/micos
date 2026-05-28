@@ -14,7 +14,7 @@ pub use policy::{
     RuleSource, ShellSafety,
 };
 pub use types::{
-    ModePermissionPolicy, PermissionPolicy, Tool, ToolContext, ToolMetadata,
+    ModePermissionPolicy, PermissionPolicy, Tool, ToolContext, ToolErrorKind, ToolMetadata,
     ToolPermissionDecision, ToolRegistry, ToolResult, ToolSummary,
 };
 #[cfg(test)]
@@ -117,7 +117,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["list_files", "read_file", "write_file", "shell"]
+            vec!["list_files", "read_file", "write_file", "shell", "grep"]
         );
         assert_eq!(schemas[1]["parameters"]["required"], json!(["path"]));
         assert_eq!(

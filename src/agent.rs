@@ -649,6 +649,7 @@ where
                     success: result.success,
                     output: result.output.clone(),
                     error: result.error.clone(),
+                    error_kind: result.error_kind.clone(),
                     truncated: result.truncated,
                     original_bytes: result.original_bytes,
                     preview_bytes: result.preview_bytes,
@@ -660,6 +661,7 @@ where
                     success: result.success,
                     output: result.output.clone(),
                     error: result.error.clone(),
+                    error_kind: result.error_kind.clone(),
                     elapsed_ms: elapsed_millis_u64(elapsed),
                     truncated: result.truncated,
                     original_bytes: result.original_bytes,
@@ -1723,7 +1725,7 @@ status = "active"
             .iter()
             .map(|schema| schema["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(tool_names, vec!["list_files", "read_file", "write_file"]);
+        assert_eq!(tool_names, vec!["list_files", "read_file", "write_file", "grep"]);
     }
 
     #[tokio::test]
@@ -1755,7 +1757,7 @@ status = "active"
             .collect::<Vec<_>>();
         assert_eq!(
             tool_names,
-            vec!["list_files", "read_file", "write_file", "shell"]
+            vec!["list_files", "read_file", "write_file", "shell", "grep"]
         );
         assert_eq!(path_config.permission_rules.len(), 1);
 
