@@ -1725,7 +1725,7 @@ status = "active"
             .iter()
             .map(|schema| schema["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(tool_names, vec!["list_files", "read_file", "write_file", "grep"]);
+        assert_eq!(tool_names, vec!["list_files", "read_file", "write_file", "grep", "edit", "glob"]);
     }
 
     #[tokio::test]
@@ -1757,7 +1757,7 @@ status = "active"
             .collect::<Vec<_>>();
         assert_eq!(
             tool_names,
-            vec!["list_files", "read_file", "write_file", "shell", "grep"]
+            vec!["list_files", "read_file", "write_file", "shell", "grep", "edit", "glob"]
         );
         assert_eq!(path_config.permission_rules.len(), 1);
 

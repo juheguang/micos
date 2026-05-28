@@ -117,7 +117,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["list_files", "read_file", "write_file", "shell", "grep"]
+            vec!["list_files", "read_file", "write_file", "shell", "grep", "edit", "glob"]
         );
         assert_eq!(schemas[1]["parameters"]["required"], json!(["path"]));
         assert_eq!(

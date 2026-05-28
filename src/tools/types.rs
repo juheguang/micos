@@ -142,6 +142,21 @@ impl ToolSummary {
                     .unwrap_or("<missing>"),
                 arguments.get("path").and_then(Value::as_str).unwrap_or(".")
             ),
+            "edit" => format!(
+                "path={}",
+                arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>")
+            ),
+            "glob" => format!(
+                "pattern={} root={}",
+                arguments
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>"),
+                arguments.get("root").and_then(Value::as_str).unwrap_or(".")
+            ),
             _ => arguments.to_string(),
         };
         Self { summary }

@@ -137,6 +137,8 @@ Target: make the existing feature set robust for regular daily use.
 
 Target: close the loop between session work, durable memory, and context budget.
 
+> **Detailed plan:** [docs/roadmap-0.6.md](./roadmap-0.6.md) — 彻底改造记忆和上下文策略，让 harness 承担提取时机、压缩触发、生命周期管理，模型只负责语义理解。
+
 **Memory Enhancement:**
 - Model-driven candidate extraction: after session end (or on `/memory refresh`), ask the model to extract durable facts, decisions, and patterns from the session transcript
 - Candidate deduplication: compare new candidates against existing entries; flag near-duplicates

@@ -26,6 +26,8 @@ pub enum BuiltinTool {
     WriteFile,
     Shell,
     Grep,
+    Edit,
+    Glob,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +43,8 @@ impl BuiltinTool {
             Self::WriteFile,
             Self::Shell,
             Self::Grep,
+            Self::Edit,
+            Self::Glob,
         ]
     }
 }
@@ -103,15 +107,20 @@ impl Tool for BuiltinTool {
             BuiltinTool::WriteFile => "write_file",
             BuiltinTool::Shell => "shell",
             BuiltinTool::Grep => "grep",
+            BuiltinTool::Edit => "edit",
+            BuiltinTool::Glob => "glob",
         }
     }
 
     fn metadata(&self, arguments: &Value) -> ToolMetadata {
         let (read_only, destructive, concurrency_safe, permission_hint) = match self {
-            BuiltinTool::ListFiles | BuiltinTool::ReadFile | BuiltinTool::Grep => {
+            BuiltinTool::ListFiles | BuiltinTool::ReadFile | BuiltinTool::Grep
+            | BuiltinTool::Glob => {
                 (true, false, true, PermissionDecision::Allow)
             }
-            BuiltinTool::WriteFile => (false, true, false, PermissionDecision::Ask),
+            BuiltinTool::WriteFile | BuiltinTool::Edit => {
+                (false, true, false, PermissionDecision::Ask)
+            }
             BuiltinTool::Shell => match classify_shell_command(
                 arguments
                     .get("command")
@@ -209,6 +218,41 @@ impl Tool for BuiltinTool {
                 },
                 "strict": false
             }),
+            BuiltinTool::Edit => json!({
+                "type": "function",
+                "name": "edit",
+                "description": "Replace text in a file by search-and-replace or line range. Only the specified portion is changed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path relative to cwd."},
+                        "search": {"type": "string", "description": "Exact text to locate for replacement."},
+                        "replace": {"type": "string", "description": "New text to substitute (paired with search)."},
+                        "line_start": {"type": "integer", "description": "Start line for line-range edit (1-based, inclusive). Requires line_end and new_content."},
+                        "line_end": {"type": "integer", "description": "End line for line-range edit (1-based, inclusive). Requires line_start and new_content."},
+                        "new_content": {"type": "string", "description": "Replacement content for line-range edit."}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
+            BuiltinTool::Glob => json!({
+                "type": "function",
+                "name": "glob",
+                "description": "Find files matching a glob pattern under session cwd. Returns newline-separated relative paths.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.rs', '*.md')."},
+                        "root": {"type": "string", "description": "Root directory relative to cwd. Defaults to ."},
+                        "depth": {"type": "integer", "description": "Maximum recursion depth. No limit by default."}
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }),
         }
     }
 
@@ -257,6 +301,8 @@ impl BuiltinTool {
             BuiltinTool::WriteFile => write_file(input, &ctx).await.map(ToolResult::ok),
             BuiltinTool::Shell => shell(input, &ctx).await,
             BuiltinTool::Grep => grep(input, &ctx.cwd).await,
+            BuiltinTool::Edit => edit(input, &ctx).await,
+            BuiltinTool::Glob => glob(input, &ctx.cwd).await,
         }
     }
 }
@@ -310,6 +356,23 @@ struct GrepInput {
     path: Option<String>,
     include: Option<String>,
     context: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct EditInput {
+    path: String,
+    search: Option<String>,
+    replace: Option<String>,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    new_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GlobInput {
+    pattern: String,
+    root: Option<String>,
+    depth: Option<u32>,
 }
 
 #[derive(serde::Serialize)]
@@ -531,6 +594,158 @@ async fn grep(input: Value, cwd: &Path) -> std::result::Result<ToolResult, ToolE
     };
 
     let preview = truncate_text_with_metadata(&output, GREP_OUTPUT_LIMIT);
+    Ok(ToolResult::ok_with_preview(
+        preview.text,
+        preview.truncated,
+        preview.original_bytes,
+        preview.preview_bytes,
+    ))
+}
+
+const EDIT_SIZE_LIMIT: usize = 1024 * 1024;
+const GLOB_OUTPUT_LIMIT: usize = 32 * 1024;
+const GLOB_TIMEOUT_MS: u64 = 30_000;
+
+async fn edit(input: Value, ctx: &ToolContext) -> std::result::Result<ToolResult, ToolExecError> {
+    let input: EditInput = serde_json::from_value(input)?;
+    let path = resolve_under_cwd(&ctx.cwd, &input.path)?;
+    if path_has_symlink_component(&ctx.cwd, &path)? {
+        return Err(ToolExecError::Permission(format!(
+            "refusing to edit through symlink path {}",
+            path.display()
+        )));
+    }
+
+    let original = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| ToolExecError::Io {
+            source: e,
+            context: format!("read file for edit {}", path.display()),
+        })?;
+
+    let edited = if let (Some(search), Some(replace)) = (&input.search, &input.replace) {
+        // search/replace mode: replace first occurrence
+        if !original.contains(search) {
+            return Err(ToolExecError::Other(anyhow::anyhow!(
+                "search text not found in {}",
+                path.display()
+            )));
+        }
+        original.replacen(search, replace, 1)
+    } else if let (Some(start), Some(end), Some(new_content)) =
+        (&input.line_start, &input.line_end, &input.new_content)
+    {
+        // line-based mode: replace range of lines
+        let lines: Vec<&str> = original.lines().collect();
+        let total = lines.len();
+        if *start < 1 || *end < *start || *end > total {
+            return Err(ToolExecError::Other(anyhow::anyhow!(
+                "invalid line range {start}..{end} (file has {total} lines)"
+            )));
+        }
+        let mut new_lines: Vec<&str> = Vec::new();
+        new_lines.extend(&lines[..start - 1]);
+        for line in new_content.lines() {
+            new_lines.push(line);
+        }
+        new_lines.extend(&lines[*end..]);
+        new_lines.join("\n")
+    } else {
+        return Err(ToolExecError::Other(anyhow::anyhow!(
+            "edit requires search+replace or line_start+line_end+new_content"
+        )));
+    };
+
+    if edited.len() > EDIT_SIZE_LIMIT {
+        return Err(ToolExecError::Other(anyhow::anyhow!(
+            "edit result exceeds {EDIT_SIZE_LIMIT} bytes"
+        )));
+    }
+
+    tokio::fs::write(&path, &edited)
+        .await
+        .map_err(|e| ToolExecError::Io {
+            source: e,
+            context: format!("write edited file {}", path.display()),
+        })?;
+
+    let rel = path.strip_prefix(&ctx.cwd).unwrap_or(&path).display();
+    Ok(ToolResult::ok(format!(
+        "edited {} ({} → {} bytes)",
+        rel,
+        original.len(),
+        edited.len()
+    )))
+}
+
+async fn glob(input: Value, cwd: &Path) -> std::result::Result<ToolResult, ToolExecError> {
+    let input: GlobInput = serde_json::from_value(input)?;
+    let root = resolve_under_cwd(cwd, input.root.as_deref().unwrap_or("."))?;
+
+    let mut cmd = Command::new("find");
+    cmd.arg(&root)
+        .arg("-name")
+        .arg(&input.pattern)
+        .arg("-type")
+        .arg("f")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    if let Some(depth) = input.depth {
+        cmd.arg("-maxdepth").arg(depth.to_string());
+    }
+
+    let mut child = cmd.spawn().map_err(|e| ToolExecError::Io {
+        source: e,
+        context: "spawn find".into(),
+    })?;
+
+    let mut stdout = child.stdout.take().context("capture find stdout")?;
+    let mut stderr = child.stderr.take().context("capture find stderr")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await.map(|_| buf)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).await.map(|_| buf)
+    });
+
+    let _status =
+        match tokio::time::timeout(Duration::from_millis(GLOB_TIMEOUT_MS), child.wait()).await {
+            Ok(result) => result.context("wait for find")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(ToolExecError::Timeout {
+                    duration_ms: GLOB_TIMEOUT_MS,
+                });
+            }
+        };
+
+    let stdout = stdout_task
+        .await
+        .context("join find stdout task")?
+        .context("read find stdout")?;
+    let _stderr = stderr_task
+        .await
+        .context("join find stderr task")?
+        .context("read find stderr")?;
+
+    let output = String::from_utf8(stdout)?;
+    let output = if output.is_empty() {
+        "no files matched".to_string()
+    } else {
+        // strip the root prefix from paths
+        let root_prefix = format!("{}/", root.display());
+        output
+            .lines()
+            .map(|line| line.strip_prefix(&root_prefix).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let preview = truncate_text_with_metadata(&output, GLOB_OUTPUT_LIMIT);
     Ok(ToolResult::ok_with_preview(
         preview.text,
         preview.truncated,

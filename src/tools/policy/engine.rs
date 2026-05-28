@@ -175,7 +175,7 @@ impl PolicyEngine {
         }
 
         match tool_name {
-            "write_file" => default_for_write_file(permission, cwd, arguments),
+            "write_file" | "edit" => default_for_write_file(permission, cwd, arguments),
             "shell" => default_for_shell(permission, arguments),
             _ => decision(
                 PermissionDecision::Allow,
@@ -196,7 +196,7 @@ impl PermissionPolicy for PolicyEngine {
         arguments: &Value,
         cwd: &Path,
     ) -> PolicyDecision {
-        if tool_name == "write_file" {
+        if tool_name == "write_file" || tool_name == "edit" {
             if let Some(decision) = hard_write_file_guard(cwd, arguments) {
                 return decision;
             }
