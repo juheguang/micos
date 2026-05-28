@@ -81,7 +81,34 @@ pub enum SessionEvent {
         index_path: PathBuf,
         index_tokens: usize,
         topic_count: usize,
+        #[serde(default)]
+        candidate_count: usize,
+        #[serde(default)]
+        entry_count: usize,
+        #[serde(default)]
+        active_entry_count: usize,
+        #[serde(default)]
+        active_entry_tokens: usize,
         created_index: bool,
+    },
+    MemoryCandidateCreated {
+        timestamp: String,
+        id: String,
+        title: String,
+        source_session: Option<String>,
+        created: bool,
+    },
+    MemoryPromoted {
+        timestamp: String,
+        id: String,
+        title: String,
+        source_session: Option<String>,
+    },
+    MemoryStatusChanged {
+        timestamp: String,
+        id: String,
+        status: String,
+        title: String,
     },
     HandoffWritten {
         timestamp: String,
@@ -93,12 +120,44 @@ pub enum SessionEvent {
         known_failures: usize,
         tokens_estimate: usize,
     },
+    RecoveryReportWritten {
+        timestamp: String,
+        path: PathBuf,
+        trigger: String,
+        stop_reason: Option<String>,
+        failure_class: String,
+        known_failures: usize,
+        tokens_estimate: usize,
+    },
+    CheckpointBeforeTool {
+        timestamp: String,
+        call_id: String,
+        tool: String,
+        argument_summary: String,
+        git_available: bool,
+        branch: Option<String>,
+        status_short: String,
+    },
+    CheckpointAfterTool {
+        timestamp: String,
+        call_id: String,
+        tool: String,
+        success: bool,
+        git_available: bool,
+        branch: Option<String>,
+        changed_files: Vec<String>,
+        status_short: String,
+    },
     ContextSnapshot {
         timestamp: String,
         model: String,
         estimated_tokens: usize,
         max_tokens: usize,
         usage_percent: usize,
+        #[serde(default)]
+        warning_percent: usize,
+        #[serde(default)]
+        pressure_status: String,
         categories: Vec<ContextCategory>,
         #[serde(default)]
         prompt_sections: Vec<PromptSectionSnapshot>,
@@ -360,6 +419,10 @@ mod tests {
             index_path: PathBuf::from(".micos/memory/MEMORY.md"),
             index_tokens: 42,
             topic_count: 2,
+            candidate_count: 3,
+            entry_count: 4,
+            active_entry_count: 1,
+            active_entry_tokens: 24,
             created_index: true,
         };
 
@@ -369,7 +432,45 @@ mod tests {
         assert_eq!(value["index_path"], ".micos/memory/MEMORY.md");
         assert_eq!(value["index_tokens"], 42);
         assert_eq!(value["topic_count"], 2);
+        assert_eq!(value["candidate_count"], 3);
+        assert_eq!(value["entry_count"], 4);
+        assert_eq!(value["active_entry_count"], 1);
+        assert_eq!(value["active_entry_tokens"], 24);
         assert_eq!(value["created_index"], true);
+    }
+
+    #[test]
+    fn memory_lifecycle_events_serialize_with_expected_fields() {
+        let candidate = SessionEvent::MemoryCandidateCreated {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            id: "session-1".into(),
+            title: "Continue work".into(),
+            source_session: Some("session-1".into()),
+            created: true,
+        };
+        let promoted = SessionEvent::MemoryPromoted {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            id: "session-1".into(),
+            title: "Continue work".into(),
+            source_session: Some("session-1".into()),
+        };
+        let changed = SessionEvent::MemoryStatusChanged {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            id: "session-1".into(),
+            status: "stale".into(),
+            title: "Continue work".into(),
+        };
+
+        let candidate = serde_json::to_value(candidate).unwrap();
+        let promoted = serde_json::to_value(promoted).unwrap();
+        let changed = serde_json::to_value(changed).unwrap();
+
+        assert_eq!(candidate["type"], "memory_candidate_created");
+        assert_eq!(candidate["created"], true);
+        assert_eq!(promoted["type"], "memory_promoted");
+        assert_eq!(promoted["source_session"], "session-1");
+        assert_eq!(changed["type"], "memory_status_changed");
+        assert_eq!(changed["status"], "stale");
     }
 
     #[test]
@@ -437,6 +538,49 @@ mod tests {
     }
 
     #[test]
+    fn recovery_and_checkpoint_events_serialize_with_expected_fields() {
+        let recovery = SessionEvent::RecoveryReportWritten {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            path: PathBuf::from(".micos/recovery/latest.md"),
+            trigger: "tool_error".into(),
+            stop_reason: Some("tool_error".into()),
+            failure_class: "tool_error".into(),
+            known_failures: 2,
+            tokens_estimate: 80,
+        };
+        let before = SessionEvent::CheckpointBeforeTool {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            call_id: "call_1".into(),
+            tool: "write_file".into(),
+            argument_summary: "path=src/lib.rs bytes=2".into(),
+            git_available: true,
+            branch: Some("main".into()),
+            status_short: " M src/lib.rs".into(),
+        };
+        let after = SessionEvent::CheckpointAfterTool {
+            timestamp: "2026-05-27T00:00:00Z".into(),
+            call_id: "call_1".into(),
+            tool: "write_file".into(),
+            success: true,
+            git_available: true,
+            branch: Some("main".into()),
+            changed_files: vec!["src/lib.rs".into()],
+            status_short: " M src/lib.rs".into(),
+        };
+
+        let recovery = serde_json::to_value(recovery).unwrap();
+        let before = serde_json::to_value(before).unwrap();
+        let after = serde_json::to_value(after).unwrap();
+
+        assert_eq!(recovery["type"], "recovery_report_written");
+        assert_eq!(recovery["failure_class"], "tool_error");
+        assert_eq!(before["type"], "checkpoint_before_tool");
+        assert_eq!(before["git_available"], true);
+        assert_eq!(after["type"], "checkpoint_after_tool");
+        assert_eq!(after["changed_files"][0], "src/lib.rs");
+    }
+
+    #[test]
     fn context_summary_event_serializes_with_expected_fields() {
         let event = SessionEvent::ContextSummary {
             timestamp: "2026-05-27T00:00:00Z".into(),
@@ -466,6 +610,8 @@ mod tests {
             estimated_tokens: 20,
             max_tokens: 100,
             usage_percent: 20,
+            warning_percent: 80,
+            pressure_status: "ok".into(),
             categories: vec![ContextCategory {
                 name: "prompt.identity".into(),
                 tokens: 10,
@@ -480,6 +626,8 @@ mod tests {
 
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "context_snapshot");
+        assert_eq!(value["warning_percent"], 80);
+        assert_eq!(value["pressure_status"], "ok");
         assert_eq!(value["prompt_sections"][0]["id"], "identity");
         assert_eq!(value["prompt_sections"][0]["source"], "base");
     }

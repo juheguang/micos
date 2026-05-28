@@ -1,10 +1,20 @@
 use crate::context::estimate_text_tokens;
+use crate::plan::HandoffDraft;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
+
+mod records;
+use records::{
+    candidate_from_draft, entry_from_candidate, render_active_entries, sanitize_id, scan_toml_dir,
+    write_toml,
+};
+pub use records::{MemoryCandidate, MemoryCandidateReport, MemoryEntry, MemoryStatus};
 
 pub const MEMORY_DIR: &str = ".micos/memory";
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 pub const MEMORY_TOPICS_DIR: &str = "topics";
+pub const MEMORY_CANDIDATES_DIR: &str = "candidates";
+pub const MEMORY_ENTRIES_DIR: &str = "entries";
 
 const MEMORY_INDEX_TEMPLATE: &str = r#"# Project Memory
 
@@ -18,6 +28,9 @@ pub struct ProjectMemory {
     pub index_text: String,
     pub index_tokens: usize,
     pub topics: Vec<MemoryTopic>,
+    pub candidates: Vec<MemoryCandidate>,
+    pub entries: Vec<MemoryEntry>,
+    pub active_entries_tokens: usize,
     pub created_index: bool,
 }
 
@@ -33,8 +46,19 @@ impl ProjectMemory {
     pub fn load_or_init(cwd: &Path) -> Result<Self> {
         let root = cwd.join(MEMORY_DIR);
         let topics_dir = root.join(MEMORY_TOPICS_DIR);
+        let candidates_dir = root.join(MEMORY_CANDIDATES_DIR);
+        let entries_dir = root.join(MEMORY_ENTRIES_DIR);
         std::fs::create_dir_all(&topics_dir)
             .with_context(|| format!("create memory topics directory {}", topics_dir.display()))?;
+        std::fs::create_dir_all(&candidates_dir).with_context(|| {
+            format!(
+                "create memory candidates directory {}",
+                candidates_dir.display()
+            )
+        })?;
+        std::fs::create_dir_all(&entries_dir).with_context(|| {
+            format!("create memory entries directory {}", entries_dir.display())
+        })?;
 
         let index_path = root.join(MEMORY_INDEX_FILE);
         let created_index = if index_path.exists() {
@@ -49,6 +73,9 @@ impl ProjectMemory {
             .with_context(|| format!("read memory index {}", index_path.display()))?;
         let topics = scan_topics(&topics_dir)?;
         let index_tokens = estimate_text_tokens(active_index_text(&index_text).unwrap_or(""));
+        let candidates = scan_toml_dir::<MemoryCandidate>(&candidates_dir)?;
+        let entries = scan_toml_dir::<MemoryEntry>(&entries_dir)?;
+        let active_entries_tokens = estimate_text_tokens(&render_active_entries(&entries));
 
         Ok(Self {
             root,
@@ -56,12 +83,34 @@ impl ProjectMemory {
             index_text,
             index_tokens,
             topics,
+            candidates,
+            entries,
+            active_entries_tokens,
             created_index,
         })
     }
 
     pub fn active_index_text(&self) -> Option<&str> {
         active_index_text(&self.index_text)
+    }
+
+    pub fn active_entries_text(&self) -> Option<String> {
+        let text = render_active_entries(&self.entries);
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    pub fn pending_candidates(&self) -> Vec<&MemoryCandidate> {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.status == MemoryStatus::Candidate)
+            .collect()
+    }
+
+    pub fn active_entries(&self) -> Vec<&MemoryEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.status == MemoryStatus::Active)
+            .collect()
     }
 
     pub fn read_topic(&self, file_name: &str) -> Result<String> {
@@ -78,6 +127,90 @@ impl ProjectMemory {
         }
         std::fs::read_to_string(&path)
             .with_context(|| format!("read memory topic {}", path.display()))
+    }
+
+    pub fn refresh_candidates_from_session(
+        &mut self,
+        session_path: &Path,
+        timestamp: String,
+    ) -> Result<MemoryCandidateReport> {
+        let draft =
+            HandoffDraft::from_session_log(session_path, "memory_refresh", timestamp.clone())
+                .with_context(|| {
+                    format!("build memory candidate from {}", session_path.display())
+                })?;
+        let source_session = session_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(ToOwned::to_owned);
+        let candidate = candidate_from_draft(&draft, source_session, timestamp);
+        let path = self.candidate_path(&candidate.id);
+        let created = !path.exists();
+        write_toml(&path, &candidate)?;
+        self.reload_records()?;
+        Ok(MemoryCandidateReport { candidate, created })
+    }
+
+    pub fn promote_candidate(&mut self, id: &str, timestamp: String) -> Result<MemoryEntry> {
+        let candidate = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == id && candidate.status == MemoryStatus::Candidate)
+            .cloned()
+            .with_context(|| format!("memory candidate not found: {id}"))?;
+        let entry = entry_from_candidate(candidate.clone(), timestamp);
+        write_toml(&self.entry_path(&entry.id), &entry)?;
+        let _ = std::fs::remove_file(self.candidate_path(&candidate.id));
+        self.reload_records()?;
+        Ok(entry)
+    }
+
+    pub fn mark_entry_status(&mut self, id: &str, status: MemoryStatus) -> Result<MemoryEntry> {
+        if !matches!(status, MemoryStatus::Stale | MemoryStatus::Forgotten) {
+            bail!("memory entry status can only be stale or forgotten");
+        }
+        let mut entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .with_context(|| format!("memory entry not found: {id}"))?;
+        entry.status = status;
+        write_toml(&self.entry_path(&entry.id), &entry)?;
+        self.reload_records()?;
+        Ok(entry)
+    }
+
+    pub fn forget_candidate(&mut self, id: &str) -> Result<MemoryCandidate> {
+        let mut candidate = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned()
+            .with_context(|| format!("memory candidate not found: {id}"))?;
+        candidate.status = MemoryStatus::Forgotten;
+        write_toml(&self.candidate_path(&candidate.id), &candidate)?;
+        self.reload_records()?;
+        Ok(candidate)
+    }
+
+    fn reload_records(&mut self) -> Result<()> {
+        self.candidates = scan_toml_dir::<MemoryCandidate>(&self.root.join(MEMORY_CANDIDATES_DIR))?;
+        self.entries = scan_toml_dir::<MemoryEntry>(&self.root.join(MEMORY_ENTRIES_DIR))?;
+        self.active_entries_tokens = estimate_text_tokens(&render_active_entries(&self.entries));
+        Ok(())
+    }
+
+    fn candidate_path(&self, id: &str) -> PathBuf {
+        self.root
+            .join(MEMORY_CANDIDATES_DIR)
+            .join(format!("{}.toml", sanitize_id(id)))
+    }
+
+    fn entry_path(&self, id: &str) -> PathBuf {
+        self.root
+            .join(MEMORY_ENTRIES_DIR)
+            .join(format!("{}.toml", sanitize_id(id)))
     }
 }
 
@@ -141,8 +274,12 @@ mod tests {
         assert!(memory.created_index);
         assert!(memory.index_path.exists());
         assert!(memory.root.join(MEMORY_TOPICS_DIR).is_dir());
+        assert!(memory.root.join(MEMORY_CANDIDATES_DIR).is_dir());
+        assert!(memory.root.join(MEMORY_ENTRIES_DIR).is_dir());
         assert_eq!(memory.active_index_text(), None);
         assert_eq!(memory.index_tokens, 0);
+        assert!(memory.candidates.is_empty());
+        assert!(memory.entries.is_empty());
     }
 
     #[test]
@@ -163,6 +300,46 @@ mod tests {
         assert_eq!(memory.topics.len(), 1);
         assert_eq!(memory.topics[0].file_name, "build.md");
         assert_eq!(memory.topics[0].title, "Build");
+    }
+
+    #[test]
+    fn promotes_stales_and_forgets_memory_entries() {
+        let cwd = temp_cwd();
+        let mut memory = ProjectMemory::load_or_init(&cwd).unwrap();
+        let session_dir = cwd.join(crate::session::SESSION_DIR);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("abc.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"user_input","text":"Implement memory lifecycle."}
+{"type":"assistant_text","text":"Changed src/memory.rs and ran cargo test."}
+{"type":"verification_finished","name":"test","command":"cargo test","success":true,"exit_code":0,"elapsed_ms":1,"output_preview":"ok","truncated":false}
+"#,
+        )
+        .unwrap();
+
+        let report = memory
+            .refresh_candidates_from_session(&session_path, "2026-05-27T00:00:00Z".into())
+            .unwrap();
+
+        assert!(report.created);
+        assert_eq!(memory.pending_candidates().len(), 1);
+        let entry = memory
+            .promote_candidate(&report.candidate.id, "2026-05-27T00:01:00Z".into())
+            .unwrap();
+        assert_eq!(entry.status, MemoryStatus::Active);
+        assert!(memory.active_entries_text().unwrap().contains("cargo test"));
+        assert!(memory.pending_candidates().is_empty());
+
+        let entry = memory
+            .mark_entry_status(&entry.id, MemoryStatus::Stale)
+            .unwrap();
+        assert_eq!(entry.status, MemoryStatus::Stale);
+        assert_eq!(memory.active_entries_text(), None);
+        let entry = memory
+            .mark_entry_status(&entry.id, MemoryStatus::Forgotten)
+            .unwrap();
+        assert_eq!(entry.status, MemoryStatus::Forgotten);
     }
 
     #[test]

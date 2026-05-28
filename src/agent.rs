@@ -1,4 +1,5 @@
 mod approval;
+mod checkpoint;
 mod compact;
 mod model_output;
 
@@ -8,13 +9,14 @@ use crate::config::{
 use crate::context::{
     compacted_summary_message, estimate_text_tokens, ContextBuilder, ContextStats,
 };
-use crate::memory::ProjectMemory;
+use crate::memory::{MemoryCandidateReport, MemoryEntry, MemoryStatus, ProjectMemory};
 use crate::model::{ModelClient, ModelRequest, OpenAiModelClient};
 use crate::plan::{self, ActivePlan, HandoffReport};
 use crate::prompt::{
     compact_instructions, compact_repair_instructions, PromptBuild, PromptBuilder,
     PromptRuntimeContext,
 };
+use crate::recovery::{self, RecoveryReport};
 use crate::session::{now, Session, SessionEvent, SessionStore, StopReason};
 use crate::session_replay::{replay_session, resolve_session_target, SessionResumeReport};
 use crate::tools::{
@@ -29,7 +31,7 @@ use crate::verify::{
     load_verification_checks, select_verification_checks, shell_exit_code, VerificationCheckReport,
     VerificationRunReport,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use approval::suggest_approval_rule;
 use compact::{
     compression_ratio_percent, normalize_compact_summary, validate_compact_summary, CompactPlan,
@@ -163,10 +165,74 @@ where
             index_path: memory.index_path.clone(),
             index_tokens: memory.index_tokens,
             topic_count: memory.topics.len(),
+            candidate_count: memory.candidates.len(),
+            entry_count: memory.entries.len(),
+            active_entry_count: memory.active_entries().len(),
+            active_entry_tokens: memory.active_entries_tokens,
             created_index: memory.created_index,
         })?;
         self.project_memory = Some(memory);
         Ok(())
+    }
+
+    pub fn refresh_memory_candidates(&mut self) -> Result<MemoryCandidateReport> {
+        let memory = self
+            .project_memory
+            .as_mut()
+            .context("project memory is not loaded")?;
+        let report = memory.refresh_candidates_from_session(self.session.path(), now())?;
+        self.session.append(&SessionEvent::MemoryCandidateCreated {
+            timestamp: now(),
+            id: report.candidate.id.clone(),
+            title: report.candidate.title.clone(),
+            source_session: report.candidate.source_session.clone(),
+            created: report.created,
+        })?;
+        Ok(report)
+    }
+
+    pub fn promote_memory_candidate(&mut self, id: &str) -> Result<MemoryEntry> {
+        let memory = self
+            .project_memory
+            .as_mut()
+            .context("project memory is not loaded")?;
+        let entry = memory.promote_candidate(id, now())?;
+        self.session.append(&SessionEvent::MemoryPromoted {
+            timestamp: now(),
+            id: entry.id.clone(),
+            title: entry.title.clone(),
+            source_session: entry.source_session.clone(),
+        })?;
+        Ok(entry)
+    }
+
+    pub fn mark_memory_stale(&mut self, id: &str) -> Result<MemoryEntry> {
+        self.mark_memory_entry_status(id, MemoryStatus::Stale)
+    }
+
+    pub fn forget_memory(&mut self, id: &str) -> Result<String> {
+        let memory = self
+            .project_memory
+            .as_mut()
+            .context("project memory is not loaded")?;
+        if memory.entries.iter().any(|entry| entry.id == id) {
+            let entry = memory.mark_entry_status(id, MemoryStatus::Forgotten)?;
+            self.session.append(&SessionEvent::MemoryStatusChanged {
+                timestamp: now(),
+                id: entry.id.clone(),
+                status: entry.status.to_string(),
+                title: entry.title.clone(),
+            })?;
+            return Ok(format!("forgotten entry {}", entry.id));
+        }
+        let candidate = memory.forget_candidate(id)?;
+        self.session.append(&SessionEvent::MemoryStatusChanged {
+            timestamp: now(),
+            id: candidate.id.clone(),
+            status: candidate.status.to_string(),
+            title: candidate.title.clone(),
+        })?;
+        Ok(format!("forgotten candidate {}", candidate.id))
     }
 
     pub fn install_active_plan(&mut self, active_plan: ActivePlan) {
@@ -192,6 +258,26 @@ where
             tokens_estimate: report.tokens_estimate,
         })?;
         self.active_plan = Some(active_plan);
+        Ok(report)
+    }
+
+    pub fn write_recovery_report(&mut self, trigger: &str) -> Result<RecoveryReport> {
+        let timestamp = now();
+        let report = recovery::write_recovery_report(
+            &self.config.cwd,
+            self.session.path(),
+            trigger,
+            timestamp.clone(),
+        )?;
+        self.session.append(&SessionEvent::RecoveryReportWritten {
+            timestamp,
+            path: report.path.clone(),
+            trigger: report.trigger.clone(),
+            stop_reason: report.stop_reason.clone(),
+            failure_class: report.failure_class.to_string(),
+            known_failures: report.known_failures,
+            tokens_estimate: report.tokens_estimate,
+        })?;
         Ok(report)
     }
 
@@ -420,6 +506,10 @@ where
             });
         }
 
+        if reports.iter().any(|report| !report.success) {
+            let _ = self.write_recovery_report("verification_failed");
+        }
+
         Ok(VerificationRunReport { checks: reports })
     }
 
@@ -494,6 +584,7 @@ where
                     })?;
                     self.stop(StopReason::ApiError).await?;
                     self.write_handoff(&StopReason::ApiError.to_string())?;
+                    let _ = self.write_recovery_report(&StopReason::ApiError.to_string());
                     ui.on_event(AgentEvent::Stop {
                         reason: StopReason::ApiError,
                     })?;
@@ -594,6 +685,7 @@ where
                         .push(function_call_output(&call.call_id, &result));
                     self.stop(StopReason::ToolDenied).await?;
                     self.write_handoff(&StopReason::ToolDenied.to_string())?;
+                    let _ = self.write_recovery_report(&StopReason::ToolDenied.to_string());
                     ui.on_event(AgentEvent::Stop {
                         reason: StopReason::ToolDenied,
                     })?;
@@ -609,6 +701,7 @@ where
                             .push(function_call_output(&call.call_id, &result));
                         self.stop(StopReason::ToolError).await?;
                         self.write_handoff(&StopReason::ToolError.to_string())?;
+                        let _ = self.write_recovery_report(&StopReason::ToolError.to_string());
                         ui.on_event(AgentEvent::Stop {
                             reason: StopReason::ToolError,
                         })?;
@@ -623,6 +716,7 @@ where
 
         self.stop(StopReason::MaxSteps).await?;
         self.write_handoff(&StopReason::MaxSteps.to_string())?;
+        let _ = self.write_recovery_report(&StopReason::MaxSteps.to_string());
         ui.on_event(AgentEvent::Stop {
             reason: StopReason::MaxSteps,
         })?;
@@ -756,7 +850,17 @@ where
             PermissionDecision::Deny => return ToolResult::denied(decision.message),
         }
 
-        self.tools
+        if !metadata.read_only {
+            let _ = checkpoint::record_before_tool(
+                &self.session,
+                &self.config.cwd,
+                call_id,
+                name,
+                &metadata.argument_summary,
+            );
+        }
+        let result = self
+            .tools
             .execute(
                 name,
                 arguments,
@@ -765,7 +869,17 @@ where
                     permission: self.config.permission,
                 },
             )
-            .await
+            .await;
+        if !metadata.read_only {
+            let _ = checkpoint::record_after_tool(
+                &self.session,
+                &self.config.cwd,
+                call_id,
+                name,
+                &result,
+            );
+        }
+        result
     }
 
     fn record_permission_decision(
@@ -804,8 +918,15 @@ where
     fn prompt_runtime_context(&self) -> PromptRuntimeContext {
         let mut runtime = PromptRuntimeContext::from_config(&self.config);
         if let Some(memory) = self.project_memory.as_ref() {
+            let mut parts = Vec::new();
             if let Some(index) = memory.active_index_text() {
-                runtime = runtime.with_project_memory(&memory.index_path, index);
+                parts.push(index.to_string());
+            }
+            if let Some(entries) = memory.active_entries_text() {
+                parts.push(format!("## Accepted durable memory\n{entries}"));
+            }
+            if !parts.is_empty() {
+                runtime = runtime.with_project_memory(&memory.index_path, parts.join("\n\n"));
             }
         }
         if let Some(active_plan) = self.active_plan.as_ref() {
@@ -823,6 +944,12 @@ where
             estimated_tokens: context.stats.total_tokens_estimate,
             max_tokens: context.stats.max_tokens,
             usage_percent: context.stats.usage_percent,
+            warning_percent: self.config.context_warning_percent,
+            pressure_status: if context.stats.usage_percent >= self.config.context_warning_percent {
+                "warning".into()
+            } else {
+                "ok".into()
+            },
             categories: context.stats.categories.clone(),
             prompt_sections: context.prompt_sections.clone(),
         })
@@ -852,6 +979,21 @@ where
             message: format!("added permission rule: {rule_text}"),
         };
         self.record_permission_decision(call_id, tool, argument_summary, &update, 0)
+    }
+
+    fn mark_memory_entry_status(&mut self, id: &str, status: MemoryStatus) -> Result<MemoryEntry> {
+        let memory = self
+            .project_memory
+            .as_mut()
+            .context("project memory is not loaded")?;
+        let entry = memory.mark_entry_status(id, status)?;
+        self.session.append(&SessionEvent::MemoryStatusChanged {
+            timestamp: now(),
+            id: entry.id.clone(),
+            status: entry.status.to_string(),
+            title: entry.title.clone(),
+        })?;
+        Ok(entry)
     }
 }
 
@@ -1037,6 +1179,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             cwd,
         }
@@ -1109,9 +1252,25 @@ mod tests {
         let config = temp_config(PermissionMode::Safe, 3);
         let memory_root = config.cwd.join(crate::memory::MEMORY_DIR);
         std::fs::create_dir_all(memory_root.join(crate::memory::MEMORY_TOPICS_DIR)).unwrap();
+        std::fs::create_dir_all(memory_root.join(crate::memory::MEMORY_ENTRIES_DIR)).unwrap();
         std::fs::write(
             memory_root.join(crate::memory::MEMORY_INDEX_FILE),
             "# Project Facts\nUse cargo test before reporting success.",
+        )
+        .unwrap();
+        std::fs::write(
+            memory_root
+                .join(crate::memory::MEMORY_ENTRIES_DIR)
+                .join("accepted.toml"),
+            r#"id = "accepted"
+title = "Accepted fact"
+body = "Use scripts/smoke-memory.sh for memory lifecycle checks."
+source_session = "session-1"
+created_at = "2026-05-27T00:00:00Z"
+last_validated_at = "2026-05-27T00:00:00Z"
+scope = "project"
+status = "active"
+"#,
         )
         .unwrap();
         let memory = ProjectMemory::load_or_init(&config.cwd).unwrap();
@@ -1125,11 +1284,15 @@ mod tests {
         let requests = agent.client.requests.lock().unwrap();
         assert!(requests[0].instructions.contains("## Project memory"));
         assert!(requests[0].instructions.contains("Use cargo test"));
+        assert!(requests[0]
+            .instructions
+            .contains("Use scripts/smoke-memory.sh"));
 
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\"type\":\"memory_loaded\""));
         assert!(log.contains("\"index_tokens\""));
         assert!(log.contains("\"topic_count\":0"));
+        assert!(log.contains("\"active_entry_count\":1"));
     }
 
     #[tokio::test]
@@ -1196,6 +1359,8 @@ mod tests {
         let log = std::fs::read_to_string(path).unwrap();
         assert!(log.contains("\"type\":\"handoff_written\""));
         assert!(log.contains("\"trigger\":\"tool_denied\""));
+        assert!(log.contains("\"type\":\"recovery_report_written\""));
+        assert!(log.contains("\"failure_class\":\"tool_denied\""));
         let plan = std::fs::read_to_string(
             agent
                 .config
@@ -1205,6 +1370,15 @@ mod tests {
         )
         .unwrap();
         assert!(plan.contains("non-final stop: tool_denied"));
+        let recovery = std::fs::read_to_string(
+            agent
+                .config
+                .cwd
+                .join(crate::recovery::RECOVERY_DIR)
+                .join(crate::recovery::LATEST_RECOVERY_FILE),
+        )
+        .unwrap();
+        assert!(recovery.contains("tool_denied"));
     }
 
     #[tokio::test]

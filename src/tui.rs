@@ -6,9 +6,11 @@ use crate::session::StopReason;
 use crate::tools::ToolSummary;
 use crate::ui::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
-    format_memory, format_memory_index, format_prompt, format_resume_report, format_sessions,
-    format_status, format_summary, format_trace, format_transcript, format_verification_report,
-    recent_session_choices, AgentEvent, ApprovalDecision, SlashCommand, SlashInvocation, UiSink,
+    format_memory, format_memory_candidate_report, format_memory_candidates, format_memory_entry,
+    format_memory_index, format_prompt, format_recovery_report, format_resume_report,
+    format_sessions, format_status, format_summary, format_trace, format_transcript,
+    format_verification_report, recent_session_choices, AgentEvent, ApprovalDecision, SlashCommand,
+    SlashInvocation, UiSink,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -228,6 +230,9 @@ impl TuiUi {
                                 .expect("agent checked above")
                                 .stop(StopReason::UserInterrupt)
                                 .await?;
+                            if let Some(agent) = self.agent.as_mut() {
+                                let _ = agent.write_recovery_report("user_interrupt");
+                            }
                             self.push_message(MessageKind::Warning, "stopped", "interrupted");
                             self.run_status = RunStatus::Idle;
                             self.render()?;
@@ -686,38 +691,25 @@ impl TuiUi {
                 }
             }
             SlashCommand::Memory => {
-                let agent = self.agent.as_ref().expect("agent checked above");
-                let Some(memory) = agent.project_memory() else {
-                    self.push_message(
-                        MessageKind::Warning,
-                        "/memory",
-                        "project memory is not loaded",
-                    );
-                    return Ok(true);
-                };
-                if invocation.args.is_empty() {
-                    self.push_message(MessageKind::System, "/memory", format_memory(memory));
-                } else if invocation.args == "index" {
-                    self.push_message(
-                        MessageKind::System,
-                        "/memory index",
-                        format_memory_index(memory),
-                    );
-                } else {
-                    match memory.read_topic(&invocation.args) {
-                        Ok(topic) => {
-                            self.push_message(MessageKind::System, "/memory", topic);
-                        }
-                        Err(error) => self.push_message(
-                            MessageKind::Warning,
-                            "/memory",
-                            format!("memory failed: {error}"),
-                        ),
-                    }
-                }
+                self.handle_memory_command(&invocation.args);
             }
             SlashCommand::Handoff => {
                 self.write_handoff_with_status("manual")?;
+            }
+            SlashCommand::Recover => {
+                let agent = self.agent.as_mut().expect("agent checked above");
+                match agent.write_recovery_report("manual") {
+                    Ok(report) => self.push_message(
+                        MessageKind::System,
+                        "/recover",
+                        format_recovery_report(&report),
+                    ),
+                    Err(error) => self.push_message(
+                        MessageKind::Warning,
+                        "/recover",
+                        format!("recover failed: {error}"),
+                    ),
+                }
             }
             SlashCommand::Plan => {
                 let agent = self.agent.as_ref().expect("agent checked above");
@@ -968,6 +960,150 @@ impl TuiUi {
         self.finish_handoff_message(trigger, result, elapsed);
         self.scroll_to_bottom();
         self.render()
+    }
+
+    fn handle_memory_command(&mut self, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            let Some(memory) = self.agent.as_ref().and_then(|agent| agent.project_memory()) else {
+                self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    "project memory is not loaded",
+                );
+                return;
+            };
+            self.push_message(MessageKind::System, "/memory", format_memory(memory));
+            return;
+        }
+        if args == "index" {
+            let Some(memory) = self.agent.as_ref().and_then(|agent| agent.project_memory()) else {
+                self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    "project memory is not loaded",
+                );
+                return;
+            };
+            self.push_message(
+                MessageKind::System,
+                "/memory index",
+                format_memory_index(memory),
+            );
+            return;
+        }
+        if args == "candidates" {
+            let Some(memory) = self.agent.as_ref().and_then(|agent| agent.project_memory()) else {
+                self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    "project memory is not loaded",
+                );
+                return;
+            };
+            self.push_message(
+                MessageKind::System,
+                "/memory candidates",
+                format_memory_candidates(memory),
+            );
+            return;
+        }
+        if args == "candidates refresh" {
+            let result = self
+                .agent
+                .as_mut()
+                .expect("agent checked above")
+                .refresh_memory_candidates();
+            match result {
+                Ok(report) => self.push_message(
+                    MessageKind::System,
+                    "/memory candidates refresh",
+                    format_memory_candidate_report(&report),
+                ),
+                Err(error) => self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    format!("memory failed: {error}"),
+                ),
+            }
+            return;
+        }
+        if let Some(id) = args.strip_prefix("promote ").map(str::trim) {
+            let result = self
+                .agent
+                .as_mut()
+                .expect("agent checked above")
+                .promote_memory_candidate(id);
+            match result {
+                Ok(entry) => self.push_message(
+                    MessageKind::System,
+                    "/memory promote",
+                    format_memory_entry(&entry, "promoted"),
+                ),
+                Err(error) => self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    format!("memory failed: {error}"),
+                ),
+            }
+            return;
+        }
+        if let Some(id) = args.strip_prefix("stale ").map(str::trim) {
+            let result = self
+                .agent
+                .as_mut()
+                .expect("agent checked above")
+                .mark_memory_stale(id);
+            match result {
+                Ok(entry) => self.push_message(
+                    MessageKind::System,
+                    "/memory stale",
+                    format_memory_entry(&entry, "staled"),
+                ),
+                Err(error) => self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    format!("memory failed: {error}"),
+                ),
+            }
+            return;
+        }
+        if let Some(id) = args.strip_prefix("forget ").map(str::trim) {
+            let result = self
+                .agent
+                .as_mut()
+                .expect("agent checked above")
+                .forget_memory(id);
+            match result {
+                Ok(message) => {
+                    self.push_message(MessageKind::System, "/memory forget", message);
+                }
+                Err(error) => self.push_message(
+                    MessageKind::Warning,
+                    "/memory",
+                    format!("memory failed: {error}"),
+                ),
+            }
+            return;
+        }
+        let Some(memory) = self.agent.as_ref().and_then(|agent| agent.project_memory()) else {
+            self.push_message(
+                MessageKind::Warning,
+                "/memory",
+                "project memory is not loaded",
+            );
+            return;
+        };
+        match memory.read_topic(args) {
+            Ok(topic) => {
+                self.push_message(MessageKind::System, "/memory", topic);
+            }
+            Err(error) => self.push_message(
+                MessageKind::Warning,
+                "/memory",
+                format!("memory failed: {error}"),
+            ),
+        }
     }
 
     fn finish_handoff_message(
@@ -1374,6 +1510,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 20,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };
@@ -1410,6 +1547,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 20,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             cwd: std::path::PathBuf::from("/tmp/micos"),
         };

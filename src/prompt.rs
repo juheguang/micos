@@ -277,6 +277,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 3,
             context_window_tokens: crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS,
+            context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt,
             cwd: PathBuf::from("/tmp/micos"),
         }

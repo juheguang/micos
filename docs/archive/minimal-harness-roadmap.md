@@ -120,6 +120,7 @@ Scope:
   - store source session, timestamp, scope, and last validation state
 - memory commands:
   - `/memory candidates`
+  - `/memory candidates refresh`
   - `/memory promote <id>`
   - `/memory stale <id>`
   - `/memory forget <id>`
@@ -159,7 +160,7 @@ Scope:
   - failing test recovery
   - compact and resume
 - eval command:
-  - `/eval` or `micos eval` for deterministic harness behavior tests
+  - `micos eval` for deterministic harness behavior tests
   - report pass/fail, stop reason, tool count, and trace path
 
 Acceptance:
@@ -201,7 +202,7 @@ These areas matter, but they should wait until 0.4.3 through 0.4.6 are stable:
 
 Start here for the next coding session:
 
-1. Run `cargo test`, `scripts/smoke-no-tui.sh`, and `scripts/smoke-verify.sh` before starting feature work.
+1. Run `cargo test`, `scripts/smoke-no-tui.sh`, `scripts/smoke-verify.sh`, `scripts/smoke-memory.sh`, and `scripts/smoke-eval.sh` before starting feature work.
 2. Do a short manual TUI smoke for `/permission`, `/resume`, `/compact`, `/verify`, and `/exit` when touching UI paths.
-3. Start 0.4.5 with memory promotion and context lifecycle work.
+3. Plan 0.4.7 around edit workflow hardening or the first MCP/tools integration slice.
 4. Keep verification commands routed through the same permission and trace path as shell tools.

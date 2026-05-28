@@ -10,6 +10,7 @@ pub const DEFAULT_MODEL: &str = "gpt-5.3-codex";
 pub const DEFAULT_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1/responses";
 pub const DEEPSEEK_CHAT_COMPLETIONS_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
 pub const DEFAULT_MAX_STEPS: usize = 20;
+pub const DEFAULT_CONTEXT_WARNING_PERCENT: usize = 80;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,6 +141,7 @@ pub struct SessionConfig {
     pub permission_rules: Vec<PermissionRule>,
     pub max_steps: usize,
     pub context_window_tokens: usize,
+    pub context_warning_percent: usize,
     pub append_system_prompt: Option<String>,
     pub cwd: PathBuf,
 }
@@ -161,6 +163,7 @@ pub struct ConfigOverrides {
     pub permission: Option<PermissionMode>,
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
+    pub context_warning_percent: Option<usize>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -174,6 +177,7 @@ pub struct FileConfig {
     pub permissions: Option<FilePermissionsConfig>,
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
+    pub context_warning_percent: Option<usize>,
     pub append_system_prompt: Option<String>,
     pub cwd: Option<PathBuf>,
 }
@@ -197,6 +201,7 @@ pub struct EnvConfig {
     pub permission: Option<PermissionMode>,
     pub max_steps: Option<usize>,
     pub context_window_tokens: Option<usize>,
+    pub context_warning_percent: Option<usize>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -242,6 +247,14 @@ impl SessionConfig {
         if context_window_tokens == 0 {
             bail!("context_window_tokens must be greater than 0");
         }
+        let context_warning_percent = cli
+            .context_warning_percent
+            .or(env.context_warning_percent)
+            .or(file.context_warning_percent)
+            .unwrap_or(DEFAULT_CONTEXT_WARNING_PERCENT);
+        if !(1..=100).contains(&context_warning_percent) {
+            bail!("context_warning_percent must be between 1 and 100");
+        }
 
         Ok(Self {
             api_kind,
@@ -264,6 +277,7 @@ impl SessionConfig {
                 .or(file.max_steps)
                 .unwrap_or(DEFAULT_MAX_STEPS),
             context_window_tokens,
+            context_warning_percent,
             append_system_prompt: file.append_system_prompt,
             cwd,
         })
@@ -427,6 +441,14 @@ impl EnvConfig {
             Ok(value) => Some(value.parse().context("parse MICOS_CONTEXT_WINDOW_TOKENS")?),
             Err(_) => None,
         };
+        let context_warning_percent = match std::env::var("MICOS_CONTEXT_WARNING_PERCENT") {
+            Ok(value) => Some(
+                value
+                    .parse()
+                    .context("parse MICOS_CONTEXT_WARNING_PERCENT")?,
+            ),
+            Err(_) => None,
+        };
 
         Ok(Self {
             model: std::env::var("MICOS_MODEL").ok(),
@@ -436,6 +458,7 @@ impl EnvConfig {
             permission,
             max_steps,
             context_window_tokens,
+            context_warning_percent,
             cwd,
         })
     }
@@ -507,6 +530,7 @@ mod tests {
             cfg.context_window_tokens,
             crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS
         );
+        assert_eq!(cfg.context_warning_percent, DEFAULT_CONTEXT_WARNING_PERCENT);
         assert_eq!(cfg.append_system_prompt, None);
     }
 
@@ -523,6 +547,7 @@ mod tests {
                 permissions: None,
                 max_steps: Some(3),
                 context_window_tokens: Some(123_000),
+                context_warning_percent: Some(70),
                 append_system_prompt: None,
                 cwd: None,
             },
@@ -534,6 +559,7 @@ mod tests {
                 permission: Some(PermissionMode::Auto),
                 max_steps: Some(4),
                 context_window_tokens: Some(124_000),
+                context_warning_percent: Some(75),
                 cwd: None,
             },
             ConfigOverrides {
@@ -544,6 +570,7 @@ mod tests {
                 permission: Some(PermissionMode::Ask),
                 max_steps: Some(5),
                 context_window_tokens: Some(125_000),
+                context_warning_percent: Some(90),
                 cwd: None,
             },
         )
@@ -557,6 +584,7 @@ mod tests {
         assert_eq!(cfg.permission, PermissionMode::Ask);
         assert_eq!(cfg.max_steps, 5);
         assert_eq!(cfg.context_window_tokens, 125_000);
+        assert_eq!(cfg.context_warning_percent, 90);
     }
 
     #[test]
@@ -607,6 +635,7 @@ base_url = "https://api.deepseek.com/chat/completions"
 thinking = "enabled"
 	reasoning_effort = "max"
 	context_window_tokens = 123000
+	context_warning_percent = 75
 	append_system_prompt = "Prefer concise replies."
 	"#,
         )
@@ -620,6 +649,7 @@ thinking = "enabled"
         assert_eq!(cfg.thinking, Some(ThinkingMode::Enabled));
         assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Max));
         assert_eq!(cfg.context_window_tokens, Some(123_000));
+        assert_eq!(cfg.context_warning_percent, Some(75));
         assert_eq!(
             cfg.append_system_prompt,
             Some("Prefer concise replies.".into())
@@ -670,6 +700,24 @@ deny = ["shell(rm *)", "shell(curl *)"]
         assert!(error
             .to_string()
             .contains("context_window_tokens must be greater than 0"));
+    }
+
+    #[test]
+    fn context_warning_percent_must_be_between_one_and_one_hundred() {
+        let error = SessionConfig::resolve(
+            PathBuf::from("/tmp/micos"),
+            FileConfig {
+                context_warning_percent: Some(0),
+                ..FileConfig::default()
+            },
+            EnvConfig::default(),
+            ConfigOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("context_warning_percent must be between 1 and 100"));
     }
 
     #[test]

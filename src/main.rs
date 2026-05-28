@@ -10,7 +10,10 @@ use micos::model::{ModelClient, OpenAiModelClient};
 use micos::plan::ActivePlan;
 use micos::session::{now, Session, SessionEvent, StopReason};
 use micos::tui;
-use micos::ui::{parse_input, ConsoleUi, InputCommand, SlashCommand, SlashInvocation};
+use micos::ui::{
+    format_memory_candidate_report, format_memory_candidates, format_memory_entry, parse_input,
+    ConsoleUi, InputCommand, SlashCommand, SlashInvocation,
+};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io::{self, BufRead, IsTerminal};
@@ -26,6 +29,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Chat(ChatArgs),
+    Eval(EvalArgs),
+}
+
+#[derive(Debug, Parser)]
+struct EvalArgs {
+    #[arg(long)]
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -117,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Chat(args) => run_chat(args).await,
+        Commands::Eval(args) => micos::eval::run_eval_suite(args.cwd).await.map(|report| {
+            println!("{}", report);
+        }),
     }
 }
 
@@ -129,6 +142,7 @@ async fn run_chat(args: ChatArgs) -> anyhow::Result<()> {
         permission: args.permission.map(Into::into),
         max_steps: args.max_steps,
         context_window_tokens: None,
+        context_warning_percent: None,
         cwd: args.cwd,
     };
     let config = SessionConfig::load(overrides).context("load configuration")?;
@@ -206,6 +220,7 @@ async fn run_console_chat<C: ModelClient>(
             Err(ReadlineError::Interrupted) => {
                 write_handoff_or_warn(agent, "user_interrupt");
                 agent.stop(StopReason::UserInterrupt).await?;
+                write_recovery_or_warn(agent, "user_interrupt");
                 eprintln!("Interrupted.");
                 break;
             }
@@ -307,30 +322,15 @@ async fn handle_console_slash<C: ModelClient>(
             }
         }
         SlashCommand::Memory => {
-            if invocation.args.is_empty() {
-                if let Some(memory) = agent.project_memory() {
-                    ui.print_memory(memory);
-                } else {
-                    eprintln!("project memory is not loaded");
-                }
-            } else if invocation.args == "index" {
-                if let Some(memory) = agent.project_memory() {
-                    ui.print_memory_index(memory);
-                } else {
-                    eprintln!("project memory is not loaded");
-                }
-            } else if let Some(memory) = agent.project_memory() {
-                match memory.read_topic(&invocation.args) {
-                    Ok(topic) => println!("{topic}"),
-                    Err(error) => eprintln!("memory failed: {error}"),
-                }
-            } else {
-                eprintln!("project memory is not loaded");
-            }
+            handle_console_memory(invocation.args, agent, ui)?;
         }
         SlashCommand::Handoff => match agent.write_handoff("manual") {
             Ok(report) => ui.print_handoff_report(&report),
             Err(error) => eprintln!("handoff failed: {error}"),
+        },
+        SlashCommand::Recover => match agent.write_recovery_report("manual") {
+            Ok(report) => ui.print_recovery_report(&report),
+            Err(error) => eprintln!("recover failed: {error}"),
         },
         SlashCommand::Plan => ui.print_active_plan(agent.active_plan()),
         SlashCommand::Model => {
@@ -346,6 +346,75 @@ async fn handle_console_slash<C: ModelClient>(
     Ok(true)
 }
 
+fn handle_console_memory<C: ModelClient>(
+    args: String,
+    agent: &mut Agent<C>,
+    ui: &mut ConsoleUi,
+) -> anyhow::Result<()> {
+    let args = args.trim();
+    if args.is_empty() {
+        if let Some(memory) = agent.project_memory() {
+            ui.print_memory(memory);
+        } else {
+            eprintln!("project memory is not loaded");
+        }
+        return Ok(());
+    }
+    if args == "index" {
+        if let Some(memory) = agent.project_memory() {
+            ui.print_memory_index(memory);
+        } else {
+            eprintln!("project memory is not loaded");
+        }
+        return Ok(());
+    }
+    if args == "candidates" {
+        if let Some(memory) = agent.project_memory() {
+            println!("{}", format_memory_candidates(memory));
+        } else {
+            eprintln!("project memory is not loaded");
+        }
+        return Ok(());
+    }
+    if args == "candidates refresh" {
+        match agent.refresh_memory_candidates() {
+            Ok(report) => println!("{}", format_memory_candidate_report(&report)),
+            Err(error) => eprintln!("memory failed: {error}"),
+        }
+        return Ok(());
+    }
+    if let Some(id) = args.strip_prefix("promote ").map(str::trim) {
+        match agent.promote_memory_candidate(id) {
+            Ok(entry) => println!("{}", format_memory_entry(&entry, "promoted")),
+            Err(error) => eprintln!("memory failed: {error}"),
+        }
+        return Ok(());
+    }
+    if let Some(id) = args.strip_prefix("stale ").map(str::trim) {
+        match agent.mark_memory_stale(id) {
+            Ok(entry) => println!("{}", format_memory_entry(&entry, "staled")),
+            Err(error) => eprintln!("memory failed: {error}"),
+        }
+        return Ok(());
+    }
+    if let Some(id) = args.strip_prefix("forget ").map(str::trim) {
+        match agent.forget_memory(id) {
+            Ok(message) => println!("memory forgotten\n{message}"),
+            Err(error) => eprintln!("memory failed: {error}"),
+        }
+        return Ok(());
+    }
+    if let Some(memory) = agent.project_memory() {
+        match memory.read_topic(args) {
+            Ok(topic) => println!("{topic}"),
+            Err(error) => eprintln!("memory failed: {error}"),
+        }
+    } else {
+        eprintln!("project memory is not loaded");
+    }
+    Ok(())
+}
+
 fn should_use_tui(no_tui: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
     !no_tui && stdin_tty && stdout_tty
 }
@@ -353,6 +422,12 @@ fn should_use_tui(no_tui: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
 fn write_handoff_or_warn<C: ModelClient>(agent: &mut Agent<C>, trigger: &str) {
     if let Err(error) = agent.write_handoff(trigger) {
         eprintln!("handoff failed: {error}");
+    }
+}
+
+fn write_recovery_or_warn<C: ModelClient>(agent: &mut Agent<C>, trigger: &str) {
+    if let Err(error) = agent.write_recovery_report(trigger) {
+        eprintln!("recover failed: {error}");
     }
 }
 

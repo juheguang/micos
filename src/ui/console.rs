@@ -1,8 +1,8 @@
 use super::{
     format_active_plan, format_compact_report, format_context, format_handoff_report, format_help,
-    format_memory, format_memory_index, format_prompt, format_resume_report, format_sessions,
-    format_status, format_summary, format_trace, format_transcript, format_verification_report,
-    AgentEvent, ApprovalDecision, UiSink,
+    format_memory, format_memory_index, format_prompt, format_recovery_report,
+    format_resume_report, format_sessions, format_status, format_summary, format_trace,
+    format_transcript, format_verification_report, AgentEvent, ApprovalDecision, UiSink,
 };
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
@@ -157,6 +157,10 @@ impl ConsoleUi {
 
     pub fn print_handoff_report(&mut self, report: &crate::plan::HandoffReport) {
         println!("{}", format_handoff_report(report));
+    }
+
+    pub fn print_recovery_report(&mut self, report: &crate::recovery::RecoveryReport) {
+        println!("{}", format_recovery_report(report));
     }
 
     pub fn clear(&mut self) -> Result<()> {

@@ -125,12 +125,13 @@ REPL 支持常用 slash commands：
 - `/summary`：显示当前 session 最近一次 compact summary 正文。
 - `/trace`：显示最近工具调用、权限决策、拒绝原因和 stop reason。
 - `/prompt`：显示当前 system prompt 的 section、来源和估算 token。
-- `/context`：显示当前模型上下文的估算 token、窗口大小和分类占用。
+- `/context`：显示当前模型上下文的估算 token、窗口大小、压力状态和分类占用。
 - `/compact`：调用模型生成固定格式摘要，并用摘要替换当前 model-visible context。
 - `/verify [name]`：运行 `.micos/verify.toml` 中配置的验证命令；未配置且项目含 `Cargo.toml` 时默认运行 `cargo test`。
 - `/resume <session-id-or-path>`：从旧 session JSONL 恢复当前运行时 model-visible context。
-- `/memory`：显示项目本地 memory index 和 topic 列表。
+- `/memory`：显示项目本地 memory、候选项、已接受 entry 和 topic 列表。
 - `/handoff`：把当前 session 的可续接状态写入 `.micos/plans/active.md`。
+- `/recover`：把最近失败或中断 turn 的恢复报告写入 `.micos/recovery/latest.md` 并展示摘要。
 - `/plan`：显示当前 active plan / handoff 正文。
 - `/model`：在 TUI 模式中选择模型和思考设置。
 - `/clear`：清屏。
@@ -178,9 +179,9 @@ deny = ["shell(rm *)", "shell(curl *)"]
 - `tool(pattern)` 表示 scoped rule，例如 `deny = ["shell(rm *)"]` 会保留 `shell` schema，但匹配调用会在运行时被拒绝。
 - `*` 是简单通配符。`shell` 规则会把 `&&`、`||`、`;`、`|`、`|&`、`&` 和换行分隔出的子命令逐段检查。
 
-`context_window_tokens` 默认是 `200000`。当 `base_url` 是 DeepSeek 官方 API 且 model 为 `deepseek-v4-*` 时，默认窗口自动使用 `1000000`；显式配置仍然优先。
+`context_window_tokens` 默认是 `200000`。当 `base_url` 是 DeepSeek 官方 API 且 model 为 `deepseek-v4-*` 时，默认窗口自动使用 `1000000`；显式配置仍然优先。`context_warning_percent` 默认是 `80`，用于 `/context` 和 `context_snapshot` 标记 context pressure；0.4.5 只预警，不会自动 compact。
 
-每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小、分类占用和 prompt section 摘要。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/prompt`、`/context` 和 `/trace` 查看当前 session 的 prompt、上下文和权限 trace。
+每次模型请求前都会写入 session JSONL 的 `context_snapshot` 事件，用于记录粗估 token、窗口大小、分类占用、prompt section 摘要、`warning_percent` 和 `pressure_status`。每次工具权限判断都会写入 `permission_decision` 事件。REPL 中可用 `/prompt`、`/context` 和 `/trace` 查看当前 session 的 prompt、上下文和权限 trace。
 
 ## Verification
 
@@ -246,6 +247,18 @@ scripts/smoke-no-tui.sh
 scripts/smoke-verify.sh
 ```
 
+memory lifecycle smoke：
+
+```bash
+scripts/smoke-memory.sh
+```
+
+eval smoke：
+
+```bash
+scripts/smoke-eval.sh
+```
+
 ## Resume
 
 可以在启动时恢复旧 session：
@@ -273,17 +286,26 @@ resume 不会重放工具，也不会修改旧 session JSONL；它会在当前�
 ```text
 .micos/memory/MEMORY.md
 .micos/memory/topics/*.md
+.micos/memory/candidates/*.toml
+.micos/memory/entries/*.toml
 ```
 
 `.micos/` 默认由 `.gitignore` 忽略，因此这层 memory 是当前 checkout 的本地运行态。`MEMORY.md` 用于稳定项目事实、约定、常见失败和 runbook；如果它不是空模板，会作为 `Project memory` prompt section 注入每次模型请求。topic 文件不会自动进入上下文，只能按需查看。
 
+0.4.5 增加了候选到 durable entry 的显式提升流程。`candidates/*.toml` 保存从最近 session/handoff 确定性生成的候选；`entries/*.toml` 保存已接受 memory。entry 的 `status` 可为 `active`、`stale` 或 `forgotten`，只有 `active` 会进入后续 prompt。
+
 REPL/TUI 支持：
 
-- `/memory`：显示 memory root、index、token 估算和 topic 列表。
+- `/memory`：显示 memory root、index、entry/candidate 数量、token 估算和 topic 列表。
 - `/memory index`：显示完整 `MEMORY.md`。
+- `/memory candidates`：显示待确认候选。
+- `/memory candidates refresh`：基于当前 session JSONL 生成或刷新候选。
+- `/memory promote <id>`：把候选提升为 active durable memory。
+- `/memory stale <id>`：把 active entry 标记为 stale，并从 prompt 注入中移除。
+- `/memory forget <id>`：把 candidate 或 entry 标记为 forgotten，保留本地记录但不再注入。
 - `/memory <topic-file.md>`：读取 `.micos/memory/topics/` 下的单个 topic 文件；路径逃逸会被拒绝。
 
-session JSONL 会在启动时写入 `memory_loaded`，字段包含 `timestamp`、`root`、`index_path`、`index_tokens`、`topic_count`、`created_index`。
+session JSONL 会在启动时写入 `memory_loaded`，字段包含 `timestamp`、`root`、`index_path`、`index_tokens`、`topic_count`、`candidate_count`、`entry_count`、`active_entry_count`、`active_entry_tokens`、`created_index`。memory 生命周期操作会写入 `memory_candidate_created`、`memory_promoted` 和 `memory_status_changed`。
 
 ## Active Plan / Handoff
 
@@ -315,6 +337,32 @@ REPL/TUI 支持：
 TUI 中 handoff 会以类似工具调用的消息展示 running/success/failed 状态。输入 `/exit` 或触发 Ctrl-C 退出时，会先等待 handoff 写入完成，再停止当前 session 并退出。
 
 session JSONL 会在写 handoff 后记录 `handoff_written`，字段包含 `timestamp`、`path`、`trigger`、`files_touched`、`commands_run`、`verification_status`、`known_failures`、`tokens_estimate`。
+
+## Recovery and Eval
+
+`/recover` 会基于当前 session JSONL 确定性生成恢复报告，不调用模型。报告写入：
+
+```text
+.micos/recovery/latest.md
+```
+
+报告包含 failure class、stop reason、latest user request、attempted tools、files touched、commands run、verification status、known failures 和 next safe step。`micos` 会在 API error、tool denied、tool error、max steps、user interrupt 和 verification failed 等场景自动写 recovery report；没有可恢复失败时，`/recover` 会提示没有 recoverable failure。
+
+recovery 相关 session events：
+
+- `recovery_report_written`：字段包含 `timestamp`、`path`、`trigger`、`stop_reason`、`failure_class`、`known_failures`、`tokens_estimate`
+- `checkpoint_before_tool`：在非 read-only 工具执行前记录 git branch、`git status --short` 和工具摘要
+- `checkpoint_after_tool`：在非 read-only 工具执行后记录 changed files、执行成功状态和 git 摘要
+
+checkpoint 只做轻量记录，不执行自动回滚；如果当前目录不是 git repo，会记录 `git_available=false` 并继续执行工具。
+
+本地 eval 可用：
+
+```bash
+micos eval
+```
+
+`micos eval` 使用内置 mock model，不需要真实 API key 或网络。当前 fixtures 覆盖 read-only question、small edit、denied tool、failing tool recovery、compact/resume，并输出 pass/fail、stop reason、tool count 和 session log path。
 
 ## Model-visible 工具输出
 

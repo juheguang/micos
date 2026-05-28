@@ -1,9 +1,10 @@
 use crate::agent::ContextCompactReport;
 use crate::config::SessionConfig;
 use crate::context::ContextStats;
-use crate::memory::ProjectMemory;
+use crate::memory::{MemoryCandidateReport, MemoryEntry, ProjectMemory};
 use crate::plan::{ActivePlan, HandoffReport};
 use crate::prompt::PromptBuild;
+use crate::recovery::RecoveryReport;
 use crate::session::SESSION_DIR;
 use crate::session_replay::SessionResumeReport;
 use crate::verify::VerificationRunReport;
@@ -31,6 +32,7 @@ pub enum SlashCommand {
     Resume,
     Memory,
     Handoff,
+    Recover,
     Plan,
     Model,
     Clear,
@@ -124,13 +126,18 @@ pub const SLASH_COMMANDS: &[SlashCommandInfo] = &[
     },
     SlashCommandInfo {
         name: "memory",
-        description: "show project memory index and topics",
+        description: "show project memory, candidates, and accepted entries",
         command: SlashCommand::Memory,
     },
     SlashCommandInfo {
         name: "handoff",
         description: "write current active handoff to .micos/plans/active.md",
         command: SlashCommand::Handoff,
+    },
+    SlashCommandInfo {
+        name: "recover",
+        description: "write and show latest recovery report",
+        command: SlashCommand::Recover,
     },
     SlashCommandInfo {
         name: "plan",
@@ -250,6 +257,7 @@ pub fn format_status(config: &SessionConfig, session_id: Uuid, session_path: &Pa
             "context window: {} tokens",
             format_tokens(config.context_window_tokens)
         ),
+        format!("context warning: {}%", config.context_warning_percent),
         format!("cwd: {}", config.cwd.display()),
         format!("log: {}", session_path.display()),
     ]
@@ -394,6 +402,15 @@ pub fn format_context(config: &SessionConfig, session_path: &Path, stats: &Conte
             format_tokens(stats.max_tokens),
             stats.usage_percent
         ),
+        format!(
+            "pressure: {} (warning at {}%)",
+            if stats.usage_percent >= config.context_warning_percent {
+                "warning"
+            } else {
+                "ok"
+            },
+            config.context_warning_percent
+        ),
         "categories:".into(),
     ];
     for category in &stats.categories {
@@ -522,6 +539,13 @@ pub fn format_memory(memory: &ProjectMemory) -> String {
         format!("root: {}", memory.root.display()),
         format!("index: {}", memory.index_path.display()),
         format!("index tokens: {}", format_tokens(memory.index_tokens)),
+        format!(
+            "entries: {} active={} tokens={}",
+            memory.entries.len(),
+            memory.active_entries().len(),
+            format_tokens(memory.active_entries_tokens)
+        ),
+        format!("candidates: {}", memory.pending_candidates().len()),
         format!("topics: {}", memory.topics.len()),
     ];
     if memory.topics.is_empty() {
@@ -535,7 +559,10 @@ pub fn format_memory(memory: &ProjectMemory) -> String {
             ));
         }
     }
-    output.push("usage: /memory index | /memory <topic-file.md>".into());
+    output.push(
+        "usage: /memory index | /memory candidates | /memory candidates refresh | /memory promote <id> | /memory stale <id> | /memory forget <id> | /memory <topic-file.md>"
+            .into(),
+    );
     output.join("\n")
 }
 
@@ -544,6 +571,54 @@ pub fn format_memory_index(memory: &ProjectMemory) -> String {
         .active_index_text()
         .unwrap_or("Project memory index is empty.")
         .to_string()
+}
+
+pub fn format_memory_candidates(memory: &ProjectMemory) -> String {
+    let candidates = memory.pending_candidates();
+    if candidates.is_empty() {
+        return "memory candidates: none".into();
+    }
+    let mut output = vec!["memory candidates:".to_string()];
+    for candidate in candidates {
+        output.push(format!(
+            "  {:<32} {:<9} {}",
+            candidate.id,
+            candidate.status,
+            trim_one_line(&candidate.title, 80)
+        ));
+    }
+    output.join("\n")
+}
+
+pub fn format_memory_candidate_report(report: &MemoryCandidateReport) -> String {
+    [
+        if report.created {
+            "memory candidate created".to_string()
+        } else {
+            "memory candidate refreshed".to_string()
+        },
+        format!("id: {}", report.candidate.id),
+        format!("title: {}", report.candidate.title),
+        format!(
+            "source session: {}",
+            report
+                .candidate
+                .source_session
+                .as_deref()
+                .unwrap_or("unknown")
+        ),
+    ]
+    .join("\n")
+}
+
+pub fn format_memory_entry(entry: &MemoryEntry, action: &str) -> String {
+    [
+        format!("memory {action}"),
+        format!("id: {}", entry.id),
+        format!("status: {}", entry.status),
+        format!("title: {}", entry.title),
+    ]
+    .join("\n")
 }
 
 pub fn format_active_plan(plan: Option<&ActivePlan>) -> String {
@@ -560,6 +635,22 @@ pub fn format_handoff_report(report: &HandoffReport) -> String {
         format!("files touched: {}", report.files_touched),
         format!("commands run: {}", report.commands_run),
         format!("verification: {}", report.verification_status),
+        format!("known failures: {}", report.known_failures),
+        format!("tokens: {}", format_tokens(report.tokens_estimate)),
+    ]
+    .join("\n")
+}
+
+pub fn format_recovery_report(report: &RecoveryReport) -> String {
+    [
+        "recovery report written".to_string(),
+        format!("path: {}", report.path.display()),
+        format!("trigger: {}", report.trigger),
+        format!(
+            "stop reason: {}",
+            report.stop_reason.as_deref().unwrap_or("unknown")
+        ),
+        format!("failure class: {}", report.failure_class),
         format!("known failures: {}", report.known_failures),
         format!("tokens: {}", format_tokens(report.tokens_estimate)),
     ]
@@ -838,6 +929,10 @@ mod tests {
             parse_input("/handoff"),
             invocation(SlashCommand::Handoff, "")
         );
+        assert_eq!(
+            parse_input("/recover"),
+            invocation(SlashCommand::Recover, "")
+        );
         assert_eq!(parse_input("/plan"), invocation(SlashCommand::Plan, ""));
         assert_eq!(
             parse_input("/missing"),
@@ -868,6 +963,7 @@ mod tests {
                 "resume",
                 "memory",
                 "handoff",
+                "recover",
                 "plan",
                 "model",
                 "clear",
@@ -884,6 +980,7 @@ mod tests {
         assert_eq!(slash_command_exact("/compact"), Some(SlashCommand::Compact));
         assert_eq!(slash_command_exact("/verify"), Some(SlashCommand::Verify));
         assert_eq!(slash_command_exact("/handoff"), Some(SlashCommand::Handoff));
+        assert_eq!(slash_command_exact("/recover"), Some(SlashCommand::Recover));
         assert_eq!(slash_command_exact("/plan"), Some(SlashCommand::Plan));
         assert_eq!(slash_command_exact("/quit"), Some(SlashCommand::Exit));
         assert_eq!(slash_command_exact("/resume target"), None);
@@ -917,6 +1014,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 3,
             context_window_tokens: 1_000,
+            context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: None,
             cwd,
         };
@@ -962,6 +1060,7 @@ mod tests {
             permission_rules: Vec::new(),
             max_steps: 3,
             context_window_tokens: 1_000,
+            context_warning_percent: crate::config::DEFAULT_CONTEXT_WARNING_PERCENT,
             append_system_prompt: Some("Prefer concise replies.".into()),
             cwd: std::env::temp_dir(),
         };
@@ -1009,6 +1108,9 @@ mod tests {
                 title: "Build".into(),
                 bytes: 20,
             }],
+            candidates: Vec::new(),
+            entries: Vec::new(),
+            active_entries_tokens: 0,
             created_index: false,
         };
 
@@ -1075,6 +1177,24 @@ mod tests {
         assert!(output.contains("handoff written"));
         assert!(output.contains("trigger: manual"));
         assert!(output.contains("verification: unverified"));
+    }
+
+    #[test]
+    fn formats_recovery_report() {
+        let report = RecoveryReport {
+            path: std::path::PathBuf::from(".micos/recovery/latest.md"),
+            trigger: "manual".into(),
+            stop_reason: Some("tool_error".into()),
+            failure_class: crate::recovery::FailureClass::ToolError,
+            known_failures: 2,
+            tokens_estimate: 44,
+        };
+
+        let output = format_recovery_report(&report);
+
+        assert!(output.contains("recovery report written"));
+        assert!(output.contains("failure class: tool_error"));
+        assert!(output.contains("known failures: 2"));
     }
 
     #[test]
